@@ -1,0 +1,414 @@
+import { randomUUID } from "node:crypto";
+import { and, eq, isNull, sql } from "drizzle-orm";
+import { afterAll, beforeEach, describe, expect, it } from "vitest";
+
+import { locations, passwordTokens, users } from "../../db/schema";
+import { api, createTestContext, resetData, SEEDED, signInAs } from "../../test/harness";
+import { MESSAGES, stageProblem } from "./users.routes";
+
+const ctx = createTestContext();
+const http = api(ctx);
+beforeEach(() => resetData(ctx));
+afterAll(() => ctx.pool.end());
+
+const LI_WEI = "li@mrgarments.com";
+const NON_MANAGEMENT = [SEEDED.procurement, SEEDED.accounts, SEEDED.chinaStaff, SEEDED.indiaStaff, SEEDED.warehouseStaff];
+
+const idOf = async (email: string) => (await ctx.db.select({ id: users.id }).from(users).where(eq(users.email, email)))[0]!.id;
+const management = () => signInAs(ctx, SEEDED.management);
+const sessionsOf = async (userId: string) =>
+  (await ctx.pool.query(`select count(*)::int as n from session where sess->>'userId' = $1`, [userId])).rows[0].n as number;
+
+const newUser = { name: "Test User", email: "test@mrgarments.com", role: "China staff", stages: [2] };
+
+describe("access (AT-R5)", () => {
+  it("lets only Management use USR-1 to USR-4 and ROL-1; signed out is 401", async () => {
+    const wang = await idOf(SEEDED.chinaStaffTwoStages);
+    const calls = [
+      () => http.get("/users"),
+      () => http.get(`/users/${wang}`),
+      () => http.post("/users", newUser),
+      () => http.patch(`/users/${wang}`, {}),
+      () => http.get("/roles"),
+    ];
+    for (const call of calls) {
+      expect((await call()).status).toBe(401);
+      for (const email of NON_MANAGEMENT) {
+        expect((await call().set("Cookie", await signInAs(ctx, email))).status).toBe(403);
+      }
+    }
+    const cookie = await management();
+    expect((await http.get("/users").set("Cookie", cookie)).status).toBe(200);
+    expect((await http.get(`/users/${wang}`).set("Cookie", cookie)).status).toBe(200);
+    expect((await http.post("/users", newUser).set("Cookie", cookie)).status).toBe(201);
+    expect((await http.patch(`/users/${wang}`, {}).set("Cookie", cookie)).status).toBe(200);
+    expect((await http.get("/roles").set("Cookie", cookie)).status).toBe(200);
+  });
+});
+
+describe("USR-1 GET /users", () => {
+  it("lists the 8 seeded users in creation order; the Head office users have no office (AT-U1)", async () => {
+    const res = await http.get("/users").set("Cookie", await management());
+    expect(res.status).toBe(200);
+    expect(res.body.counts).toEqual({ active: 8, inactive: 0 });
+    expect(res.body.data.map((row: { name: string; office: string | null }) => [row.name, row.office])).toEqual([
+      ["Suresh Menon", null],
+      ["Priya Nair", null],
+      ["Anita Joseph", null],
+      ["Wang Fang", "Guangzhou office"],
+      ["Chen Yu", "Guangzhou office"],
+      ["Li Wei", "Guangzhou office"],
+      ["Anil Sharma", "India office"],
+      ["Joseph M", "Main warehouse"],
+    ]);
+    expect(Object.keys(res.body.data[0]).sort()).toEqual(["email", "id", "lastSignInAt", "name", "office", "role", "status"]);
+    expect(res.body.data[0]).toMatchObject({ email: "suresh@mrgarments.com", role: "Management", lastSignInAt: null, status: "Active" });
+  });
+
+  it("filters by search, role and status; the counts ignore the filters (AT-U2)", async () => {
+    const cookie = await management();
+    const names = async (query: string) => {
+      const res = await http.get(`/users${query}`).set("Cookie", cookie);
+      expect(res.status).toBe(200);
+      return res.body.data.map((row: { name: string }) => row.name);
+    };
+    expect(await names("?search=wang")).toEqual(["Wang Fang"]);
+    expect(await names("?search=%20W%20ANG%20")).toEqual(["Wang Fang"]);
+    expect(await names("?search=chen%40")).toEqual(["Chen Yu"]);
+    expect(await names("?role=China%20staff")).toEqual(["Wang Fang", "Chen Yu", "Li Wei"]);
+    expect(await names("?status=Inactive")).toEqual([]);
+    expect(await names("")).toHaveLength(8);
+
+    await ctx.db.update(users).set({ status: "Inactive" }).where(eq(users.email, SEEDED.warehouseStaff));
+    const res = await http.get("/users?status=Active").set("Cookie", cookie);
+    expect(res.body.data).toHaveLength(7);
+    expect(res.body.counts).toEqual({ active: 7, inactive: 1 });
+  });
+
+  it("refuses unknown query keys and values with 400", async () => {
+    const cookie = await management();
+    for (const query of ["?sort=name", "?role=Boss", "?status=active", "?role=Accounts&role=Procurement"]) {
+      const res = await http.get(`/users${query}`).set("Cookie", cookie);
+      expect(res.status, query).toBe(400);
+      expect(res.body.error.code).toBe("bad_request");
+    }
+  });
+
+  it("shows the last sign-in time once a user has signed in", async () => {
+    const at = new Date("2026-10-26T03:42:00.000Z");
+    await ctx.db.update(users).set({ lastSignInAt: at }).where(eq(users.email, SEEDED.chinaStaff));
+    const res = await http.get("/users?search=chen").set("Cookie", await management());
+    expect(res.body.data[0].lastSignInAt).toBe(at.toISOString());
+  });
+});
+
+describe("USR-2 GET /users/:id", () => {
+  it("returns the user and the form options", async () => {
+    const res = await http.get(`/users/${await idOf(SEEDED.chinaStaffTwoStages)}`).set("Cookie", await management());
+    expect(res.status).toBe(200);
+    const guangzhou = (await ctx.db.select().from(locations).where(eq(locations.name, "Guangzhou office")))[0]!;
+    expect(res.body.user).toEqual({
+      id: await idOf(SEEDED.chinaStaffTwoStages),
+      name: "Wang Fang",
+      email: "wang@mrgarments.com",
+      phone: "",
+      role: "China staff",
+      officeId: guangzhou.id,
+      office: "Guangzhou office",
+      language: "English",
+      status: "Active",
+      stages: [2, 3],
+      lastSignInAt: null,
+    });
+    expect(res.body.options.roles).toEqual(["Management", "Procurement", "Accounts", "China staff", "India staff", "Warehouse staff"]);
+    expect(res.body.options.offices.map((office: { name: string }) => office.name)).toEqual(["Guangzhou office", "India office", "Main warehouse"]);
+    expect(res.body.options.languages).toEqual(["English"]);
+  });
+
+  it("offers active offices only", async () => {
+    await ctx.db.update(locations).set({ status: "Inactive" }).where(eq(locations.name, "India office"));
+    const res = await http.get(`/users/${await idOf(SEEDED.management)}`).set("Cookie", await management());
+    expect(res.body.user.officeId).toBeNull();
+    expect(res.body.options.offices.map((office: { name: string }) => office.name)).toEqual(["Guangzhou office", "Main warehouse"]);
+  });
+
+  it("is 404 for an unknown or malformed id (E10)", async () => {
+    const cookie = await management();
+    for (const id of [randomUUID(), "not-an-id"]) {
+      const res = await http.get(`/users/${id}`).set("Cookie", cookie);
+      expect(res.status).toBe(404);
+      expect(res.body.error.code).toBe("not_found");
+    }
+  });
+});
+
+describe("USR-3 POST /users", () => {
+  it("adds an active user with the ticked stages and issues an invite link (AT-U7)", async () => {
+    const res = await http.post("/users", { ...newUser, email: "  Test@MRGarments.com " }).set("Cookie", await management());
+    expect(res.status).toBe(201);
+    expect(res.body.user).toMatchObject({
+      name: "Test User",
+      email: "test@mrgarments.com",
+      phone: "",
+      role: "China staff",
+      officeId: null,
+      office: null,
+      language: "English",
+      status: "Active",
+      stages: [2],
+      lastSignInAt: null,
+    });
+    const id = res.body.user.id as string;
+    const stored = (await ctx.db.select().from(users).where(eq(users.id, id)))[0]!;
+    expect(stored.passwordHash).toBeNull();
+    expect(stored.createdBy).toBe(await idOf(SEEDED.management));
+    const links = await ctx.db
+      .select()
+      .from(passwordTokens)
+      .where(and(eq(passwordTokens.userId, id), eq(passwordTokens.purpose, "invite"), isNull(passwordTokens.usedAt)));
+    expect(links).toHaveLength(1);
+
+    const list = await http.get("/users").set("Cookie", await management());
+    expect(list.body.data.at(-1)).toMatchObject({ name: "Test User", status: "Active" });
+    expect(list.body.counts).toEqual({ active: 9, inactive: 0 });
+  });
+
+  it("stores the office, phone, language and status it is given", async () => {
+    const office = (await ctx.db.select().from(locations).where(eq(locations.name, "India office")))[0]!;
+    const res = await http
+      .post("/users", { name: "Ravi K", email: "ravi@mrgarments.com", phone: " +91 98470 11111 ", role: "India staff", officeId: office.id, language: "English", status: "Inactive", stages: [5, 4, 5] })
+      .set("Cookie", await management());
+    expect(res.status).toBe(201);
+    expect(res.body.user).toMatchObject({ phone: "+91 98470 11111", officeId: office.id, office: "India office", status: "Inactive", stages: [4, 5] });
+  });
+
+  it("refuses a password with 400 (C5)", async () => {
+    const res = await http.post("/users", { ...newUser, password: "Secret123" }).set("Cookie", await management());
+    expect(res.status).toBe(400);
+    expect(res.body.error.code).toBe("bad_request");
+    expect(await ctx.db.select().from(users).where(eq(users.email, newUser.email))).toHaveLength(0);
+  });
+
+  it("refuses unknown keys and impossible values with 400", async () => {
+    const cookie = await management();
+    for (const body of [{ ...newUser, admin: true }, { ...newUser, language: "French" }, { ...newUser, status: "Gone" }, { ...newUser, stages: [7] }, { ...newUser, stages: "2" }]) {
+      expect((await http.post("/users", body).set("Cookie", cookie)).status, JSON.stringify(body)).toBe(400);
+    }
+  });
+
+  it("names every missing required field (M13, M14, M16)", async () => {
+    const res = await http.post("/users", {}).set("Cookie", await management());
+    expect(res.status).toBe(422);
+    expect(res.body.error).toMatchObject({ code: "validation_failed", fields: { name: MESSAGES.name, email: MESSAGES.email, role: MESSAGES.role } });
+    const blank = await http.post("/users", { name: "  ", email: "not-an-email", role: "" }).set("Cookie", await management());
+    expect(blank.body.error.fields).toEqual({ name: "Enter the full name.", email: "Enter a valid email address.", role: "Choose a role." });
+  });
+
+  it("refuses a duplicate email in any capitalisation with 409 (AT-U11, M15)", async () => {
+    const res = await http.post("/users", { ...newUser, email: "WANG@mrgarments.com" }).set("Cookie", await management());
+    expect(res.status).toBe(409);
+    expect(res.body.error).toMatchObject({ code: "email_exists", fields: { email: "A user with this email already exists." } });
+  });
+
+  it("refuses an office that is unknown, malformed or inactive (M17)", async () => {
+    const cookie = await management();
+    await ctx.db.update(locations).set({ status: "Inactive" }).where(eq(locations.name, "Main warehouse"));
+    const closed = (await ctx.db.select().from(locations).where(eq(locations.name, "Main warehouse")))[0]!;
+    for (const officeId of [randomUUID(), "Guangzhou office", closed.id]) {
+      const res = await http.post("/users", { ...newUser, officeId }).set("Cookie", cookie);
+      expect(res.status, officeId).toBe(422);
+      expect(res.body.error.fields).toEqual({ officeId: "Choose an office from the list." });
+    }
+  });
+
+  it("refuses stages outside the role (M18) and stages for non-staff roles (M19)", async () => {
+    const cookie = await management();
+    const outside = await http.post("/users", { ...newUser, stages: [2, 4] }).set("Cookie", cookie);
+    expect(outside.status).toBe(422);
+    expect(outside.body.error.fields).toEqual({ stages: "China staff can't enter data for Clearing (India). Untick it first." });
+    const notUsed = await http.post("/users", { ...newUser, role: "Procurement" }).set("Cookie", cookie);
+    expect(notUsed.body.error.fields).toEqual({ stages: "Procurement doesn't use stage access. Untick all stages first." });
+  });
+});
+
+describe("USR-4 PATCH /users/:id", () => {
+  it("saves a changed stage and keeps it (AT-U3)", async () => {
+    const cookie = await management();
+    const wang = await idOf(SEEDED.chinaStaffTwoStages);
+    const res = await http.patch(`/users/${wang}`, { stages: [2] }).set("Cookie", cookie);
+    expect(res.status).toBe(200);
+    expect(res.body.user.stages).toEqual([2]);
+    expect((await http.get(`/users/${wang}`).set("Cookie", cookie)).body.user.stages).toEqual([2]);
+  });
+
+  it("saves the other fields and only the keys sent", async () => {
+    const cookie = await management();
+    const wang = await idOf(SEEDED.chinaStaffTwoStages);
+    const res = await http.patch(`/users/${wang}`, { name: "Wang Fang ", phone: "+86 138 2210 7745", officeId: null }).set("Cookie", cookie);
+    expect(res.status).toBe(200);
+    expect(res.body.user).toMatchObject({ name: "Wang Fang", phone: "+86 138 2210 7745", officeId: null, role: "China staff", stages: [2, 3] });
+  });
+
+  it("refuses a stage outside the role and saves nothing (AT-U4)", async () => {
+    const cookie = await management();
+    const wang = await idOf(SEEDED.chinaStaffTwoStages);
+    const res = await http.patch(`/users/${wang}`, { stages: [2, 3, 4] }).set("Cookie", cookie);
+    expect(res.status).toBe(422);
+    expect(res.body.error.fields).toEqual({ stages: "China staff can't enter data for Clearing (India). Untick it first." });
+    expect((await http.get(`/users/${wang}`).set("Cookie", cookie)).body.user.stages).toEqual([2, 3]);
+  });
+
+  it("refuses a password with 400 (C5) and unknown users with 404 (E10)", async () => {
+    const cookie = await management();
+    expect((await http.patch(`/users/${await idOf(SEEDED.chinaStaff)}`, { password: "Secret123" }).set("Cookie", cookie)).status).toBe(400);
+    expect((await http.patch(`/users/${randomUUID()}`, { name: "Nobody" }).set("Cookie", cookie)).status).toBe(404);
+    expect((await http.patch("/users/not-an-id", { name: "Nobody" }).set("Cookie", cookie)).status).toBe(404);
+  });
+
+  it("refuses another user's email (M15) but accepts the user's own in another case", async () => {
+    const cookie = await management();
+    const chen = await idOf(SEEDED.chinaStaff);
+    const taken = await http.patch(`/users/${chen}`, { email: "Wang@mrgarments.com" }).set("Cookie", cookie);
+    expect(taken.status).toBe(409);
+    expect(taken.body.error.fields).toEqual({ email: MESSAGES.emailTaken });
+    const own = await http.patch(`/users/${chen}`, { email: "CHEN@mrgarments.com" }).set("Cookie", cookie);
+    expect(own.status).toBe(200);
+    expect(own.body.user.email).toBe("chen@mrgarments.com");
+  });
+
+  it("checks a changed office (M17) but not an unchanged one", async () => {
+    const cookie = await management();
+    const li = await idOf(LI_WEI);
+    expect((await http.patch(`/users/${li}`, { officeId: randomUUID() }).set("Cookie", cookie)).body.error.fields).toEqual({ officeId: MESSAGES.office });
+    await ctx.db.update(locations).set({ status: "Inactive" }).where(eq(locations.name, "Guangzhou office"));
+    const current = (await http.get(`/users/${li}`).set("Cookie", cookie)).body.user;
+    expect((await http.patch(`/users/${li}`, { officeId: current.officeId, phone: "1" }).set("Cookie", cookie)).status).toBe(200);
+  });
+});
+
+describe("B8 role changes, the last Management user and sessions", () => {
+  it("China staff to India staff while Receiving is ticked: 422, session unchanged (B8 row 1, AT-U5)", async () => {
+    const chen = await idOf(SEEDED.chinaStaff);
+    const chenCookie = await signInAs(ctx, SEEDED.chinaStaff);
+    const res = await http.patch(`/users/${chen}`, { role: "India staff" }).set("Cookie", await management());
+    expect(res.status).toBe(422);
+    expect(res.body.error.fields).toEqual({ stages: "India staff can't enter data for Receiving (China). Untick it first." });
+    const me = await http.get("/me").set("Cookie", chenCookie);
+    expect(me.status).toBe(200);
+    expect(me.body).toMatchObject({ role: "China staff", stages: [2] });
+  });
+
+  it("China staff to India staff with ticks changed to Clearing: saved, next request uses it (B8 row 2, AT-T2)", async () => {
+    const wang = await idOf(SEEDED.chinaStaffTwoStages);
+    const wangCookie = await signInAs(ctx, SEEDED.chinaStaffTwoStages);
+    expect((await http.get("/me").set("Cookie", wangCookie)).body.stages).toEqual([2, 3]);
+    const res = await http.patch(`/users/${wang}`, { role: "India staff", stages: [4] }).set("Cookie", await management());
+    expect(res.status).toBe(200);
+    const me = await http.get("/me").set("Cookie", wangCookie);
+    expect(me.status).toBe(200);
+    expect(me.body).toMatchObject({ role: "India staff", stages: [4], landing: "/clearing" });
+  });
+
+  it("a staff user moved to a non-staff role must lose their stages first (M19)", async () => {
+    const res = await http.patch(`/users/${await idOf(LI_WEI)}`, { role: "Accounts" }).set("Cookie", await management());
+    expect(res.body.error.fields).toEqual({ stages: "Accounts doesn't use stage access. Untick all stages first." });
+    const ok = await http.patch(`/users/${await idOf(LI_WEI)}`, { role: "Accounts", stages: [] }).set("Cookie", await management());
+    expect(ok.body.user).toMatchObject({ role: "Accounts", stages: [] });
+  });
+
+  it("the only Management user can't leave Management or go inactive (B8 row 3, AT-U6, M20)", async () => {
+    const cookie = await management();
+    const suresh = await idOf(SEEDED.management);
+    const role = await http.patch(`/users/${suresh}`, { role: "Procurement" }).set("Cookie", cookie);
+    expect(role.status).toBe(409);
+    expect(role.body.error).toMatchObject({ code: "last_management", fields: { role: "At least one active Management user is required." } });
+    expect(role.body.error.fields.status).toBeUndefined();
+    const status = await http.patch(`/users/${suresh}`, { status: "Inactive" }).set("Cookie", cookie);
+    expect(status.status).toBe(409);
+    expect(status.body.error.fields).toEqual({ status: MESSAGES.lastManagement });
+    const both = await http.patch(`/users/${suresh}`, { role: "Accounts", status: "Inactive" }).set("Cookie", cookie);
+    expect(both.body.error.fields).toEqual({ role: MESSAGES.lastManagement, status: MESSAGES.lastManagement });
+    expect((await http.get(`/users/${suresh}`).set("Cookie", cookie)).body.user).toMatchObject({ role: "Management", status: "Active" });
+    // Saving the only Management user without demoting him is fine.
+    expect((await http.patch(`/users/${suresh}`, { role: "Management", status: "Active", phone: "1" }).set("Cookie", cookie)).status).toBe(200);
+  });
+
+  it("an inactive Management user does not count", async () => {
+    await ctx.db.update(users).set({ role: "Management", status: "Inactive" }).where(eq(users.email, SEEDED.procurement));
+    const res = await http.patch(`/users/${await idOf(SEEDED.management)}`, { role: "Procurement" }).set("Cookie", await management());
+    expect(res.status).toBe(409);
+  });
+
+  it("with another Management user, Suresh may demote himself; admin access ends on his next request (B8 row 4, B8.3)", async () => {
+    const cookie = await management();
+    const priya = await idOf(SEEDED.procurement);
+    expect((await http.patch(`/users/${priya}`, { role: "Management" }).set("Cookie", cookie)).status).toBe(200);
+    const res = await http.patch(`/users/${await idOf(SEEDED.management)}`, { role: "Procurement" }).set("Cookie", cookie);
+    expect(res.status).toBe(200);
+    expect(res.body.user.role).toBe("Procurement");
+    expect((await http.get("/users").set("Cookie", cookie)).status).toBe(403);
+    expect((await http.get("/me").set("Cookie", cookie)).body.role).toBe("Procurement");
+  });
+
+  it("two simultaneous demotions of the last two Management users: exactly one succeeds (AT-R6)", async () => {
+    const cookie = await management();
+    const suresh = await idOf(SEEDED.management);
+    const priya = await idOf(SEEDED.procurement);
+    const waitingOnLocks = async () =>
+      (await ctx.pool.query(`select count(*)::int as n from pg_stat_activity where datname = current_database() and wait_event_type = 'Lock'`)).rows[0]
+        .n as number;
+    for (const change of [{ role: "Procurement" }, { status: "Inactive" }]) {
+      await ctx.db.update(users).set({ role: "Management", status: "Active" }).where(eq(users.id, priya));
+      await ctx.db.update(users).set({ role: "Management", status: "Active" }).where(eq(users.id, suresh));
+      // Hold the Management rows until both requests are past sign-in and waiting on them, so they really overlap.
+      const holder = await ctx.pool.connect();
+      await holder.query("begin");
+      await holder.query(`select id from users where role = 'Management' and status = 'Active' for update`);
+      const pending = Promise.all([http.patch(`/users/${suresh}`, change).set("Cookie", cookie), http.patch(`/users/${priya}`, change).set("Cookie", cookie)]);
+      for (let tries = 0; (await waitingOnLocks()) < 2 && tries < 250; tries++) await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(await waitingOnLocks()).toBe(2);
+      await holder.query("commit");
+      holder.release();
+      const results = await pending;
+      expect(results.map((res) => res.status).sort()).toEqual([200, 409]);
+      expect(results.find((res) => res.status === 409)!.body.error.code).toBe("last_management");
+      const left = await ctx.db.execute(sql`select count(*)::int as n from users where role = 'Management' and status = 'Active'`);
+      expect(left.rows[0]!.n).toBe(1);
+    }
+  });
+
+  it("deactivating ends that user's sessions at once and only theirs (B8 row 5, AT-T1, B8.4)", async () => {
+    const cookie = await management();
+    const li = await idOf(LI_WEI);
+    const liCookie = await signInAs(ctx, LI_WEI);
+    await signInAs(ctx, LI_WEI);
+    expect((await http.get("/me").set("Cookie", liCookie)).status).toBe(200);
+    expect(await sessionsOf(li)).toBe(2);
+    const res = await http.patch(`/users/${li}`, { status: "Inactive" }).set("Cookie", cookie);
+    expect(res.status).toBe(200);
+    expect(await sessionsOf(li)).toBe(0);
+    expect((await http.get("/me").set("Cookie", liCookie)).status).toBe(401);
+    expect((await http.get("/users").set("Cookie", cookie)).status).toBe(200);
+  });
+
+  it("reactivating lets the user sign in again (B8 row 6)", async () => {
+    const cookie = await management();
+    const li = await idOf(LI_WEI);
+    await http.patch(`/users/${li}`, { status: "Inactive" }).set("Cookie", cookie);
+    expect((await http.get("/me").set("Cookie", await signInAs(ctx, LI_WEI))).status).toBe(401);
+    const res = await http.patch(`/users/${li}`, { status: "Active" }).set("Cookie", cookie);
+    expect(res.status).toBe(200);
+    expect((await http.get("/me").set("Cookie", await signInAs(ctx, LI_WEI))).status).toBe(200);
+  });
+});
+
+describe("stageProblem", () => {
+  it("follows Q7 for every role", () => {
+    expect(stageProblem("China staff", [2, 3])).toBeUndefined();
+    expect(stageProblem("India staff", [4, 5])).toBeUndefined();
+    expect(stageProblem("Warehouse staff", [6])).toBeUndefined();
+    expect(stageProblem("Warehouse staff", [5, 6])).toBe("Warehouse staff can't enter data for Transport. Untick it first.");
+    expect(stageProblem("Management", [])).toBeUndefined();
+    expect(stageProblem("Management", [2])).toBe("Management doesn't use stage access. Untick all stages first.");
+  });
+});

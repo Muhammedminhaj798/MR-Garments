@@ -1,0 +1,8 @@
+node_modules/
+coverage/
+dist/
+
+# Local settings and secrets. Only the example file is committed.
+.env
+.env.*
+!.env.example
