@@ -74,7 +74,8 @@ Same rules for all seven tabs:
 - Name: trimmed, required, at most 200 characters. Duplicates are case-insensitive (the existing unique indexes on
   `lower(name)` decide, so two simultaneous adds can't both win): 409 `name_exists` with `fields.name`
   "A <noun> with this name already exists.". Empty: 422 `fields.name` "Enter the <noun> name.".
-- Other text fields: trimmed, optional, at most 200 characters (address and notes 1000).
+- Other text fields: trimmed, optional, at most 200 characters (address and notes 1000). Too long: 422
+  `fields.<field>` "Use 200 characters or fewer." ("Use 1000 characters or fewer." for address and notes).
 - **No delete.** Records are referenced by orders, containers and users; "Deactivate" is `PATCH { status: "Inactive" }`.
   Inactive records drop out of every option list (they already select `status = 'Active'`) and stay on existing
   records. The frontend asks for confirmation before deactivating.
