@@ -207,6 +207,57 @@ hub's "recent downloads" list has no table behind it: show the empty state, don'
 Each owner appends its endpoint shapes here (Agent 5: CLR, TRN, WH; Agent 6: landed cost, reports) in the same
 style as `live-screens-contracts.md`. Frontend types live in the owner's own file (section 9).
 
+### 8.A6 Landed cost and Reports (Agent 6)
+
+Backend `src/modules/reports/` (`landed-cost-list.ts`, `reports.ts`, `reports.routes.ts`); frontend types
+`src/lib/api/reports-types.ts`. INR with 2 decimals, CNY with 2 decimals, dates `YYYY-MM-DD`, months `YYYY-MM`.
+Query parameters are strict: an unknown or repeated key, a malformed date or id, or `from` after `to` is 400
+`bad_request`. 401 signed out, 403 below View.
+
+- **`GET /landed-cost?supplierId=&teamId=`** (landedCost >= View; both optional uuids) `LandedCostResponse`:
+  - `orders`: every order whose `totalInr > 0` (newest order date first; `supplierId` keeps that supplier's orders,
+    `teamId` the orders with stocked pieces for that team), each `{ orderId, po, supplier {id, name}, item, quantity,
+    unit` (main line) `, terms` (`"FOB"` | `"CNF"` when every container carrying the order has those terms, `"mixed"`
+    when they differ, `null` before loading) `, ...OrderLandedCost` (6.1, from `loadLandedCosts`) `, teams {teamId,
+    team, pieces, costInr}[]` (stocked receipt lines with pieces > 0, team creation order; `costInr = round2(pieces x
+    perPieceInr)`) `, goodsPayments {id, orderId, kind, paidOn, amountCny, rateInr, amountInr}[] }` (paid supplier
+    payments, oldest first; `amountInr = round2(amountCny x rateInr)`).
+  - `kpis {finishedTotalInr, finishedPieces, finishedPos, estimatePos, estimateWaitingFor}`: over the rows; finished =
+    `final`; `finishedPieces` sums `stockedPieces`; `estimateWaitingFor` is the reason every estimate shares, else null.
+  - `suppliers`, `teams`: active `{id, name}[]` (creation order), for the header filters.
+- **`GET /reports/<name>?from=&to=&supplierId=`** (reports >= View; all optional). Every body also has
+  `filter {from, to, supplier}` (`supplier`: the filtered supplier's name, null when not filtered or unknown).
+  "Today" is the date in India. Unknown names fall through to 404.
+  - `order-status` (orders by order date in the period, supplier): `{ total, stageCounts` (stages 1-6) `, late {orderId,
+    po, supplier, due, lateDays}[]` (stage 1-2 orders due before today, oldest due first) `, finishedThisMonth,
+    averageOrderDays }`. Finished = stage 6; its finish date is the latest `received_on` of a stocked warehouse receipt
+    of a container carrying it. `averageOrderDays`: average of finish date - order date, rounded; null without one.
+  - `deliveries-per-day` (supplier only): `{ from` (today) `, to` (today + 13) `, days {date, count}[]` (14 days, stage
+    1-2 orders by delivery date) `, dueNext7, suppliersNext7, dueNext14, busiest {dates, count} | null, daysWithNone,
+    late }` (`late`: stage 1-2 orders due before today; not in `days`).
+  - `ordered-vs-received` (orders by order date, supplier): `{ lines {orderLineId, orderId, po, supplier, item, unit,
+    ordered, received, short, shortValueCny}[]` (every line of every order with a China receipt; `short = max(0,
+    ordered - received)`, `shortValueCny = round2(short x rateCny)` or null) `, ordersChecked, shortPos, shortValueCny,
+    fullOrders }`.
+  - `containers-timeline` (window `from`-`to`, default today - 25 to today + 24; supplier = containers carrying one of
+    its orders): `{ from, to, containers {id, number, status, loadedOn, arrival}[]` (spans overlapping the window,
+    loading date first; `arrival` = the clearing's `arrivedOn` for an arrived container, else its `eta`) `, active`
+    (loading or at sea) `, arrivingIn7Days` (the ETA dates, today to today + 7, of containers not arrived) `, averageSeaDays`
+    (arrived ones, loaded to arrival, rounded; null) `, nextArrival {date, number} | null }`.
+  - `payments-per-supplier` (orders by order date, supplier): `{ suppliers {supplierId, supplier, orders, orderValueCny,
+    paidCny, paidInr, balanceCny}[]` (open orders, stage below 6, by order value, largest first; paid = paid payments to
+    the supplier only, agent payments being sea freight (6.2); `balanceCny = orderValueCny - paidCny`) `, totals {orders,
+    orderValueCny, paidCny, paidInr, balanceCny}, dueNext30Cny` (due supplier payments of those orders, today to today +
+    30; CNY, as due payments have no rate) `, finishedPos }` (stage 6 POs, same filters).
+  - `landed-cost-by-month` (period = month of stocking, not order date; supplier): `{ months {month, pieces,
+    landedCostInr, perPieceInr, soFar}[], totals {orders, pieces, landedCostInr, perPieceInr}, biggest {month,
+    landedCostInr} | null }`. Only orders whose landed cost is `final`, by the month of their finish date (above);
+    `pieces = stockedPieces`, `landedCostInr = totalInr`. Months run from `from` (else the first month with an order) to
+    `to` (else this month), empty months as 0; `soFar` marks this month; `[]` when nothing is finished and no `from`.
+  - `summary` (the hub, same filters as the reports it summarises): `{ suppliers` (active `{id, name}[]`) `, orders
+    {total, atStage1}, deliveries {dueNext7, late}, receiving {shortOrders, shortPcs, shortM}, containers {onTheWay,
+    arrivingIn7Days}` (counts) `, payments {dueNext30Cny}, landedCost {finishedOrders, finishedTotalInr} }`.
+
 ## 9. Files and owners
 
 Each agent owns a vertical slice: its backend routes and tests, and its frontend feature, queries, types and e2e.
