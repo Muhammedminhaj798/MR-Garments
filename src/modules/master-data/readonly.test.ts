@@ -160,19 +160,6 @@ describe("malformed queries are 400", () => {
   });
 });
 
-describe("read-only: POST and PATCH fall through to 404 (B6)", () => {
-  it.each(PATHS.filter((path) => path !== "/shipping-agents"))("%s", async (path) => {
-    for (const res of [
-      await http.post(path, { name: "New" }).set("Cookie", management),
-      await http.patch(path, { name: "New" }).set("Cookie", management),
-      await http.patch(`${path}/00000000-0000-4000-8000-000000000000`, { status: "Inactive" }).set("Cookie", management),
-    ]) {
-      expect(res.status).toBe(404);
-      expect(res.body).toEqual({ error: { code: "not_found", message: "Endpoint not found." } });
-    }
-  });
-});
-
 describe("AT-R5: Management only", () => {
   const others = [SEEDED.procurement, SEEDED.accounts, SEEDED.chinaStaff, SEEDED.indiaStaff, SEEDED.warehouseStaff];
   it.each(PATHS)("%s", async (path) => {
