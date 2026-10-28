@@ -207,6 +207,73 @@ hub's "recent downloads" list has no table behind it: show the empty state, don'
 Each owner appends its endpoint shapes here (Agent 5: CLR, TRN, WH; Agent 6: landed cost, reports) in the same
 style as `live-screens-contracts.md`. Frontend types live in the owner's own file (section 9).
 
+### 8.1 Clearing, Transport, Warehouse (Agent 5)
+
+Types: frontend `src/lib/api/stages-types.ts`. Every endpoint: 401 signed out; 403 `forbidden` below the section 3
+access; 404 `not_found` "Container not found." (CLR, TRN) or "Trip not found." (WH) for a malformed or unknown id;
+400 `bad_request` for unknown keys or a body that isn't an object. PUTs answer 200, insert or update the one record,
+and run in one transaction that locks the container (or trip) row, then the record's row. "Last 30 days" is today in
+India and the 29 days before it. Option lists are the active rows plus the ones already used, so saved records keep
+their names.
+
+- **CLR-1** `GET /clearings` -> `ClearingList`: `kpis {inClearingNow, clearedLast30Days, averageDaysToClear,
+  clearingCostLast30DaysInr}` (in clearing now: arrived containers not cleared, waiting ones included; the others count
+  clearings by `clearedOn`; average `arrivedOn` -> `clearedOn` in days, 1 decimal, null when none); `rows` one per
+  container with status `arrived`, newest `arrivedOn` (the ETA while waiting) first: `containerId, number, terms, eta,
+  agent {id, name} | null, arrivedOn, handedOn, billOfEntry, dutyPaidOn, clearedOn, orders` (POs), `status`
+  (`waiting` = no clearing yet | `in_clearing` | `cleared`), `clearingCostInr` (the four charges; 0 while waiting);
+  `agents {id, name}[]` (filter).
+- **CLR-2** `GET /clearings/:containerId` -> `ClearingForm`: `container {id, number, status, terms, loadedOn, eta}`
+  (any status), `clearing {id, clearingAgentId, arrivedOn, handedOn, billOfEntry, dutyPaidOn, clearedOn,
+  goodsValueInr | null, customsDutyInr, otherDutiesInr, agentChargesInr, portChargesInr, status} | null`, `goods
+  {orderLineId, orderId, po, item, unit, bundles, quantity}[]` (PO, then line order), `suppliers` (names), `agents {id,
+  name, contactPerson, phone}[]`.
+- **CLR-3** `PUT /clearings/:containerId` body `SaveClearingBody`: `clearingAgentId, arrivedOn` required;
+  `handedOn, dutyPaidOn, clearedOn` (date or null, default null), `billOfEntry` (default ""), `goodsValueInr` (default
+  null), the four charges (default 0), `complete` (default false). 200 `{ clearing: {id, status} }`. 409
+  `container_not_arrived`, `record_closed`. 422 fields `clearingAgentId`, `arrivedOn`, `handedOn`, `dutyPaidOn`,
+  `clearedOn`, `billOfEntry`, `goodsValueInr` and the charges. Every save calls `moveOrdersToStage(tx, id, 4)`.
+- **TRN-1** `GET /transports` -> `TransportList`: `kpis {onTheWay, deliveredLast30Days, bundlesDeliveredLast30Days,
+  shortLast30Days, transportCostLast30DaysInr}` (on the way: trips `on_road`; the others count trips by `unloadedOn`);
+  `rows` one per trip, newest loading first: `id, containerId, container, vehicleNumber, lrNumber, company {id, name},
+  orders, bundlesLoaded, loadedOn, unloadedOn, bundlesReceived, status` (`on_road` | `unloaded`), `costInr` (freight +
+  handling); `ready {containerId, container, clearedOn, clearingAgent, orders, bundles}[]` (cleared, no trip, oldest
+  clearing first); `companies {id, name}[]` (filter).
+- **TRN-2** `GET /transports/:containerId` -> `TransportForm`: `container {id, number, status, terms}`, `clearing
+  {status, clearedOn, agent {id, name}} | null`, `trip {id, transportCompanyId, destinationId, lrNumber, vehicleNumber,
+  driverName, driverPhone, bundlesLoaded, loadedOn, loadedFrom, loadedBy, unloadedOn, bundlesReceived, receivedBy,
+  shortRemark, freightInr, handlingInr, status} | null`, `goods`, `suppliers` (as CLR-2), `companies {id, name}[]`,
+  `warehouses {id, name}[]` (locations of type Warehouse).
+- **TRN-3** `PUT /transports/:containerId` body `SaveTripBody`: `transportCompanyId, destinationId, lrNumber,
+  vehicleNumber, driverPhone, bundlesLoaded` (1+), `loadedOn` required; `driverName, loadedFrom, loadedBy, receivedBy`
+  (default "", 200 characters), `shortRemark` (default "", 1000), `unloadedOn`, `bundlesReceived` (default null),
+  `freightInr, handlingInr` (default 0), `complete`. 200 `{ trip: {id, status} }`. 409 `not_cleared`, `record_closed`.
+  422 fields: every body key; `bundlesReceived` above `bundlesLoaded` is refused on drafts too. Every save calls
+  `moveOrdersToStage(tx, id, 5)`.
+- **WH-1** `GET /warehouse-receipts` -> `WarehouseList`: `rows` one per order per stocked receipt, newest received
+  first, then PO: `id` (`<receiptId>:<orderId>`), `receiptId, transportId, receivedOn, receivedBy, container, orderId,
+  po, item` (main line), `supplier, location {id, name}, received` (pieces given to teams), `teams` (`{ <teamId>:
+  pieces }`), `costPerPieceInr` (the order's `perPieceInr`; null without landedCost >= View); `ready {transportId,
+  containerId, container, vehicleNumber, lrNumber, unloadedOn, bundlesReceived, destination, receiptStatus` (`draft` |
+  null)`, orders}[]` (unloaded trips not stocked, oldest unloading first); `teams {id, name}[]` (active only: the split
+  columns); `warehouses {id, name}[]`. The KPIs and the totals row are sums of `rows`, made by the frontend.
+- **WH-2** `GET /warehouse-receipts/:transportId` -> `ReceiveGoodsForm`: `trip {id, containerId, container, terms,
+  vehicleNumber, lrNumber, bundlesLoaded, bundlesReceived, unloadedOn, destinationId, status}` (any status), `receipt
+  {id, locationId, receivedOn, receivedBy, bundlesReceived, status` (`draft` | `stocked`)`, lines {orderLineId, teamId,
+  quantity}[]} | null`, `lines {orderLineId, orderId, po, item, unit, quantity}[]` (the container's quantities to
+  split), `teams`, `warehouses`, `cost {goodsInr, seaFreightInr, clearingInr | null, transportInr | null, totalInr,
+  orderedPieces, final} | null`: the `loadLandedCosts` figures of the container's orders added up (a part stays null
+  while it is null for every order), `orderedPieces` = the quantity of every line of those orders (cost per piece so
+  far = `totalInr / orderedPieces`), `final` when every one of those orders is final; null without landedCost >= View.
+- **WH-3** `PUT /warehouse-receipts/:transportId` body `SaveReceiptBody`: `locationId, receivedOn, receivedBy,
+  bundlesReceived` (0+) required, `lines {orderLineId, teamId, quantity}[]` (default [], at most 1000, one per line and
+  team), `complete`. 200 `{ receipt: {id, status} }`. 409 `not_unloaded`, `record_closed`. 422 fields `locationId`,
+  `receivedOn`, `receivedBy`, `bundlesReceived`, `lines` (the first problem: a line not in this container, a team that
+  isn't active, a quantity that isn't a whole number 0+, a line and team twice, a split over the container quantity
+  "<item> (<PO>): only <n> <unit> in this container.", or `complete` with nothing assigned "Give at least one piece to
+  a team."). The split is replaced as a whole and zero quantities aren't stored. `complete: true` calls
+  `moveOrdersToStage(tx, containerId, 6)`; drafts move nothing.
+
 ## 9. Files and owners
 
 Each agent owns a vertical slice: its backend routes and tests, and its frontend feature, queries, types and e2e.
