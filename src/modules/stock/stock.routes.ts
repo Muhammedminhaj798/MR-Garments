@@ -38,6 +38,7 @@ export const MESSAGES = {
   notOnOrder: "Some lines aren't on this order.",
   overReceipt: (item: string, left: number, unit: string) => `${item}: only ${left} ${unit} left to receive.`,
   notReceivable: "This order is past receiving and can't take more receipts.",
+  shortRemark: "Add a remark about the short items.",
   number: "Enter the container number.",
   numberTaken: "A container with this number already exists.",
   agent: "Choose a shipping agent from the list.",
@@ -65,7 +66,7 @@ const newReceipt = z.strictObject({
   orderId: z.uuid({ error: MESSAGES.order }),
   receivedOn: date(MESSAGES.receivedOn).refine((day) => day <= todayInIndia(), MESSAGES.receivedOnFuture),
   locationId: z.uuid({ error: MESSAGES.office }),
-  bundles: z.number({ error: MESSAGES.bundles }).int(MESSAGES.bundles).min(0, MESSAGES.bundles),
+  bundles: z.number({ error: MESSAGES.bundles }).int(MESSAGES.bundles).min(0, MESSAGES.bundles).max(2_147_483_647, MESSAGES.bundles),
   deliveryNote: text,
   shortRemark: text,
   lines: z
@@ -94,7 +95,7 @@ const newContainer = z.strictObject({
     .array(
       z.strictObject({
         orderLineId: z.uuid({ error: MESSAGES.unknownLine }),
-        bundles: z.number({ error: MESSAGES.loadQuantity }).int(MESSAGES.loadQuantity).min(0, MESSAGES.loadQuantity),
+        bundles: z.number({ error: MESSAGES.loadQuantity }).int(MESSAGES.loadQuantity).min(0, MESSAGES.loadQuantity).max(2_147_483_647, MESSAGES.loadQuantity),
         quantity: z.number({ error: MESSAGES.loadQuantity }).int(MESSAGES.loadQuantity).min(1, MESSAGES.loadQuantity),
       }),
       { error: MESSAGES.noLines },
@@ -220,6 +221,10 @@ export function stockRoutes({ db }: RouteContext) {
           problems.lines ??= MESSAGES.overReceipt(line.item, line.ordered - line.received, unit(line.countedIn));
         }
       }
+      // Screen 21: a remark is required while any line of the order is still short after this receipt.
+      const now = new Map(input.lines.map((line) => [line.orderLineId, line.quantity]));
+      const short = lines.some((line) => line.received + (now.get(line.id) ?? 0) < line.ordered);
+      if (!problems.lines && short && !input.shortRemark) problems.shortRemark = MESSAGES.shortRemark;
       if (Object.keys(problems).length > 0) throw validationFailed(problems);
 
       const { lines: bodyLines, ...values } = input;

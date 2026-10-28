@@ -55,8 +55,8 @@ const newOrder = z.strictObject({
 });
 type NewOrder = z.infer<typeof newOrder>;
 
-const unit = (countedIn: string) => (countedIn === "Metres" ? "m" : "pcs");
-const round2 = (value: number) => Math.round(value * 100) / 100;
+export const unit = (countedIn: string) => (countedIn === "Metres" ? "m" : "pcs");
+export const round2 = (value: number) => Math.round(value * 100) / 100;
 
 // PO numbers: "PO-" + (highest number + 1); the first is PO-2050.
 const FIRST_PO = 2050;
@@ -115,7 +115,7 @@ const orderColumns = {
 const newestFirst = [desc(orders.orderDate), desc(poValue)];
 
 // ponytail: per-order subqueries over every order; add paging or a stage filter when orders reach the thousands.
-function orderRows(db: Database, orderBy: SQL[], where?: SQL) {
+export function orderRows(db: Database, orderBy: SQL[], where?: SQL) {
   return db
     .select(orderColumns)
     .from(orders)
@@ -187,6 +187,8 @@ export function ordersRoutes({ db }: RouteContext) {
     for (let attempt = 1; ; attempt++) {
       try {
         const order = await db.transaction(async (tx) => {
+          // One order at a time takes a PO number, so a burst of creates can't all pick the same one (audit M1).
+          await tx.execute(sql`select pg_advisory_xact_lock(hashtext('orders.po_number'))`);
           const created = await tx
             .insert(orders)
             .values({ poNumber: await nextPo(tx), supplierId: input.supplierId, orderDate: input.orderDate, deliveryDate: input.deliveryDate, createdBy: userId })

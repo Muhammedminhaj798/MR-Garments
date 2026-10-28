@@ -29,7 +29,7 @@ const body = (orderId: string, lines: { orderLineId: string; quantity: number }[
   locationId: guangzhou,
   bundles: 2,
   deliveryNote: "DN-1",
-  shortRemark: "",
+  shortRemark: "The rest follows next week.",
   lines,
   ...extra,
 });
@@ -161,6 +161,34 @@ describe("REC-3 POST /receipts and REC-1 GET /receipts", () => {
     expect((await post(chen, { ...body(order.id, lines), receivedBy: "someone" })).status).toBe(400);
     expect((await post(chen, { ...body(order.id, []), lines: [{ ...lines[0], extra: 1 }] })).status).toBe(400);
     expect((await post(chen, body(order.id, lines, { bundles: 1.5 }))).body.error.fields).toEqual({ bundles: MESSAGES.bundles });
+  });
+
+  it("needs a short remark while any line is still short after this receipt", async () => {
+    const order = await makeOrder(ctx, { lines: twoLines });
+    const [main, fabric] = order.lineIds as [string, string];
+    for (const shortRemark of ["", "   "]) {
+      const res = await post(chen, body(order.id, [{ orderLineId: main, quantity: 100 }], { shortRemark }));
+      expect(res.status).toBe(422);
+      expect(res.body.error.fields).toEqual({ shortRemark: MESSAGES.shortRemark });
+    }
+    expect(await receiptCount(order.id)).toBe(0);
+    expect(await stageOf(order.id)).toBe(1);
+
+    const short = await post(chen, body(order.id, [{ orderLineId: main, quantity: 100 }, { orderLineId: fabric, quantity: 400 }], { shortRemark: " 100 m fabric to follow. " }));
+    expect(short.status).toBe(201);
+    const saved = await ctx.db.select({ shortRemark: receipts.shortRemark }).from(receipts).where(eq(receipts.id, short.body.receipt.id));
+    expect(saved).toEqual([{ shortRemark: "100 m fabric to follow." }]);
+
+    // The receipt that completes the order (counting earlier receipts) needs no remark.
+    expect((await post(chen, body(order.id, [{ orderLineId: fabric, quantity: 100 }], { shortRemark: "" }))).status).toBe(201);
+  });
+
+  it("takes a complete receipt with an empty remark", async () => {
+    const order = await makeOrder(ctx, { lines: twoLines });
+    const [main, fabric] = order.lineIds as [string, string];
+    const res = await post(chen, body(order.id, [{ orderLineId: main, quantity: 100 }, { orderLineId: fabric, quantity: 500 }], { shortRemark: "" }));
+    expect(res.status).toBe(201);
+    expect(await stageOf(order.id)).toBe(2);
   });
 
   it("refuses two simultaneous receipts that together over-receive", async () => {
