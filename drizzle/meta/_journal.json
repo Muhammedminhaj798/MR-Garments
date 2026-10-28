@@ -29,6 +29,13 @@
       "when": 1793084766001,
       "tag": "0003_orders_receiving_containers",
       "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "7",
+      "when": 1793170668674,
+      "tag": "0004_clearing_transport_warehouse",
+      "breakpoints": true
     }
   ]
 }
