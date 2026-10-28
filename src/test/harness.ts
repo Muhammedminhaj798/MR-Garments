@@ -40,6 +40,10 @@ const TABLES = [
   "transport_companies",
   "teams",
   "items",
+  "warehouse_receipt_lines",
+  "warehouse_receipts",
+  "transports",
+  "clearings",
 ];
 
 /** Empties every table and re-seeds, giving every seeded user TEST_PASSWORD. */
