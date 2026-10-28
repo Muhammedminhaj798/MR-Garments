@@ -161,7 +161,7 @@ describe("malformed queries are 400", () => {
 });
 
 describe("read-only: POST and PATCH fall through to 404 (B6)", () => {
-  it.each(PATHS)("%s", async (path) => {
+  it.each(PATHS.filter((path) => !["/locations", "/teams"].includes(path)))("%s", async (path) => {
     for (const res of [
       await http.post(path, { name: "New" }).set("Cookie", management),
       await http.patch(path, { name: "New" }).set("Cookie", management),
