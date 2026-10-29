@@ -245,7 +245,6 @@ export function stockRoutes({ db }: RouteContext) {
         const line = short[0]!;
         await notify(tx, {
           kind: "short-receipt",
-          capability: "receiving",
           actorId: req.user!.id,
           sourceId: created.id,
           title: `${po} received short`,
@@ -414,7 +413,6 @@ export function stockRoutes({ db }: RouteContext) {
         .where(and(inArray(orders.id, [...stages.keys()]), eq(orders.stage, 2)));
       await notify(tx, {
         kind: "container-loaded",
-        capability: "containers",
         actorId: req.user!.id,
         sourceId: containerId,
         title: `Container ${input.number} loaded`,

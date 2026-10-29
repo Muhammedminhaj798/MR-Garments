@@ -1,11 +1,12 @@
-import { and, count, desc, eq, isNull, sql } from "drizzle-orm";
+import { and, count, desc, eq, inArray, isNull, sql } from "drizzle-orm";
 import { Router } from "express";
 import { z } from "zod";
 
-import { requireUser } from "../../auth/current-user";
+import { type CurrentUser, requireUser } from "../../auth/current-user";
 import { notifications } from "../../db/schema";
 import { GENERIC_MESSAGE, HttpError, notFound } from "../../http/errors";
 import type { RouteContext } from "../context";
+import { readableKinds } from "./notify";
 
 // Owner: Agent 2 (notifications). NTF-1 GET /notifications, NTF-2 GET /notifications/unread-count,
 // NTF-3 POST /notifications/:id/read, NTF-4 POST /notifications/read-all (docs/live-screens-contracts.md,
@@ -35,16 +36,20 @@ const toNotification = <T extends { readAt: Date | null; createdAt: Date }>({ re
 
 export function notificationsRoutes({ db }: RouteContext) {
   const router = Router();
-  const mine = (userId: string) => eq(notifications.userId, userId);
-  const unread = async (userId: string) =>
-    (await db.select({ unread: count() }).from(notifications).where(and(mine(userId), isNull(notifications.readAt))))[0]!.unread;
+  // The caller's own rows, of the kinds their access allows now (KIND_CAPABILITY): every route reads through this.
+  const mine = (user: CurrentUser) => {
+    const kinds = readableKinds(user.role, user.stages);
+    return and(eq(notifications.userId, user.id), kinds.length > 0 ? inArray(notifications.kind, kinds) : sql`false`);
+  };
+  const unread = async (user: CurrentUser) =>
+    (await db.select({ unread: count() }).from(notifications).where(and(mine(user), isNull(notifications.readAt))))[0]!.unread;
 
   // NTF-1. Newest first; the cursor is the last item's id, so the next page starts strictly after that row.
   router.get("/notifications", requireUser, async (req, res) => {
     const query = listQuery.safeParse(req.query);
     if (!query.success) throw badRequest();
     const { limit, cursor } = query.data;
-    const me = req.user!.id;
+    const me = req.user!;
     let after;
     if (cursor) {
       // created_at as text keeps the microseconds a JS Date would drop.
@@ -64,7 +69,7 @@ export function notificationsRoutes({ db }: RouteContext) {
 
   // NTF-2. Served by the partial index on unread rows.
   router.get("/notifications/unread-count", requireUser, async (req, res) => {
-    res.json({ unread: await unread(req.user!.id) });
+    res.json({ unread: await unread(req.user!) });
   });
 
   // NTF-4.
@@ -72,7 +77,7 @@ export function notificationsRoutes({ db }: RouteContext) {
     const result = await db
       .update(notifications)
       .set({ readAt: sql`now()` })
-      .where(and(mine(req.user!.id), isNull(notifications.readAt)));
+      .where(and(mine(req.user!), isNull(notifications.readAt)));
     res.json({ updated: result.rowCount ?? 0 });
   });
 
@@ -84,7 +89,7 @@ export function notificationsRoutes({ db }: RouteContext) {
       await db
         .update(notifications)
         .set({ readAt: sql`coalesce(${notifications.readAt}, now())` })
-        .where(and(mine(req.user!.id), eq(notifications.id, id)))
+        .where(and(mine(req.user!), eq(notifications.id, id)))
         .returning(shape)
     )[0];
     if (!row) throw notFound("Notification");

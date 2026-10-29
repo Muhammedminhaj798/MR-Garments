@@ -147,7 +147,6 @@ export function containerDetailRoutes({ db }: RouteContext) {
         const sailed = input.status === "sea";
         await notify(tx, {
           kind: sailed ? "container-sailed" : "container-arrived",
-          capability: "containers",
           actorId: req.user!.id,
           sourceId: id,
           title: `Container ${row.number} ${sailed ? "sailed" : "arrived"}`,

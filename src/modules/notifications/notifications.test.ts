@@ -199,6 +199,23 @@ const inbox = (kind: string) =>
     .orderBy(asc(users.email));
 const LI = "li@mrgarments.com";
 
+describe("access changes", () => {
+  it("hides a kind from a reader who no longer has its access: list, count and read", async () => {
+    const [row] = await seedInbox(SEEDED.accounts, 1);
+    expect((await list(cookies.accounts)).body).toMatchObject({ unread: 1, items: [{ id: row!.id }] });
+    // Anita moves from Accounts to Warehouse staff, which has no payments access.
+    await ctx.db.update(users).set({ role: "Warehouse staff" }).where(eq(users.email, SEEDED.accounts));
+    expect((await list(cookies.accounts)).body).toEqual({ items: [], nextCursor: null, unread: 0 });
+    expect((await http.get("/notifications/unread-count").set("Cookie", cookies.accounts)).body).toEqual({ unread: 0 });
+    expect((await http.post(`/notifications/${row!.id}/read`).set("Cookie", cookies.accounts)).status).toBe(404);
+    expect((await http.post("/notifications/read-all").set("Cookie", cookies.accounts)).body).toEqual({ updated: 0 });
+    // Kept, not deleted: back in Accounts, it shows again, still unread.
+    expect(await unreadRows(SEEDED.accounts)).toBe(1);
+    await ctx.db.update(users).set({ role: "Accounts" }).where(eq(users.email, SEEDED.accounts));
+    expect((await list(cookies.accounts)).body).toMatchObject({ unread: 1, items: [{ id: row!.id, read: false }] });
+  });
+});
+
 describe("short-receipt (REC-3)", () => {
   const receipt = async (cookie: string, quantities: number[], extra: object = {}) => {
     const order = await makeOrder(ctx, {
@@ -365,7 +382,6 @@ describe("container-loaded, -sailed, -arrived (CON-3, CON-5)", () => {
 describe("notify()", () => {
   const event = async () => ({
     kind: "container-loaded" as const,
-    capability: "containers" as const,
     actorId: await userId(SEEDED.management),
     sourceId: UNKNOWN,
     title: "T",

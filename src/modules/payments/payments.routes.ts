@@ -98,7 +98,6 @@ export function paymentsRoutes({ db }: RouteContext) {
       )[0]!;
       await notify(tx, {
         kind: "payment-recorded",
-        capability: "payments",
         actorId: req.user!.id,
         sourceId: created.id,
         title: `${po} payment recorded`,

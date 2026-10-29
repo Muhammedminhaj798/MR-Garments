@@ -161,7 +161,10 @@ applied to a database (with a backup) **before** this code runs there, because P
 
 Events (`notify()` in `src/modules/notifications/notify.ts`, inside the business transaction; dedupe key
 `<kind>:<source id>`, unique per user, `ON CONFLICT DO NOTHING`). Recipients: active users whose effective access
-(matrix narrowed by stage grants) to the capability is View or better, minus the actor.
+(matrix narrowed by stage grants) to the capability is View or better, minus the actor. Reading follows the reader's
+access now (`KIND_CAPABILITY`, `readableKinds`): NTF-1..4 only list, count or mark kinds whose capability the caller
+still has, so a user moved out of payments no longer sees payment amounts; the rows stay and show again if access
+returns.
 
 | Kind | When | Capability | Title / details | href |
 | --- | --- | --- | --- | --- |

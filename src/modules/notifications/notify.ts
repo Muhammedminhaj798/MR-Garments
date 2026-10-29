@@ -1,16 +1,31 @@
 import { and, eq, ne } from "drizzle-orm";
 
 import type { Database } from "../../db/client";
-import { type NotificationKind, notifications, type Role, users, userStageGrants } from "../../db/schema";
+import { NOTIFICATION_KINDS, type NotificationKind, notifications, type Role, users, userStageGrants } from "../../db/schema";
 import { atLeast, type Capability, effectiveAccess } from "../../permissions/matrix";
 
 // Owner: Agent 2 (notifications). Business routes call notify() inside their own transaction, so a rolled-back write
 // leaves no notification (D:\SDEC\MR Garments\docs\notifications-contract.md, "Rules the backend guarantees").
 
+/**
+ * What each kind is about. Recipients are the active users with at least View on it (matrix plus stage grants),
+ * except the actor; and a reader sees a kind only while they still have that access, so a payment amount stops
+ * showing to someone moved out of payments.
+ */
+export const KIND_CAPABILITY: Record<NotificationKind, Capability> = {
+  "short-receipt": "receiving",
+  "payment-recorded": "payments",
+  "container-loaded": "containers",
+  "container-sailed": "containers",
+  "container-arrived": "containers",
+};
+
+/** The kinds this role and these stage grants may read now. */
+export const readableKinds = (role: Role, stages: number[]) =>
+  NOTIFICATION_KINDS.filter((kind) => atLeast(effectiveAccess(role, stages, KIND_CAPABILITY[kind]), "View"));
+
 export type NotificationEvent = {
   kind: NotificationKind;
-  /** Recipients: active users with at least View on this capability (matrix plus stage grants), except the actor. */
-  capability: Capability;
   actorId: string;
   /** The source record's id; the dedupe key is `<kind>:<sourceId>`. */
   sourceId: string;
@@ -36,7 +51,7 @@ export async function notify(tx: Pick<Database, "select" | "insert">, event: Not
   }
   const values = [...people].flatMap(([userId, { role, stages }]) => {
     const canView = (capability: Capability) => atLeast(effectiveAccess(role, stages, capability), "View");
-    if (!canView(event.capability)) return [];
+    if (!canView(KIND_CAPABILITY[event.kind])) return [];
     const { kind, title, details } = event;
     return [{ userId, kind, title, details, href: event.href(canView), dedupeKey: `${kind}:${event.sourceId}` }];
   });
