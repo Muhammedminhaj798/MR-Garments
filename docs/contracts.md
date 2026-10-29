@@ -52,6 +52,18 @@ with the browser. A wrong password, an unknown email and an inactive user all ge
 **AUTH-2 `POST /auth/logout`** (A1): signed in; 204, ends the session and clears the cookie (`endSession`); 401 when
 signed out.
 
+**Password policy (2026-10-29, not yet released).** Nobody sets their own password in the application; there are no
+invite, reset or password links and no emails.
+- **USR-3 `POST /users`** requires `password`, the user's initial sign-in password, checked against B9.10 (422
+  `fields.password`: "Enter a password." / M8 / M9) and stored only as an argon2id hash with `password_changed_at`.
+- **USR-4 `PATCH /users/{id}`** accepts an optional `password` with the same checks. For another user it replaces
+  the hash, sets `password_changed_at` and signs that user out everywhere. For the caller's own account it is 403
+  `password_change_disabled` ("Ask another Management user to set your password.") and nothing is saved.
+- **AUTH-5 `POST /auth/change-password`** and **AUTH-4 `POST /auth/reset-password`** answer 403
+  `password_change_disabled` ("Passwords are set by a Management user.") to everyone, signed in or not.
+- No response includes `password` or `passwordHash`; failed queries are logged without their parameters.
+- Operators can still reset a Management password with `scripts/reset-admin-password.ts` (docs/operator-commands.md).
+
 **Lists.** Every list endpoint returns rows in creation order (`created_at`, then `name`). The seed gives seeded rows
 increasing creation times in `master.ts` order, which is the order the references show; new rows come last.
 
@@ -84,8 +96,8 @@ Searchable columns: name, contact person and phone (suppliers, agents, transport
 - The signed-in user is re-read on every request into `req.user` (`src/auth/current-user.ts`); guard routes with
   `requireUser` or `requirePermission(capability, minimum)`. Never write your own session or permission checks.
 - The role matrix, stage grants (Q7), access labels, initials and landing pages: `src/permissions/matrix.ts`.
-- Passwords: `src/auth/passwords.ts` (argon2id, `passwordProblems`). Links: `src/auth/tokens.ts`
-  (`issuePasswordLink`, `completePasswordWithLink`). Sign-in throttling: `src/auth/rate-limit.ts`.
+- Passwords: `src/auth/passwords.ts` (argon2id, `passwordProblems`). Password links were removed with the password
+  policy; the `password_tokens` table stays but nothing issues or reads it. Sign-in throttling: `src/auth/rate-limit.ts`.
 
 ## Database (coordinator-owned)
 

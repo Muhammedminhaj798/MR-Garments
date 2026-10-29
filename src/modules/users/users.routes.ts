@@ -3,8 +3,8 @@ import { Router } from "express";
 import { z } from "zod";
 
 import { requirePermission } from "../../auth/current-user";
+import { hashPassword, passwordProblems } from "../../auth/passwords";
 import { signOutEverywhere } from "../../auth/session";
-import { issuePasswordLink } from "../../auth/tokens";
 import type { Database } from "../../db/client";
 import { locations, ROLES, type Role, STATUSES, users, userStageGrants } from "../../db/schema";
 import { conflict, GENERIC_MESSAGE, HttpError, notFound, validationFailed } from "../../http/errors";
@@ -14,9 +14,15 @@ import type { RouteContext } from "../context";
 
 // Owner: A2 (users). USR-1 GET /users, USR-2 GET /users/:id, USR-3 POST /users, USR-4 PATCH /users/:id.
 // All Management only, guarded per route: this router sits at /api/v1, so router.use() would guard every module.
+// Password policy (2026-10-29, supersedes B1 (b), B1.4-B1.9, B1.11, B1.12 and C5 R1): Management types the initial
+// password on Add user and may set a new one for another user on Edit user. No links or emails are sent.
 
-/** Approved wording M13-M20 (docs/batch1-decisions.md, U36.2). */
+/** Approved wording M8, M9 and M13-M20 (docs/batch1-decisions.md, U36.2); `password` and `ownPassword` are proposed. */
 export const MESSAGES = {
+  password: "Enter a password.", // proposed
+  passwordRules: "Use at least 8 characters, a number and a capital letter.", // M8
+  passwordTooLong: "Use 128 characters or fewer.", // M9
+  ownPassword: "Ask another Management user to set your password.", // proposed
   name: "Enter the full name.", // M13
   email: "Enter a valid email address.", // M14
   emailTaken: "A user with this email already exists.", // M15
@@ -33,6 +39,14 @@ export const LANGUAGES = ["English"] as const;
 const badRequest = () => new HttpError(400, "bad_request", GENERIC_MESSAGE);
 const isUuid = (value: string) => z.uuid().safeParse(value).success;
 
+/** The message for a password Management types, or undefined when it meets the rules (B9.10). Never trimmed. */
+export function passwordMessage(password: string) {
+  if (!password) return MESSAGES.password;
+  const problems = passwordProblems(password);
+  if (problems.includes("too_long")) return MESSAGES.passwordTooLong;
+  return problems.length > 0 ? MESSAGES.passwordRules : undefined;
+}
+
 /** Field rules, also used by the profile (PRF-2). */
 export const fields = {
   name: z.string({ error: MESSAGES.name }).trim().min(1, MESSAGES.name),
@@ -43,9 +57,13 @@ export const fields = {
   language: z.enum(LANGUAGES),
   status: z.enum(STATUSES),
   stages: z.array(z.number().int().min(2).max(6)).transform((stages) => [...new Set(stages)].sort((a, b) => a - b)),
+  password: z.string({ error: MESSAGES.password }).superRefine((value, ctx) => {
+    const message = passwordMessage(value);
+    if (message) ctx.addIssue({ code: "custom", message });
+  }),
 };
 
-// C5: strict objects, so a `password` key (or any other unknown key) is a 400.
+// Strict objects, so any unknown key is a 400. USR-3 needs the initial password; on USR-4 it is optional.
 const createSchema = z.strictObject({
   ...fields,
   phone: fields.phone.default(""),
@@ -146,7 +164,7 @@ function duplicateEmailAsConflict(error: unknown): never {
   throw error;
 }
 
-export function usersRoutes({ db, pool, config }: RouteContext) {
+export function usersRoutes({ db, pool }: RouteContext) {
   const router = Router();
   const admin = requirePermission("admin", "Full");
 
@@ -187,32 +205,43 @@ export function usersRoutes({ db, pool, config }: RouteContext) {
     res.json({ user, options: { roles: ROLES, offices, languages: LANGUAGES } });
   });
 
-  // USR-3. The new user has no password; an invite link is printed in development only (B1.9).
+  // USR-3. The user signs in with the password Management typed. Only its argon2id hash is stored; nothing is sent.
   router.post("/users", admin, async (req, res) => {
     const input = parseBody(createSchema, req.body);
     await checkRules(db, input);
     await ensureEmailFree(db, input.email);
-    const { officeId, stages, ...values } = input;
+    const { officeId, stages, password, ...values } = input;
+    const passwordHash = await hashPassword(password);
     const id = await db
       .transaction(async (tx) => {
         const created = await tx
           .insert(users)
-          .values({ ...values, locationId: officeId, createdBy: req.user!.id, updatedBy: req.user!.id })
+          .values({
+            ...values,
+            passwordHash,
+            passwordChangedAt: new Date(),
+            locationId: officeId,
+            createdBy: req.user!.id,
+            updatedBy: req.user!.id,
+          })
           .returning({ id: users.id });
         const userId = created[0]!.id;
         if (stages.length > 0) await tx.insert(userStageGrants).values(stages.map((stage) => ({ userId, stage })));
         return userId;
       })
       .catch(duplicateEmailAsConflict);
-    await issuePasswordLink(db, config, id, "invite");
     res.status(201).json({ user: await findUser(db, id) });
   });
 
-  // USR-4. Only the keys sent change. B8.1-B8.4 apply.
+  // USR-4. Only the keys sent change. B8.1-B8.4 apply. A `password` sets a new one for another user and signs them out
+  // everywhere; for one's own account it is a self-change, which nobody may make in the application (403).
   router.patch("/users/:id", admin, async (req, res) => {
     const input = parseBody(updateSchema, req.body);
     const current = await findUser(db, String(req.params.id));
     if (!current) throw notFound("User");
+    if (input.password !== undefined && current.id === req.user!.id) {
+      throw new HttpError(403, "password_change_disabled", MESSAGES.ownPassword);
+    }
     const role = input.role ?? current.role;
     const status = input.status ?? current.status;
     // An unchanged office is not re-checked, so a user whose office was closed later can still be saved.
@@ -223,7 +252,8 @@ export function usersRoutes({ db, pool, config }: RouteContext) {
     // B8.2/B8.3: leaving Management or going inactive (also to oneself) must leave another active Management user.
     // The Management rows are locked first, so of two simultaneous demotions the second sees the first (AT-R6).
     const leavesManagement = current.role === "Management" && current.status === "Active" && (role !== "Management" || status !== "Active");
-    const { officeId, stages, ...values } = input;
+    const { officeId, stages, password, ...values } = input;
+    const newPassword = password === undefined ? {} : { passwordHash: await hashPassword(password), passwordChangedAt: new Date() };
     await db
       .transaction(async (tx) => {
         if (leavesManagement) {
@@ -241,7 +271,7 @@ export function usersRoutes({ db, pool, config }: RouteContext) {
         }
         await tx
           .update(users)
-          .set({ ...values, locationId: officeId, updatedBy: req.user!.id })
+          .set({ ...values, ...newPassword, locationId: officeId, updatedBy: req.user!.id })
           .where(eq(users.id, current.id));
         if (stages) {
           await tx.delete(userStageGrants).where(eq(userStageGrants.userId, current.id));
@@ -250,8 +280,8 @@ export function usersRoutes({ db, pool, config }: RouteContext) {
       })
       .catch(duplicateEmailAsConflict);
 
-    // B8.4: deactivating signs the user out at once; role and grant changes apply on their next request.
-    if (current.status === "Active" && status === "Inactive") await signOutEverywhere(pool, current.id);
+    // B8.4: deactivating, or a new password, signs the user out at once; role and grant changes apply on their next request.
+    if (password !== undefined || (current.status === "Active" && status === "Inactive")) await signOutEverywhere(pool, current.id);
     res.json({ user: await findUser(db, current.id) });
   });
 
