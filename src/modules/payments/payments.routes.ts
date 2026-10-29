@@ -7,6 +7,7 @@ import { orders, PAYEE_ROLES, PAYMENT_KINDS, payments, shippingAgents, suppliers
 import { validationFailed } from "../../http/errors";
 import { parse } from "../../http/validate";
 import type { RouteContext } from "../context";
+import { cny, notify } from "../notifications/notify";
 
 // Owner: BE-payments. PAY-2 POST /payments (docs/live-screens-contracts.md, "Five-tab completion"). Payments are
 // records only: nothing here moves money.
@@ -42,11 +43,11 @@ const newPayment = z.strictObject({
 });
 type NewPayment = z.infer<typeof newPayment>;
 
-/** The payee's name (the order's supplier, or the active agent), or 422 with every problem found (E1). */
+/** The payee's name (the order's supplier, or the active agent) and the PO, or 422 with every problem found (E1). */
 async function payeeName(db: RouteContext["db"], input: NewPayment) {
   const problems: Record<string, string> = {};
   const order = await db
-    .select({ supplier: suppliers.name })
+    .select({ supplier: suppliers.name, po: orders.poNumber })
     .from(orders)
     .innerJoin(suppliers, eq(suppliers.id, orders.supplierId))
     .where(eq(orders.id, input.orderId));
@@ -67,7 +68,7 @@ async function payeeName(db: RouteContext["db"], input: NewPayment) {
   }
 
   if (Object.keys(problems).length > 0) throw validationFailed(problems);
-  return input.payeeRole === "supplier" ? order[0]!.supplier : agent!;
+  return { payee: input.payeeRole === "supplier" ? order[0]!.supplier : agent!, po: order[0]!.po };
 }
 
 export function paymentsRoutes({ db }: RouteContext) {
@@ -76,23 +77,37 @@ export function paymentsRoutes({ db }: RouteContext) {
   // PAY-2. A payment already made: saved as paid, at any stage. No overpayment check (the balance may go below 0).
   router.post("/payments", requirePermission("payments", "Enter"), async (req, res) => {
     const input = parse(newPayment, req.body);
-    const payee = await payeeName(db, input);
-    const created = await db
-      .insert(payments)
-      .values({
-        orderId: input.orderId,
-        kind: input.kind,
-        payee,
-        payeeRole: input.payeeRole,
-        amountCny: input.amountCny,
-        status: "paid",
-        paidOn: input.paidOn,
-        rateInr: input.rateInr,
-        mode: input.mode,
-        createdBy: req.user!.id,
-      })
-      .returning({ id: payments.id });
-    res.status(201).json({ payment: created[0]! });
+    const { payee, po } = await payeeName(db, input);
+    const payment = await db.transaction(async (tx) => {
+      const created = (
+        await tx
+          .insert(payments)
+          .values({
+            orderId: input.orderId,
+            kind: input.kind,
+            payee,
+            payeeRole: input.payeeRole,
+            amountCny: input.amountCny,
+            status: "paid",
+            paidOn: input.paidOn,
+            rateInr: input.rateInr,
+            mode: input.mode,
+            createdBy: req.user!.id,
+          })
+          .returning({ id: payments.id })
+      )[0]!;
+      await notify(tx, {
+        kind: "payment-recorded",
+        capability: "payments",
+        actorId: req.user!.id,
+        sourceId: created.id,
+        title: `${po} payment recorded`,
+        details: [`${input.kind} ${cny(input.amountCny)}`, payee],
+        href: (canView) => (canView("ordersView") ? `/orders/${po}/payments` : "/payments"),
+      });
+      return created;
+    });
+    res.status(201).json({ payment });
   });
 
   return router;

@@ -22,6 +22,7 @@ import {
 import { conflict, validationFailed } from "../../http/errors";
 import { parse } from "../../http/validate";
 import type { RouteContext } from "../context";
+import { day, notify, qty } from "../notifications/notify";
 
 // Owner: BE-stock. REC-1 GET /receipts, REC-2 GET /receipts/options, REC-3 POST /receipts, CON-1 GET /containers,
 // CON-2 GET /containers/options, CON-3 POST /containers (docs/live-screens-contracts.md).
@@ -223,14 +224,35 @@ export function stockRoutes({ db }: RouteContext) {
       }
       // Screen 21: a remark is required while any line of the order is still short after this receipt.
       const now = new Map(input.lines.map((line) => [line.orderLineId, line.quantity]));
-      const short = lines.some((line) => line.received + (now.get(line.id) ?? 0) < line.ordered);
-      if (!problems.lines && short && !input.shortRemark) problems.shortRemark = MESSAGES.shortRemark;
+      const short = lines
+        .map((line) => ({ ...line, left: line.ordered - line.received - (now.get(line.id) ?? 0) }))
+        .filter((line) => line.left > 0);
+      if (!problems.lines && short.length > 0 && !input.shortRemark) problems.shortRemark = MESSAGES.shortRemark;
       if (Object.keys(problems).length > 0) throw validationFailed(problems);
 
       const { lines: bodyLines, ...values } = input;
       const created = (await tx.insert(receipts).values({ ...values, receivedBy: req.user!.id }).returning({ id: receipts.id }))[0]!;
       await tx.insert(receiptLines).values(bodyLines.map((line) => ({ ...line, receiptId: created.id })));
       if (order.stage === 1) await tx.update(orders).set({ stage: 2 }).where(eq(orders.id, order.id));
+      if (short.length > 0) {
+        const { po, supplier } = (
+          await tx
+            .select({ po: orders.poNumber, supplier: suppliers.name })
+            .from(orders)
+            .innerJoin(suppliers, eq(suppliers.id, orders.supplierId))
+            .where(eq(orders.id, order.id))
+        )[0]!;
+        const line = short[0]!;
+        await notify(tx, {
+          kind: "short-receipt",
+          capability: "receiving",
+          actorId: req.user!.id,
+          sourceId: created.id,
+          title: `${po} received short`,
+          details: [supplier, short.length === 1 ? `${line.item} short by ${qty(line.left, unit(line.countedIn))}` : `${short.length} lines short`],
+          href: (canView) => (canView("ordersView") ? `/orders/${po}/receiving` : "/receiving"),
+        });
+      }
       return created.id;
     });
     res.status(201).json({ receipt: { id } });
@@ -329,7 +351,7 @@ export function stockRoutes({ db }: RouteContext) {
       const problems: Record<string, string> = {};
       if (input.eta < input.loadedOn) problems.eta = MESSAGES.etaBeforeLoading;
       const agent = await tx
-        .select({ id: shippingAgents.id })
+        .select({ name: shippingAgents.name })
         .from(shippingAgents)
         .where(and(eq(shippingAgents.id, input.shippingAgentId), eq(shippingAgents.status, "Active")));
       if (agent.length === 0) problems.shippingAgentId = MESSAGES.agent;
@@ -390,6 +412,15 @@ export function stockRoutes({ db }: RouteContext) {
         .update(orders)
         .set({ stage: 3 })
         .where(and(inArray(orders.id, [...stages.keys()]), eq(orders.stage, 2)));
+      await notify(tx, {
+        kind: "container-loaded",
+        capability: "containers",
+        actorId: req.user!.id,
+        sourceId: containerId,
+        title: `Container ${input.number} loaded`,
+        details: [agent[0]!.name, [...new Set(current.map((line) => line.po))].sort().join(", "), `ETA ${day(input.eta)}`],
+        href: () => `/containers/${containerId}`,
+      });
       return containerId;
     });
     res.status(201).json({ container: { id } });

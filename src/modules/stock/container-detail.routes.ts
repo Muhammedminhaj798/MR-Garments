@@ -7,6 +7,7 @@ import { containerLines, containers, items, orderLines, orders, shippingAgents }
 import { conflict, GENERIC_MESSAGE, HttpError, notFound, validationFailed } from "../../http/errors";
 import { parse } from "../../http/validate";
 import type { RouteContext } from "../context";
+import { day, notify } from "../notifications/notify";
 import { MESSAGES } from "./stock.routes";
 
 // Owner: BE-containers. CON-4 GET /containers/:id, CON-5 PATCH /containers/:id (docs/live-screens-contracts.md,
@@ -128,13 +129,33 @@ export function containerDetailRoutes({ db }: RouteContext) {
       }
       if (Object.keys(problems).length > 0) throw validationFailed(problems);
 
-      return (
+      const saved = (
         await tx
           .update(containers)
           .set(input)
           .where(eq(containers.id, id))
           .returning({ id: containers.id, status: containers.status, sailedOn: containers.sailedOn, eta: containers.eta })
       )[0]!;
+      if (input.status) {
+        const pos = await tx
+          .selectDistinct({ po: orders.poNumber })
+          .from(containerLines)
+          .innerJoin(orderLines, eq(orderLines.id, containerLines.orderLineId))
+          .innerJoin(orders, eq(orders.id, orderLines.orderId))
+          .where(eq(containerLines.containerId, id))
+          .orderBy(asc(orders.poNumber));
+        const sailed = input.status === "sea";
+        await notify(tx, {
+          kind: sailed ? "container-sailed" : "container-arrived",
+          capability: "containers",
+          actorId: req.user!.id,
+          sourceId: id,
+          title: `Container ${row.number} ${sailed ? "sailed" : "arrived"}`,
+          details: [pos.map((line) => line.po).join(", "), sailed ? `ETA ${day(saved.eta)}` : row.portOfArrival].filter(Boolean),
+          href: () => `/containers/${id}`,
+        });
+      }
+      return saved;
     });
     res.json({ container });
   });

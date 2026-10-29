@@ -11,6 +11,7 @@ import { shippingAgentsRoutes } from "./master-data/shipping-agents.routes";
 import { suppliersRoutes } from "./master-data/suppliers.routes";
 import { teamsRoutes } from "./master-data/teams.routes";
 import { transportCompaniesRoutes } from "./master-data/transport-companies.routes";
+import { notificationsRoutes } from "./notifications/notifications.routes";
 import { orderDetailRoutes } from "./orders/order-detail.routes";
 import { ordersRoutes } from "./orders/orders.routes";
 import { paymentsRoutes } from "./payments/payments.routes";
@@ -41,5 +42,6 @@ export function apiRoutes(ctx: RouteContext) {
   router.use(containerDetailRoutes(ctx)); // after CON-2, so /containers/options isn't read as an id
   router.use(stagesRoutes(ctx));
   router.use(reportsRoutes(ctx));
+  router.use(notificationsRoutes(ctx));
   return router;
 }

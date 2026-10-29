@@ -144,6 +144,35 @@ recorded here are payments already made (status `paid`); containers move forward
 - **Errors without fields** (409 `order_not_receivable`, `container_arrived`, `invalid_status_change`): the frontend
   shows the API's own message (`handleApiError` in `src/lib/feedback.ts`).
 
+## Notifications (NTF-1 to NTF-4, migration 0005)
+
+The binding contract is `D:\SDEC\MR Garments\docs\notifications-contract.md` (lead-owned). Migration 0005
+(`src/db/schema/notifications.ts`, `drizzle/0005_notifications.sql`) only adds the `notifications` table; it must be
+applied to a database (with a backup) **before** this code runs there, because PAY-2, REC-3, CON-3 and CON-5 write to it.
+
+| Id | Method and path | Permission | Body / response |
+| --- | --- | --- | --- |
+| NTF-1 | `GET /notifications?limit=&cursor=` | signed in | `limit` 1-50 (default 20), `cursor` = previous `nextCursor`; unknown query key, bad limit or a cursor that isn't one of the caller's notifications: 400 `bad_request`. 200 `{ items, nextCursor, unread }`, newest first (createdAt, then id) |
+| NTF-2 | `GET /notifications/unread-count` | signed in | 200 `{ unread }` |
+| NTF-3 | `POST /notifications/:id/read` | signed in | 200 `{ notification }`, idempotent (keeps the first read time); someone else's, unknown or malformed id: 404 `not_found` |
+| NTF-4 | `POST /notifications/read-all` | signed in | 200 `{ updated }` (rows changed) |
+
+`Notification` = `{ id, kind, title, details: string[], href: string | null, createdAt (ISO), read }`.
+
+Events (`notify()` in `src/modules/notifications/notify.ts`, inside the business transaction; dedupe key
+`<kind>:<source id>`, unique per user, `ON CONFLICT DO NOTHING`). Recipients: active users whose effective access
+(matrix narrowed by stage grants) to the capability is View or better, minus the actor.
+
+| Kind | When | Capability | Title / details | href |
+| --- | --- | --- | --- | --- |
+| `short-receipt` | REC-3 saved and some order line still has `received < ordered` | receiving | "PO-x received short" / supplier, "Item short by N unit" or "N lines short" | `/orders/PO-x/receiving` with ordersView, else `/receiving` |
+| `payment-recorded` | PAY-2 saved a payment | payments | "PO-x payment recorded" / "Kind ¥amount", payee | `/orders/PO-x/payments` with ordersView, else `/payments` |
+| `container-loaded` | CON-3 created a container | containers | "Container N loaded" / agent, POs, "ETA d Mon yyyy" | `/containers/:id` |
+| `container-sailed` | CON-5 moved it to `sea` | containers | "Container N sailed" / POs, "ETA d Mon yyyy" | `/containers/:id` |
+| `container-arrived` | CON-5 moved it to `arrived` | containers | "Container N arrived" / POs, port of arrival | `/containers/:id` |
+
+Date-only CON-5 changes, ORD-3 deposits and refused writes (4xx) notify no one.
+
 ## Files and owners
 
 - Coordinator: `src/db/schema/**`, `drizzle/**`, `src/modules/index.ts`, this file.
@@ -151,6 +180,7 @@ recorded here are payments already made (status `paid`); containers move forward
 - BE-payments: `src/modules/payments/**` (PAY-2) and its tests.
 - BE-stock: `src/modules/stock/stock.routes.ts` (REC-1..3, CON-1..3), `receipts.test.ts`, `containers.test.ts`.
 - BE-containers: `src/modules/stock/container-detail.routes.ts` (CON-4, CON-5) and `container-detail.test.ts`.
+- Notifications: `src/modules/notifications/**` (NTF-1..4, `notify()`) and `notifications.test.ts`.
 
 ## Tests
 
