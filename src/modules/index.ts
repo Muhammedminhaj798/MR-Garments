@@ -15,6 +15,7 @@ import { notificationsRoutes } from "./notifications/notifications.routes";
 import { orderDetailRoutes } from "./orders/order-detail.routes";
 import { ordersRoutes } from "./orders/orders.routes";
 import { paymentsRoutes } from "./payments/payments.routes";
+import { profileRoutes } from "./profile/profile.routes";
 import { reportsRoutes } from "./reports/reports.routes";
 import { stagesRoutes } from "./stages/stages.routes";
 import { containerDetailRoutes } from "./stock/container-detail.routes";
@@ -28,6 +29,7 @@ export function apiRoutes(ctx: RouteContext) {
   router.use(loginRoutes(ctx));
   router.use(passwordRoutes(ctx));
   router.use(usersRoutes(ctx));
+  router.use(profileRoutes(ctx));
   router.use(suppliersRoutes(ctx));
   router.use(shippingAgentsRoutes(ctx));
   router.use(clearingAgentsRoutes(ctx));

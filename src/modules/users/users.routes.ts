@@ -33,7 +33,8 @@ export const LANGUAGES = ["English"] as const;
 const badRequest = () => new HttpError(400, "bad_request", GENERIC_MESSAGE);
 const isUuid = (value: string) => z.uuid().safeParse(value).success;
 
-const fields = {
+/** Field rules, also used by the profile (PRF-2). */
+export const fields = {
   name: z.string({ error: MESSAGES.name }).trim().min(1, MESSAGES.name),
   email: z.string({ error: MESSAGES.email }).trim().toLowerCase().pipe(z.email({ error: MESSAGES.email })),
   phone: z.string().trim(),

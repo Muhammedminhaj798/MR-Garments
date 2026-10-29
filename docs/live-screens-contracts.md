@@ -176,6 +176,19 @@ returns.
 
 Date-only CON-5 changes, ORD-3 deposits and refused writes (4xx) notify no one.
 
+## Profile (PRF-1, PRF-2)
+
+The binding contract is `D:\SDEC\MR Garments\docs\profile-contract.md` (lead-owned). No migration. Both routes act on
+the signed-in user only (`req.user.id`); no id is read from the path, query or body.
+
+| Id | Method and path | Permission | Body / response |
+| --- | --- | --- | --- |
+| PRF-1 | `GET /profile` | signed in | 200 `{ profile, options: { languages } }` |
+| PRF-2 | `PATCH /profile` | signed in | strict body, any of `name`, `phone`, `language`; only the keys sent change; `updated_by` = caller. 200 `{ profile }`. Any other key (`email`, `role`, `officeId`, `status`, `stages`, `password`, `id`, ...) or an empty body: 400 `bad_request`. 422 `validation_failed` fields: `name` (M13, Users rule), `language` ("Choose a language from the list.", not yet approved) |
+
+`Profile` = `{ name, email, phone ("" when unset), role, office: { id, name } | null, language,
+passwordChangedAt (ISO) | null }`. Never the password hash, status, stage grants or audit columns.
+
 ## Files and owners
 
 - Coordinator: `src/db/schema/**`, `drizzle/**`, `src/modules/index.ts`, this file.
@@ -184,6 +197,7 @@ Date-only CON-5 changes, ORD-3 deposits and refused writes (4xx) notify no one.
 - BE-stock: `src/modules/stock/stock.routes.ts` (REC-1..3, CON-1..3), `receipts.test.ts`, `containers.test.ts`.
 - BE-containers: `src/modules/stock/container-detail.routes.ts` (CON-4, CON-5) and `container-detail.test.ts`.
 - Notifications: `src/modules/notifications/**` (NTF-1..4, `notify()`) and `notifications.test.ts`.
+- Profile: `src/modules/profile/**` (PRF-1, PRF-2) and `profile.test.ts`; field rules imported from `users.routes.ts`.
 
 ## Tests
 
