@@ -421,6 +421,12 @@ describe("USR-4 setting another user's password (password policy)", () => {
       expect(res.status, id).toBe(403);
       expect(res.body).toEqual({ error: { code: "password_change_disabled", message: MESSAGES.ownPassword } });
     }
+    // Any password at all, even empty, weak or not text, is the same 403, before the body is checked.
+    for (const password of ["", "weak", null, 12345678]) {
+      const res = await http.patch(`/users/${suresh}`, { name: "", password }).set("Cookie", cookie);
+      expect(res.status, JSON.stringify(password)).toBe(403);
+      expect(res.body.error.code).toBe("password_change_disabled");
+    }
     const after = await userRow(SEEDED.management);
     expect(after.passwordHash).toBe(before.passwordHash);
     expect(after.name).toBe("Suresh Menon");

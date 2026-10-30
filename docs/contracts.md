@@ -57,8 +57,9 @@ invite, reset or password links and no emails.
 - **USR-3 `POST /users`** requires `password`, the user's initial sign-in password, checked against B9.10 (422
   `fields.password`: "Enter a password." / M8 / M9) and stored only as an argon2id hash with `password_changed_at`.
 - **USR-4 `PATCH /users/{id}`** accepts an optional `password` with the same checks. For another user it replaces
-  the hash, sets `password_changed_at` and signs that user out everywhere. For the caller's own account it is 403
-  `password_change_disabled` ("Ask another Management user to set your password.") and nothing is saved.
+  the hash, sets `password_changed_at` and signs that user out everywhere. For the caller's own account any `password`
+  key, whatever its value, is 403 `password_change_disabled` ("Ask another Management user to set your password."),
+  checked before the body, and nothing is saved.
 - **AUTH-5 `POST /auth/change-password`** and **AUTH-4 `POST /auth/reset-password`** answer 403
   `password_change_disabled` ("Passwords are set by a Management user.") to everyone, signed in or not. **PRF-2
   `PATCH /profile`** refuses a `password` key with 400 like any other unknown key.

@@ -236,12 +236,13 @@ export function usersRoutes({ db, pool }: RouteContext) {
   // USR-4. Only the keys sent change. B8.1-B8.4 apply. A `password` sets a new one for another user and signs them out
   // everywhere; for one's own account it is a self-change, which nobody may make in the application (403).
   router.patch("/users/:id", admin, async (req, res) => {
+    // Checked before the body, so an empty or weak password for oneself is the same 403, not a rules message.
+    if (Object.hasOwn(req.body ?? {}, "password") && String(req.params.id).toLowerCase() === req.user!.id) {
+      throw new HttpError(403, "password_change_disabled", MESSAGES.ownPassword);
+    }
     const input = parseBody(updateSchema, req.body);
     const current = await findUser(db, String(req.params.id));
     if (!current) throw notFound("User");
-    if (input.password !== undefined && current.id === req.user!.id) {
-      throw new HttpError(403, "password_change_disabled", MESSAGES.ownPassword);
-    }
     const role = input.role ?? current.role;
     const status = input.status ?? current.status;
     // An unchanged office is not re-checked, so a user whose office was closed later can still be saved.
