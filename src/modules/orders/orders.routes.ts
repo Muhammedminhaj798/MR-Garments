@@ -211,9 +211,20 @@ export function ordersRoutes({ db }: RouteContext) {
     }
   });
 
-  // CAL-1. Orders at stage 1-2, due date oldest first.
+  // CAL-1. Orders at stage 1-2, due date oldest first. `quantity` and `received` are the main line's; `fullyReceived`
+  // says every line has received >= its quantity, from one grouped query beside the rows (not one per order).
   router.get("/deliveries", requirePermission("calendar", "View"), async (_req, res) => {
-    const rows = await orderRows(db, [asc(orders.deliveryDate), asc(poValue)], lte(orders.stage, 2));
+    const lineReceived = sql`(select coalesce(sum(${receiptLines.quantity}), 0) from ${receiptLines} where ${receiptLines.orderLineId} = ${orderLines.id})`;
+    const [rows, received] = await Promise.all([
+      orderRows(db, [asc(orders.deliveryDate), asc(poValue)], lte(orders.stage, 2)),
+      db
+        .select({ orderId: orderLines.orderId, full: sql<boolean>`bool_and(${lineReceived} >= ${orderLines.quantity})` })
+        .from(orderLines)
+        .innerJoin(orders, eq(orders.id, orderLines.orderId))
+        .where(lte(orders.stage, 2))
+        .groupBy(orderLines.orderId),
+    ]);
+    const fullyReceived = new Set(received.filter((order) => order.full).map((order) => order.orderId));
     res.json(
       rows.map((row) => ({
         orderId: row.id,
@@ -224,6 +235,7 @@ export function ordersRoutes({ db }: RouteContext) {
         unit: unit(row.countedIn),
         received: row.received,
         due: row.deliveryDate,
+        fullyReceived: fullyReceived.has(row.id),
       })),
     );
   });

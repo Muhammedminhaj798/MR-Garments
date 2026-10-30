@@ -197,10 +197,36 @@ describe("CAL-1 GET /deliveries", () => {
     const res = await get("/deliveries");
     expect(res.status).toBe(200);
     expect(res.body).toEqual([
-      { orderId: soon.id, po: soon.po, supplier: "Guangzhou Textile Co.", item: "Cotton fabric", quantity: 300, unit: "m", received: 0, due: "2026-11-01" },
-      { orderId: late.id, po: late.po, supplier: "Guangzhou Textile Co.", item: "Denim jeans", quantity: 1000, unit: "pcs", received: 400, due: "2026-12-15" },
+      { orderId: soon.id, po: soon.po, supplier: "Guangzhou Textile Co.", item: "Cotton fabric", quantity: 300, unit: "m", received: 0, due: "2026-11-01", fullyReceived: false },
+      { orderId: late.id, po: late.po, supplier: "Guangzhou Textile Co.", item: "Denim jeans", quantity: 1000, unit: "pcs", received: 400, due: "2026-12-15", fullyReceived: false },
     ]);
     expect((await get("/orders")).body.find((row: { id: string }) => row.id === late.id).received).toBe(400);
+  });
+
+  it("says an order is fully received only when every line is, not just the main line", async () => {
+    const twoLines = (await create(orderBody({ deliveryDate: "2026-11-02" }))).body.order; // 1000 jeans (main), 300 fabric
+    const oneLine = (await create(orderBody({ deliveryDate: "2026-11-03", lines: [{ itemId: ids.fabric, quantity: 300, rateCny: 2 }] }))).body.order;
+    const office = (await ctx.db.select({ id: locations.id }).from(locations).where(eq(locations.name, "Guangzhou office")))[0]!.id;
+    const receive = async (orderId: string, quantities: number[]) => {
+      const lines = await ctx.db.select().from(orderLines).where(eq(orderLines.orderId, orderId)).orderBy(orderLines.position);
+      const receipt = (await ctx.db.insert(receipts).values({ orderId, receivedOn: "2026-10-26", locationId: office, receivedBy: ids.userId, bundles: 1 }).returning())[0]!;
+      await ctx.db.insert(receiptLines).values(quantities.map((quantity, i) => ({ receiptId: receipt.id, orderLineId: lines[i]!.id, quantity })));
+      await ctx.db.update(orders).set({ stage: 2 }).where(eq(orders.id, orderId));
+    };
+    const flags = async () => ((await get("/deliveries")).body as { po: string; received: number; fullyReceived: boolean }[]).map((r) => [r.po, r.received, r.fullyReceived]);
+
+    await receive(twoLines.id, [1000, 0]);
+    await receive(oneLine.id, [299]);
+    expect(await flags()).toEqual([
+      [twoLines.po, 1000, false], // the main line is complete, the fabric is still awaited
+      [oneLine.po, 299, false],
+    ]);
+    await receive(twoLines.id, [0, 300]);
+    await receive(oneLine.id, [1]);
+    expect(await flags()).toEqual([
+      [twoLines.po, 1000, true],
+      [oneLine.po, 300, true],
+    ]);
   });
 });
 
