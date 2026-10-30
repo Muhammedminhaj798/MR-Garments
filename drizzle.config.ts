@@ -1,7 +1,7 @@
 import { defineConfig } from "drizzle-kit";
 
 // Migrations are generated from src/db/schema/core.ts (0001), master.ts (0002), orders.ts (0003), stages.ts (0004)
-// and notifications.ts (0005).
+// and notifications.ts (0005). 0006 (currencies) changes core.ts and orders.ts checks only.
 // Only the coordinator adds migrations, and a merged migration is never edited.
 export default defineConfig({
   dialect: "postgresql",

@@ -9,6 +9,9 @@ export const ROLES = ["Management", "Procurement", "Accounts", "China staff", "I
 export type Role = (typeof ROLES)[number];
 export const STATUSES = ["Active", "Inactive"] as const;
 export type RecordStatus = (typeof STATUSES)[number];
+/** Order and supplier currencies. Stage costs (clearing, transport) are always INR. */
+export const CURRENCIES = ["CNY", "USD", "INR"] as const;
+export type Currency = (typeof CURRENCIES)[number];
 export const LOCATION_TYPES = ["China office", "India office", "Warehouse"] as const;
 export type LocationType = (typeof LOCATION_TYPES)[number];
 

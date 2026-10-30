@@ -1,13 +1,14 @@
 import { sql } from "drizzle-orm";
 import { boolean, check, date, index, integer, numeric, pgTable, primaryKey, smallint, text, uniqueIndex, uuid } from "drizzle-orm/pg-core";
 
-import { inList, timestamps } from "./columns";
+import { type Currency, CURRENCIES, inList, timestamps } from "./columns";
 import { locations, suppliers } from "./core";
 import { items, shippingAgents } from "./master";
 
 // Migration 0003 (approved 2026-10-27): orders and stages 1-3. Orders, Deposits & Payments, the Delivery calendar
 // (orders.delivery_date), Receiving in China and Container loading. Coordinator-owned.
-// Quantities are whole pieces or metres; money is CNY with 2 decimals; rates are INR per CNY.
+// Quantities are whole pieces or metres. Money is in the order's currency (CNY, USD or INR; 0006) with 2 decimals:
+// `rate_cny` and `amount_cny` keep their CNY names. `rate_inr` is INR per 1 unit of the order's currency (1 for INR).
 
 const money = (name: string) => numeric(name, { precision: 14, scale: 2, mode: "number" });
 const rate = (name: string) => numeric(name, { precision: 12, scale: 4, mode: "number" });
@@ -28,14 +29,14 @@ export const orders = pgTable(
       .references(() => suppliers.id),
     orderDate: date("order_date").notNull(),
     deliveryDate: date("delivery_date").notNull(),
-    currency: text("currency").notNull().default("CNY"),
+    currency: text("currency").$type<Currency>().notNull().default("CNY"),
     stage: smallint("stage").notNull().default(1),
     ...timestamps,
     createdBy: uuid("created_by"),
   },
   (t) => [
     uniqueIndex("orders_po_number_unique").on(t.poNumber),
-    check("orders_currency_check", sql`currency = 'CNY'`),
+    check("orders_currency_check", inList("currency", CURRENCIES)),
     check("orders_stage_check", sql`stage between 1 and 6`),
     check("orders_dates_check", sql`delivery_date >= order_date`),
   ],
