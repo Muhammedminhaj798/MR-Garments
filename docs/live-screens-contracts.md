@@ -69,7 +69,8 @@ backend returns exactly those shapes. Summary:
   ("The delivery date can't be before the order date."), `currency` ("Choose CNY, USD or INR."), `lines`, `deposits`. Inactive or unknown supplier/item: 422 on
   that field. One transaction.
 - **CAL-1** `DeliveryItem[]` (due date, oldest first): orders at stage 1-2: `orderId, po, supplier` (name), `item,
-  quantity, unit, received, due` (= deliveryDate).
+  quantity, unit, received, due` (= deliveryDate), `fullyReceived` (every line has received >= its quantity; `item`,
+  `quantity` and `received` are the main line's). The frontend leaves fully received orders off the calendar.
 - **PAY-1** `PaymentsResponse`: `orders {orderId, po, supplier, currency, orderValueCny, paidCny, paidInr, balanceCny,
   nextDue}[]` (every order; `nextDue` = earliest `due` payment date or null) and `payments {id, orderId, po, currency,
   kind, payee, payeeRole, amountCny, status, paidOn, dueDate, rateInr, mode}[]` (`currency` is the order's).
