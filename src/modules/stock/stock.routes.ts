@@ -21,6 +21,7 @@ import {
 } from "../../db/schema";
 import { conflict, validationFailed } from "../../http/errors";
 import { parse } from "../../http/validate";
+import { atLeast, effectiveAccess } from "../../permissions/matrix";
 import type { RouteContext } from "../context";
 import { day, notify, qty } from "../notifications/notify";
 
@@ -157,8 +158,11 @@ export function stockRoutes({ db }: RouteContext) {
     res.json(rows.map(({ countedIn, receivedBy, ...row }) => ({ ...row, unit: unit(countedIn), receivedBy: receivedBy ?? "" })));
   });
 
-  // REC-2. Orders at stage 1-2, with only the lines that still have something to receive.
-  router.get("/receipts/options", requirePermission("receiving", "Enter"), async (_req, res) => {
+  // REC-2. Orders at stage 1-2, with only the lines that still have something to receive. The money fields are null,
+  // and never queried, unless the user may view payments (China staff can't: matrix "Deposits and payments").
+  router.get("/receipts/options", requirePermission("receiving", "Enter"), async (req, res) => {
+    const money = atLeast(effectiveAccess(req.user!.role, req.user!.stages, "payments"), "View");
+    const hidden = () => sql<null>`null`;
     const offices = await db
       .select({ id: locations.id, name: locations.name })
       .from(locations)
@@ -170,16 +174,20 @@ export function stockRoutes({ db }: RouteContext) {
         orderId: orders.id,
         po: orders.poNumber,
         supplier: suppliers.name,
-        orderValueCny: sql<number>`(select coalesce(round(sum(${allLines.quantity} * ${allLines.rateCny}), 2), 0) from ${orderLines} ${allLines}
-          where ${allLines.orderId} = ${orders.id})`.mapWith(Number),
-        depositsPaidCny: sql<number>`(select coalesce(sum(${payments.amountCny}), 0) from ${payments}
-          where ${payments.orderId} = ${orders.id} and ${payments.kind} = 'Deposit' and ${payments.status} = 'paid')`.mapWith(Number),
+        orderValueCny: money
+          ? sql<number>`(select coalesce(round(sum(${allLines.quantity} * ${allLines.rateCny}), 2), 0) from ${orderLines} ${allLines}
+          where ${allLines.orderId} = ${orders.id})`.mapWith(Number)
+          : hidden(),
+        depositsPaidCny: money
+          ? sql<number>`(select coalesce(sum(${payments.amountCny}), 0) from ${payments}
+          where ${payments.orderId} = ${orders.id} and ${payments.kind} = 'Deposit' and ${payments.status} = 'paid')`.mapWith(Number)
+          : hidden(),
         orderLineId: orderLines.id,
         item: items.name,
         countedIn: items.countedIn,
         ordered: orderLines.quantity,
         receivedEarlier: received,
-        unitPriceCny: orderLines.rateCny,
+        unitPriceCny: money ? orderLines.rateCny : hidden(),
       })
       .from(orders)
       .innerJoin(suppliers, eq(suppliers.id, orders.supplierId))
@@ -187,7 +195,7 @@ export function stockRoutes({ db }: RouteContext) {
       .innerJoin(items, eq(items.id, orderLines.itemId))
       .where(and(inArray(orders.stage, [1, 2]), sql`${received} < ${orderLines.quantity}`))
       .orderBy(desc(orders.orderDate), desc(orders.createdAt), asc(orderLines.position));
-    const byOrder = new Map<string, { orderId: string; po: string; supplier: string; orderValueCny: number; depositsPaidCny: number; lines: object[] }>();
+    const byOrder = new Map<string, { orderId: string; po: string; supplier: string; orderValueCny: number | null; depositsPaidCny: number | null; lines: object[] }>();
     for (const { orderLineId, item, countedIn, ordered, receivedEarlier, unitPriceCny, ...order } of rows) {
       if (!byOrder.has(order.orderId)) byOrder.set(order.orderId, { ...order, lines: [] });
       byOrder.get(order.orderId)!.lines.push({ orderLineId, item, unit: unit(countedIn), ordered, receivedEarlier, unitPriceCny });

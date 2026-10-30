@@ -69,7 +69,8 @@ backend returns exactly those shapes. Summary:
   receipt and every earlier one.
 - **REC-2** `ReceiptOptions`: active China `offices {id, name}[]` and `orders {orderId, po, supplier, orderValueCny,
   depositsPaidCny, lines {orderLineId, item, unit, ordered, receivedEarlier, unitPriceCny}[]}[]` for orders at stage
-  1-2 with something left to receive.
+  1-2 with something left to receive. `orderValueCny`, `depositsPaidCny` and `unitPriceCny` are null unless the user
+  has payments >= View (QA 2026-10-30: China staff must not see payments; lead-approved, pending management note).
 - **REC-3** body `CreateReceiptBody`: `orderId, receivedOn` (not after today), `locationId, bundles, deliveryNote,
   shortRemark, lines {orderLineId, quantity}[]`. 201 `{ receipt: { id } }`. 422 fields `receivedOn`, `locationId`,
   `bundles`, `lines`; 409 `order_not_receivable` when the order is past stage 2.
