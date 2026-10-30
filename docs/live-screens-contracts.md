@@ -8,7 +8,12 @@ strict Zod bodies via `parse()`, same-site check, `requirePermission`).
 ## Conventions
 
 - Dates are `YYYY-MM-DD` strings. "Today" is the date in India (`Asia/Kolkata`).
-- Money is CNY (number, 2 decimals). `rateInr` is INR per CNY. INR amounts are `amountCny * rateInr`, rounded to 2 decimals.
+- Money is in the order's `currency` (`"CNY" | "USD" | "INR"`, migration 0006; number, 2 decimals). The `...Cny` names
+  (`rateCny`, `amountCny`, `orderValueCny`, `paidCny`, `balanceCny`, `depositsPaidCny`, `unitPriceCny`) are kept for
+  compatibility and mean "in the order's currency"; every row that carries them also carries `currency`. Payments
+  (supplier and agent) are in their order's currency. `rateInr` is INR per 1 unit of the order's currency, typed per
+  payment; an INR order takes none and it is stored as 1. INR amounts are `amountCny * rateInr`, rounded to 2 decimals
+  per payment. Amounts in different currencies are never added together, and no rate is ever guessed.
 - Quantities are whole numbers. `unit` is `"m"` for items counted in Metres and `"pcs"` for Pieces.
 - The **main line** of an order is its `position = 0` line: lists show its item, quantity and received quantity.
 - `received` for an order line = sum of its `receipt_lines.quantity`. `loaded` = sum of its `container_lines.quantity`.
@@ -49,28 +54,33 @@ Response and body types are written once, in the frontend's `src/lib/api/types.t
 backend returns exactly those shapes. Summary:
 
 - **ORD-1** `OrderListItem[]` (order date, then PO, newest first): `id, po, orderDate, deliveryDate, stage,
-  supplier {id, name}, item, quantity, unit, received` (main line), `orderValueCny` (sum of quantity * rateCny over
+  supplier {id, name}, currency, item, quantity, unit, received` (main line), `orderValueCny` (sum of quantity * rateCny over
   all lines), `paidCny`, `paidInr` (paid payments only).
-- **ORD-2** `OrderOptions`: `nextPo`, active `suppliers {id, name, contactPerson, phone, city}[]`, active
+- **ORD-2** `OrderOptions`: `nextPo`, active `suppliers {id, name, contactPerson, phone, city, currency}[]` (`currency`: the
+  new-order default), active
   `items {id, name, unit}[]`, active shipping `agents {id, name}[]` (deposit payees). Readable by anyone who can open
   Orders, so Procurement doesn't need Settings access.
-- **ORD-3** body `CreateOrderBody`: `supplierId, orderDate, deliveryDate, lines {itemId, quantity, rateCny}[]` (1-50),
-  `deposits {payee, payeeRole, amountCny, paidOn, rateInr, mode}[]` (0-10, saved as `Deposit` payments, status `paid`).
+- **ORD-3** body `CreateOrderBody`: `supplierId, currency?` (CNY, USD or INR; CNY when left out, as an older frontend
+  shows yuan only; fixed afterwards), `orderDate, deliveryDate, lines {itemId, quantity, rateCny}[]` (1-50),
+  `deposits {payee, payeeRole, amountCny, paidOn, rateInr?, mode}[]` (0-10, saved as `Deposit` payments, status `paid`;
+  `rateInr` required unless the order is INR, where it must be left out or 1 and is stored as 1; otherwise 422 on
+  `deposits`: "Enter the INR rate." / "Leave the rate empty for an INR order.").
   201 `{ order: { id, po } }`. 422 `validation_failed` with fields `supplierId`, `orderDate`, `deliveryDate`
-  ("The delivery date can't be before the order date."), `lines`, `deposits`. Inactive or unknown supplier/item: 422 on
+  ("The delivery date can't be before the order date."), `currency` ("Choose CNY, USD or INR."), `lines`, `deposits`. Inactive or unknown supplier/item: 422 on
   that field. One transaction.
 - **CAL-1** `DeliveryItem[]` (due date, oldest first): orders at stage 1-2: `orderId, po, supplier` (name), `item,
   quantity, unit, received, due` (= deliveryDate).
-- **PAY-1** `PaymentsResponse`: `orders {orderId, po, supplier, orderValueCny, paidCny, paidInr, balanceCny, nextDue}[]`
-  (every order; `nextDue` = earliest `due` payment date or null) and `payments {id, orderId, po, kind, payee,
-  payeeRole, amountCny, status, paidOn, dueDate, rateInr, mode}[]`.
+- **PAY-1** `PaymentsResponse`: `orders {orderId, po, supplier, currency, orderValueCny, paidCny, paidInr, balanceCny,
+  nextDue}[]` (every order; `nextDue` = earliest `due` payment date or null) and `payments {id, orderId, po, currency,
+  kind, payee, payeeRole, amountCny, status, paidOn, dueDate, rateInr, mode}[]` (`currency` is the order's).
 - **REC-1** `ReceiptListItem[]` (received date, newest first): `id, receivedOn, orderId, po, supplier, item, office,
   ordered, unit, thisReceipt, totalSoFar, bundles, receivedBy` (user name). Main line figures; `totalSoFar` counts this
   receipt and every earlier one.
-- **REC-2** `ReceiptOptions`: active China `offices {id, name}[]` and `orders {orderId, po, supplier, orderValueCny,
+- **REC-2** `ReceiptOptions`: active China `offices {id, name}[]` and `orders {orderId, po, supplier, currency, orderValueCny,
   depositsPaidCny, lines {orderLineId, item, unit, ordered, receivedEarlier, unitPriceCny}[]}[]` for orders at stage
   1-2 with something left to receive. `orderValueCny`, `depositsPaidCny` and `unitPriceCny` are null unless the user
   has payments >= View (QA 2026-10-30: China staff must not see payments; lead-approved, pending management note).
+  `currency` is always given: it is not an amount.
 - **REC-3** body `CreateReceiptBody`: `orderId, receivedOn` (not after today), `locationId, bundles, deliveryNote,
   shortRemark, lines {orderLineId, quantity}[]`. 201 `{ receipt: { id } }`. 422 fields `receivedOn`, `locationId`,
   `bundles`, `lines`; 409 `order_not_receivable` when the order is past stage 2.
@@ -98,7 +108,7 @@ recorded here are payments already made (status `paid`); containers move forward
 | CON-5 | `PATCH /containers/:id` | containers >= Enter | BE-containers (`stock/container-detail.routes.ts`) |
 | REC-3 | `POST /receipts` (changed) | receiving >= Enter | BE-stock (`stock.routes.ts`) |
 
-- **ORD-4** `OrderDetail`: the ORD-1 fields for that order (`supplier` also has `contactPerson, phone, city`), plus
+- **ORD-4** `OrderDetail`: the ORD-1 fields for that order (`currency` included; `supplier` also has `contactPerson, phone, city`), plus
   `balanceCny` (as PAY-1), `lines {id, position, item {id, name}, unit, quantity, rateCny, valueCny, received, loaded}[]`
   (position order; `valueCny` = round2(quantity * rateCny)), and three sections, each `null` when the signed-in user
   can't view it (effective access below View):
@@ -114,11 +124,13 @@ recorded here are payments already made (status `paid`); containers move forward
   after ORD-2 so `/orders/options` keeps working.
 - **PAY-2** body `CreatePaymentBody`: `orderId` (uuid, existing order), `kind` (`Deposit` | `Balance`), `payeeRole`
   (`supplier` | `agent`), `agentId` (uuid of an active shipping agent when `payeeRole` is `agent`, otherwise `null`),
-  `amountCny` (0.01 to 999,999,999,999), `paidOn` (date, not after today), `rateInr` (0.0001 to 99,999,999), `mode`
+  `amountCny` (0.01 to 999,999,999,999, in the order's currency), `paidOn` (date, not after today), `rateInr` (0.0001
+  to 99,999,999; required unless the order is INR, where it must be left out or 1 and is stored as 1: "Leave the rate
+  empty for an INR order."), `mode`
   (trimmed, 1-100 characters). The server saves `status: "paid"`, the payee name (the order's supplier, or the agent)
   and `createdBy`. Any stage. 201 `{ payment: { id } }`. 422 fields `orderId, kind, payeeRole, agentId, amountCny,
   paidOn, rateInr, mode`. No overpayment check: `balanceCny` may go below 0, as it already can with deposits. No edit or
-  delete. Nothing moves money.
+  delete. Nothing moves money. The payment-recorded notification shows the amount with the order's symbol (¥, $, ₹).
 - **CON-4** `ContainerDetail`: the CON-1 fields plus `portOfLoading, portOfArrival` and `lines {orderLineId, orderId, po,
   item, unit, bundles, quantity}[]` (PO, then item). Malformed or unknown id: 404 `not_found` "Container not found.".
   Register after CON-2.

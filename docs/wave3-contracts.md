@@ -3,8 +3,9 @@
 Written 2026-10-28 by the integration lead (Agent 7). Everything in `docs/contracts.md` and
 `docs/live-screens-contracts.md` still applies: Node 22, `/api/v1`, JSON only, the one error body, strict Zod bodies
 through `parse()`, the same-site check, `requirePermission`, dates `YYYY-MM-DD`, "today" in India
-(`Asia/Kolkata`), CNY money with 2 decimals, `rateInr` = INR per CNY. INR amounts in this wave are numbers with
-2 decimals. Lists are arrays.
+(`Asia/Kolkata`), money in the order's currency (CNY, USD or INR since migration 0006; the `...Cny` names are kept)
+with 2 decimals, `rateInr` = INR per 1 unit of it. INR amounts in this wave are numbers with 2 decimals. Lists are
+arrays. Order-currency amounts of different currencies are never added together: totals come per currency.
 
 **Rule status.** Rules marked **(default)** were chosen by the lead from the reference screens and the existing
 model. They are not owner-approved yet and are listed in the final report for the project owner.
@@ -83,7 +84,7 @@ Same rules for all seven tabs:
 
 | Tab | Path, key | Editable fields | Real counts |
 | --- | --- | --- | --- |
-| 1 Suppliers (A1) | `/suppliers`, `supplier` | name, city, contactPerson, phone, address, notes (currency stays CNY) | `openOrders`: this supplier's orders with `stage < 6` |
+| 1 Suppliers (A1) | `/suppliers`, `supplier` | name, city, contactPerson, phone, address, notes, currency (CNY, USD or INR; 0006) | `openOrders`: this supplier's orders with `stage < 6` |
 | 2 Shipping agents (A1) | `/shipping-agents`, `shippingAgent` | name, contactPerson, phone, officeCity | `activeContainers`: this agent's containers with status `loading` or `sea` |
 | 3 Clearing agents (A2) | `/clearing-agents`, `clearingAgent` | name, contactPerson, phone, port | `containersCleared`: this agent's clearings with status `cleared` |
 | 4 Transport companies (A2) | `/transport-companies`, `transportCompany` | name, contactPerson, phone | `tripsSoFar`: this company's trips (any status) |
@@ -197,8 +198,9 @@ rounded to 2 decimals.
 ### 6.2 Rules (default)
 
 - **Allocation:** a container's clearing total and trip cost are shared between the orders in it by goods value
-  (sum of `quantity * rateCny` of each order's lines in that container); by quantity when the container's value is 0.
-  Rounded to 2 decimals per share.
+  (sum of `quantity * rateCny` of each order's lines in that container); by quantity when the container's value is 0
+  or when the orders in it are in different currencies (QA 2026-10-30, lead-approved default: ¥ and $ values don't
+  compare, and no rate is known for an order's value). Rounded to 2 decimals per share.
 - **Final** when the order's balance is 0 or less, the order is at stage 6, and every container carrying it has a
   cleared clearing, an unloaded trip and a stocked receipt. Otherwise it is an estimate, and `waitingFor` names the
   first missing part in the order supplier payment, duty, transport, warehouse. An order with no container yet
@@ -313,7 +315,8 @@ Query parameters are strict: an unknown or repeated key, a malformed date or id,
 
 - **`GET /landed-cost?supplierId=&teamId=`** (landedCost >= View; both optional uuids) `LandedCostResponse`:
   - `orders`: every order whose `totalInr > 0` (newest order date first; `supplierId` keeps that supplier's orders,
-    `teamId` the orders with stocked pieces for that team), each `{ orderId, po, supplier {id, name}, item, quantity,
+    `teamId` the orders with stocked pieces for that team), each `{ orderId, po, supplier {id, name}, currency` (the
+    order's: the currency of `goodsPayments[].amountCny`) `, item, quantity,
     unit` (main line) `, terms` (`"FOB"` | `"CNF"` when every container carrying the order has those terms, `"mixed"`
     when they differ, `null` before loading) `, ...OrderLandedCost` (6.1, from `loadLandedCosts`) `, teams {teamId,
     team, pieces, costInr}[]` (stocked receipt lines with pieces > 0, team creation order; `costInr = round2(pieces x
@@ -332,20 +335,25 @@ Query parameters are strict: an unknown or repeated key, a malformed date or id,
   - `deliveries-per-day` (supplier only): `{ from` (today) `, to` (today + 13) `, days {date, count}[]` (14 days, stage
     1-2 orders by delivery date) `, dueNext7, suppliersNext7, dueNext14, busiest {dates, count} | null, daysWithNone,
     late }` (`late`: stage 1-2 orders due before today; not in `days`).
-  - `ordered-vs-received` (orders by order date, supplier): `{ lines {orderLineId, orderId, po, supplier, item, unit,
-    ordered, received, short, shortValueCny}[]` (every line of every order with a China receipt; `short = max(0,
-    ordered - received)`, `shortValueCny = round2(short x rateCny)` or null) `, ordersChecked, shortPos, shortValueCny,
-    fullOrders }`.
+  - `ordered-vs-received` (orders by order date, supplier): `{ lines {orderLineId, orderId, po, supplier, currency, item,
+    unit, ordered, received, short, shortValueCny}[]` (every line of every order with a China receipt; `short = max(0,
+    ordered - received)`, `shortValueCny = round2(short x rateCny)` or null, in the line's `currency`) `, ordersChecked,
+    shortPos, shortValueCny` (CNY lines only, kept for older frontends) `, shortValueByCurrency {currency, amount}[]` (one
+    per currency the lines have, CNY, USD, INR order) `, fullOrders }`.
   - `containers-timeline` (window `from`-`to`, default today - 25 to today + 24; supplier = containers carrying one of
     its orders): `{ from, to, containers {id, number, status, loadedOn, arrival}[]` (spans overlapping the window,
     loading date first; `arrival` = the clearing's `arrivedOn` for an arrived container, else its `eta`) `, active`
     (loading or at sea) `, arrivingIn7Days` (the ETA dates, today to today + 7, of containers not arrived) `, averageSeaDays`
     (arrived ones, loaded to arrival, rounded; null) `, nextArrival {date, number} | null }`.
-  - `payments-per-supplier` (orders by order date, supplier): `{ suppliers {supplierId, supplier, orders, orderValueCny,
-    paidCny, paidInr, balanceCny}[]` (open orders, stage below 6, by order value, largest first; paid = paid payments to
+  - `payments-per-supplier` (orders by order date, supplier): `{ suppliers {supplierId, supplier, currency, orders,
+    orderValueCny, paidCny, paidInr, balanceCny}[]` (one row per supplier and order currency; open orders, stage below 6,
+    by currency (CNY, USD, INR), then order value, largest first; paid = paid payments to
     the supplier only, agent payments being sea freight (6.2); `balanceCny = orderValueCny - paidCny`) `, totals {orders,
     orderValueCny, paidCny, paidInr, balanceCny}, dueNext30Cny` (due supplier payments of those orders, today to today +
-    30; CNY, as due payments have no rate) `, finishedPos }` (stage 6 POs, same filters).
+    30; in the order's currency, as due payments have no rate). `totals` and `dueNext30Cny` count CNY orders only (kept
+    for older frontends); `totalsByCurrency {currency, orders, orderValueCny, paidCny, paidInr, balanceCny}[]` and
+    `dueNext30ByCurrency {currency, amount}[]` have one entry per currency the open orders have `, finishedPos }` (stage 6
+    POs, same filters).
   - `landed-cost-by-month` (period = month of stocking, not order date; supplier): `{ months {month, pieces,
     landedCostInr, perPieceInr, soFar}[], totals {orders, pieces, landedCostInr, perPieceInr}, biggest {month,
     landedCostInr} | null }`. Only orders whose landed cost is `final`, by the month of their finish date (above);
@@ -353,7 +361,8 @@ Query parameters are strict: an unknown or repeated key, a malformed date or id,
     `to` (else this month), empty months as 0; `soFar` marks this month; `[]` when nothing is finished and no `from`.
   - `summary` (the hub, same filters as the reports it summarises): `{ suppliers` (active `{id, name}[]`) `, orders
     {total, atStage1}, deliveries {dueNext7, late}, receiving {shortOrders, shortPcs, shortM}, containers {onTheWay,
-    arrivingIn7Days}` (counts) `, payments {dueNext30Cny}, landedCost {finishedOrders, finishedTotalInr} }`.
+    arrivingIn7Days}` (counts) `, payments {dueNext30Cny, dueNext30ByCurrency}, landedCost {finishedOrders,
+    finishedTotalInr} }`.
 
 ## 9. Files and owners
 
