@@ -1,3 +1,4 @@
+import { DrizzleQueryError } from "drizzle-orm";
 import type { ErrorRequestHandler, RequestHandler } from "express";
 
 // The one error format for every endpoint (approved U36): { error: { code, message, fields? } }.
@@ -29,6 +30,16 @@ export function errorBody(error: HttpError): ErrorBody {
   return { error: { code: error.code, message: error.message, ...(error.fields ? { fields: error.fields } : {}) } };
 }
 
+/**
+ * B9.16: a failed query's message and stack list its parameters, and PostgreSQL's `detail` can list the whole row;
+ * either may hold a password hash. Such errors are logged as the SQL (placeholders only) and the cause's code.
+ */
+export function loggable(error: unknown) {
+  if (!(error instanceof DrizzleQueryError)) return error;
+  const cause = error.cause as { code?: string; constraint?: string; message?: string } | undefined;
+  return { query: error.query, code: cause?.code, constraint: cause?.constraint, message: cause?.message };
+}
+
 export const notFoundHandler: RequestHandler = (_req, _res, next) => next(notFound("Endpoint"));
 
 export const errorHandler: ErrorRequestHandler = (error, _req, res, _next) => {
@@ -47,6 +58,6 @@ export const errorHandler: ErrorRequestHandler = (error, _req, res, _next) => {
     return;
   }
   // Never echo internals to the client (no stack traces, B9). Log the error itself, not request bodies.
-  console.error(error);
+  console.error(loggable(error));
   res.status(500).json(errorBody(new HttpError(500, "server_error", GENERIC_MESSAGE)));
 };

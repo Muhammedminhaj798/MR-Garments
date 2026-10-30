@@ -1,10 +1,11 @@
 import { randomUUID } from "node:crypto";
-import { and, eq, isNull, sql } from "drizzle-orm";
-import { afterAll, beforeEach, describe, expect, it } from "vitest";
+import { eq, sql } from "drizzle-orm";
+import { afterAll, beforeEach, describe, expect, it, vi } from "vitest";
 
+import { verifyPassword } from "../../auth/passwords";
 import { locations, passwordTokens, users } from "../../db/schema";
-import { api, createTestContext, resetData, SEEDED, signInAs } from "../../test/harness";
-import { MESSAGES, stageProblem } from "./users.routes";
+import { api, createTestContext, resetData, SEEDED, signInAs, TEST_PASSWORD } from "../../test/harness";
+import { MESSAGES, passwordMessage, stageProblem } from "./users.routes";
 
 const ctx = createTestContext();
 const http = api(ctx);
@@ -19,7 +20,12 @@ const management = () => signInAs(ctx, SEEDED.management);
 const sessionsOf = async (userId: string) =>
   (await ctx.pool.query(`select count(*)::int as n from session where sess->>'userId' = $1`, [userId])).rows[0].n as number;
 
-const newUser = { name: "Test User", email: "test@mrgarments.com", role: "China staff", stages: [2] };
+const INITIAL_PASSWORD = "Welcome2026x";
+const newUser = { name: "Test User", email: "test@mrgarments.com", role: "China staff", stages: [2], password: INITIAL_PASSWORD };
+const signIn = (email: string, password: string) => http.post("/auth/login", { email, password, keepSignedIn: false });
+const userRow = async (email: string) => (await ctx.db.select().from(users).where(eq(users.email, email)))[0]!;
+/** No response may carry a password or a hash, under any key. */
+const noPassword = (body: unknown) => expect(JSON.stringify(body)).not.toMatch(/password|argon2/i);
 
 describe("access (AT-R5)", () => {
   it("lets only Management use USR-1 to USR-4 and ROL-1; signed out is 401", async () => {
@@ -43,6 +49,27 @@ describe("access (AT-R5)", () => {
     expect((await http.post("/users", newUser).set("Cookie", cookie)).status).toBe(201);
     expect((await http.patch(`/users/${wang}`, {}).set("Cookie", cookie)).status).toBe(200);
     expect((await http.get("/roles").set("Cookie", cookie)).status).toBe(200);
+  });
+});
+
+describe("only Management creates users or assigns roles; nobody promotes themselves", () => {
+  it("a non-Management user can't create a Management user or make themselves Management (403, nothing saved)", async () => {
+    for (const email of NON_MANAGEMENT) {
+      const cookie = await signInAs(ctx, email);
+      const self = await idOf(email);
+      const before = await userRow(email);
+      const created = await http.post("/users", { ...newUser, role: "Management", stages: [] }).set("Cookie", cookie);
+      expect(created.status, email).toBe(403);
+      for (const body of [{ role: "Management", stages: [] }, { role: "Management" }, { password: INITIAL_PASSWORD }]) {
+        const res = await http.patch(`/users/${self}`, body).set("Cookie", cookie);
+        expect(res.status, `${email} ${JSON.stringify(body)}`).toBe(403);
+      }
+      const after = await userRow(email);
+      expect(after.role).toBe(before.role);
+      expect(after.passwordHash).toBe(before.passwordHash);
+      expect((await http.get("/me").set("Cookie", cookie)).body.role).toBe(before.role);
+    }
+    expect(await ctx.db.select().from(users).where(eq(users.email, newUser.email))).toHaveLength(0);
   });
 });
 
@@ -143,9 +170,10 @@ describe("USR-2 GET /users/:id", () => {
 });
 
 describe("USR-3 POST /users", () => {
-  it("adds an active user with the ticked stages and issues an invite link (AT-U7)", async () => {
+  it("adds an active user with the ticked stages and the initial password; no link is issued (AT-U7)", async () => {
     const res = await http.post("/users", { ...newUser, email: "  Test@MRGarments.com " }).set("Cookie", await management());
     expect(res.status).toBe(201);
+    noPassword(res.body);
     expect(res.body.user).toMatchObject({
       name: "Test User",
       email: "test@mrgarments.com",
@@ -160,38 +188,71 @@ describe("USR-3 POST /users", () => {
     });
     const id = res.body.user.id as string;
     const stored = (await ctx.db.select().from(users).where(eq(users.id, id)))[0]!;
-    expect(stored.passwordHash).toBeNull();
+    expect(stored.passwordHash).toMatch(/^\$argon2id\$/);
+    expect(await verifyPassword(stored.passwordHash, INITIAL_PASSWORD)).toBe(true);
+    expect(stored.passwordChangedAt).toBeInstanceOf(Date);
     expect(stored.createdBy).toBe(await idOf(SEEDED.management));
-    const links = await ctx.db
-      .select()
-      .from(passwordTokens)
-      .where(and(eq(passwordTokens.userId, id), eq(passwordTokens.purpose, "invite"), isNull(passwordTokens.usedAt)));
-    expect(links).toHaveLength(1);
+    expect(await ctx.db.select().from(passwordTokens)).toHaveLength(0);
 
     const list = await http.get("/users").set("Cookie", await management());
     expect(list.body.data.at(-1)).toMatchObject({ name: "Test User", status: "Active" });
     expect(list.body.counts).toEqual({ active: 9, inactive: 0 });
+    noPassword(list.body);
+    noPassword((await http.get(`/users/${id}`).set("Cookie", await management())).body);
+
+    // The new user signs in with exactly that password.
+    expect((await signIn("test@mrgarments.com", "Welcome2026X")).status).toBe(401);
+    const login = await signIn("test@mrgarments.com", INITIAL_PASSWORD);
+    expect(login.status).toBe(200);
+    expect(login.body.user).toMatchObject({ id, role: "China staff", stages: [2] });
+    noPassword(login.body);
+  });
+
+  it("an inactive new user can't sign in with the initial password until made active (B9.15)", async () => {
+    const res = await http.post("/users", { ...newUser, status: "Inactive" }).set("Cookie", await management());
+    expect(res.status).toBe(201);
+    expect((await signIn(newUser.email, INITIAL_PASSWORD)).status).toBe(401);
   });
 
   it("stores the office, phone, language and status it is given", async () => {
     const office = (await ctx.db.select().from(locations).where(eq(locations.name, "India office")))[0]!;
     const res = await http
-      .post("/users", { name: "Ravi K", email: "ravi@mrgarments.com", phone: " +91 98470 11111 ", role: "India staff", officeId: office.id, language: "English", status: "Inactive", stages: [5, 4, 5] })
+      .post("/users", { name: "Ravi K", email: "ravi@mrgarments.com", phone: " +91 98470 11111 ", role: "India staff", officeId: office.id, language: "English", status: "Inactive", stages: [5, 4, 5], password: INITIAL_PASSWORD })
       .set("Cookie", await management());
     expect(res.status).toBe(201);
     expect(res.body.user).toMatchObject({ phone: "+91 98470 11111", officeId: office.id, office: "India office", status: "Inactive", stages: [4, 5] });
   });
 
-  it("refuses a password with 400 (C5)", async () => {
-    const res = await http.post("/users", { ...newUser, password: "Secret123" }).set("Cookie", await management());
-    expect(res.status).toBe(400);
-    expect(res.body.error.code).toBe("bad_request");
+  it("needs a password that meets the rules (M8, M9), and saves nothing otherwise", async () => {
+    const cookie = await management();
+    const withoutPassword = { ...newUser, password: undefined }; // JSON drops the key
+    const cases: [object, string][] = [
+      [withoutPassword, MESSAGES.password],
+      [{ ...newUser, password: "" }, MESSAGES.password],
+      [{ ...newUser, password: null }, MESSAGES.password],
+      [{ ...newUser, password: 12345678 }, MESSAGES.password],
+      [{ ...newUser, password: "welcome2026" }, MESSAGES.passwordRules],
+      [{ ...newUser, password: "Welcome" }, MESSAGES.passwordRules],
+      [{ ...newUser, password: `A1${"x".repeat(127)}` }, MESSAGES.passwordTooLong],
+    ];
+    for (const [body, message] of cases) {
+      const res = await http.post("/users", body).set("Cookie", cookie);
+      expect(res.status, JSON.stringify(body).slice(0, 80)).toBe(422);
+      expect(res.body.error).toEqual({ code: "validation_failed", message: "Some fields need attention.", fields: { password: message } });
+    }
     expect(await ctx.db.select().from(users).where(eq(users.email, newUser.email))).toHaveLength(0);
   });
 
   it("refuses unknown keys and impossible values with 400", async () => {
     const cookie = await management();
-    for (const body of [{ ...newUser, admin: true }, { ...newUser, language: "French" }, { ...newUser, status: "Gone" }, { ...newUser, stages: [7] }, { ...newUser, stages: "2" }]) {
+    for (const body of [
+      { ...newUser, admin: true },
+      { ...newUser, passwordHash: "x" },
+      { ...newUser, language: "French" },
+      { ...newUser, status: "Gone" },
+      { ...newUser, stages: [7] },
+      { ...newUser, stages: "2" },
+    ]) {
       expect((await http.post("/users", body).set("Cookie", cookie)).status, JSON.stringify(body)).toBe(400);
     }
   });
@@ -199,9 +260,17 @@ describe("USR-3 POST /users", () => {
   it("names every missing required field (M13, M14, M16)", async () => {
     const res = await http.post("/users", {}).set("Cookie", await management());
     expect(res.status).toBe(422);
-    expect(res.body.error).toMatchObject({ code: "validation_failed", fields: { name: MESSAGES.name, email: MESSAGES.email, role: MESSAGES.role } });
-    const blank = await http.post("/users", { name: "  ", email: "not-an-email", role: "" }).set("Cookie", await management());
-    expect(blank.body.error.fields).toEqual({ name: "Enter the full name.", email: "Enter a valid email address.", role: "Choose a role." });
+    expect(res.body.error).toMatchObject({
+      code: "validation_failed",
+      fields: { name: MESSAGES.name, email: MESSAGES.email, role: MESSAGES.role, password: MESSAGES.password },
+    });
+    const blank = await http.post("/users", { name: "  ", email: "not-an-email", role: "", password: "" }).set("Cookie", await management());
+    expect(blank.body.error.fields).toEqual({
+      name: "Enter the full name.",
+      email: "Enter a valid email address.",
+      role: "Choose a role.",
+      password: "Enter a password.",
+    });
   });
 
   it("refuses a duplicate email in any capitalisation with 409 (AT-U11, M15)", async () => {
@@ -258,9 +327,9 @@ describe("USR-4 PATCH /users/:id", () => {
     expect((await http.get(`/users/${wang}`).set("Cookie", cookie)).body.user.stages).toEqual([2, 3]);
   });
 
-  it("refuses a password with 400 (C5) and unknown users with 404 (E10)", async () => {
+  it("refuses unknown keys with 400 and unknown users with 404 (E10)", async () => {
     const cookie = await management();
-    expect((await http.patch(`/users/${await idOf(SEEDED.chinaStaff)}`, { password: "Secret123" }).set("Cookie", cookie)).status).toBe(400);
+    expect((await http.patch(`/users/${await idOf(SEEDED.chinaStaff)}`, { passwordHash: "x" }).set("Cookie", cookie)).status).toBe(400);
     expect((await http.patch(`/users/${randomUUID()}`, { name: "Nobody" }).set("Cookie", cookie)).status).toBe(404);
     expect((await http.patch("/users/not-an-id", { name: "Nobody" }).set("Cookie", cookie)).status).toBe(404);
   });
@@ -283,6 +352,108 @@ describe("USR-4 PATCH /users/:id", () => {
     await ctx.db.update(locations).set({ status: "Inactive" }).where(eq(locations.name, "Guangzhou office"));
     const current = (await http.get(`/users/${li}`).set("Cookie", cookie)).body.user;
     expect((await http.patch(`/users/${li}`, { officeId: current.officeId, phone: "1" }).set("Cookie", cookie)).status).toBe(200);
+  });
+});
+
+describe("USR-4 setting another user's password (password policy)", () => {
+  const NEW_PASSWORD = "Ledger2026x";
+
+  it("sets Chen's new password, ends all his sessions and only his; the old password stops working", async () => {
+    const cookie = await management();
+    const chen = await idOf(SEEDED.chinaStaff);
+    const chenCookie = await signInAs(ctx, SEEDED.chinaStaff);
+    await signInAs(ctx, SEEDED.chinaStaff);
+    const wangCookie = await signInAs(ctx, SEEDED.chinaStaffTwoStages);
+    const before = await userRow(SEEDED.chinaStaff);
+
+    const res = await http.patch(`/users/${chen}`, { password: NEW_PASSWORD }).set("Cookie", cookie);
+    expect(res.status).toBe(200);
+    noPassword(res.body);
+    expect(res.body.user).toMatchObject({ id: chen, role: "China staff", stages: [2], status: "Active" });
+
+    expect(await sessionsOf(chen)).toBe(0);
+    expect((await http.get("/me").set("Cookie", chenCookie)).status).toBe(401);
+    expect((await http.get("/me").set("Cookie", wangCookie)).status).toBe(200);
+    expect((await http.get("/users").set("Cookie", cookie)).status).toBe(200);
+
+    const after = await userRow(SEEDED.chinaStaff);
+    expect(after.passwordChangedAt!.getTime()).toBeGreaterThan(before.passwordChangedAt!.getTime());
+    expect(after.updatedBy).toBe(await idOf(SEEDED.management));
+    expect((await signIn(SEEDED.chinaStaff, TEST_PASSWORD)).status).toBe(401);
+    expect((await signIn(SEEDED.chinaStaff, NEW_PASSWORD)).status).toBe(200);
+  });
+
+  it("can set a password together with other fields, and gives an account with no password one", async () => {
+    await ctx.db.update(users).set({ passwordHash: null }).where(eq(users.email, LI_WEI));
+    expect((await signIn(LI_WEI, TEST_PASSWORD)).status).toBe(401);
+    const res = await http.patch(`/users/${await idOf(LI_WEI)}`, { phone: "+86 1", password: NEW_PASSWORD }).set("Cookie", await management());
+    expect(res.status).toBe(200);
+    expect(res.body.user.phone).toBe("+86 1");
+    expect((await signIn(LI_WEI, NEW_PASSWORD)).status).toBe(200);
+  });
+
+  it("refuses an empty, weak or too long password with the field message and changes nothing", async () => {
+    const cookie = await management();
+    const chen = await idOf(SEEDED.chinaStaff);
+    const chenCookie = await signInAs(ctx, SEEDED.chinaStaff);
+    const before = await userRow(SEEDED.chinaStaff);
+    for (const [password, message] of [
+      ["", MESSAGES.password],
+      ["ledger2026", MESSAGES.passwordRules],
+      [`A1${"x".repeat(127)}`, MESSAGES.passwordTooLong],
+    ] as const) {
+      const res = await http.patch(`/users/${chen}`, { name: "Changed", password }).set("Cookie", cookie);
+      expect(res.status).toBe(422);
+      expect(res.body.error.fields).toEqual({ password: message });
+    }
+    const after = await userRow(SEEDED.chinaStaff);
+    expect(after.passwordHash).toBe(before.passwordHash);
+    expect(after.name).toBe(before.name);
+    expect((await http.get("/me").set("Cookie", chenCookie)).status).toBe(200);
+  });
+
+  it("refuses a Management user's own password with 403 and saves nothing, however the id is written", async () => {
+    const cookie = await management();
+    const suresh = await idOf(SEEDED.management);
+    const before = await userRow(SEEDED.management);
+    for (const id of [suresh, suresh.toUpperCase()]) {
+      const res = await http.patch(`/users/${id}`, { name: "Suresh M", password: NEW_PASSWORD }).set("Cookie", cookie);
+      expect(res.status, id).toBe(403);
+      expect(res.body).toEqual({ error: { code: "password_change_disabled", message: MESSAGES.ownPassword } });
+    }
+    // Any password at all, even empty, weak or not text, is the same 403, before the body is checked.
+    for (const password of ["", "weak", null, 12345678]) {
+      const res = await http.patch(`/users/${suresh}`, { name: "", password }).set("Cookie", cookie);
+      expect(res.status, JSON.stringify(password)).toBe(403);
+      expect(res.body.error.code).toBe("password_change_disabled");
+    }
+    const after = await userRow(SEEDED.management);
+    expect(after.passwordHash).toBe(before.passwordHash);
+    expect(after.name).toBe("Suresh Menon");
+    expect((await http.get("/me").set("Cookie", cookie)).status).toBe(200);
+    expect((await signIn(SEEDED.management, TEST_PASSWORD)).status).toBe(200);
+  });
+
+  it("another Management user can set Suresh's password", async () => {
+    await ctx.db.update(users).set({ role: "Management" }).where(eq(users.email, SEEDED.procurement));
+    const priya = await signInAs(ctx, SEEDED.procurement);
+    const res = await http.patch(`/users/${await idOf(SEEDED.management)}`, { password: NEW_PASSWORD }).set("Cookie", priya);
+    expect(res.status).toBe(200);
+    expect((await signIn(SEEDED.management, NEW_PASSWORD)).status).toBe(200);
+  });
+
+  it("never logs the password or its hash (B9.16)", async () => {
+    const spies = (["log", "info", "warn", "error"] as const).map((method) => vi.spyOn(console, method).mockImplementation(() => {}));
+    try {
+      const cookie = await management();
+      await http.post("/users", newUser).set("Cookie", cookie);
+      await http.patch(`/users/${await idOf(SEEDED.chinaStaff)}`, { password: NEW_PASSWORD }).set("Cookie", cookie);
+      const hashes = [(await userRow(newUser.email)).passwordHash!, (await userRow(SEEDED.chinaStaff)).passwordHash!];
+      const logged = JSON.stringify(spies.flatMap((spy) => spy.mock.calls));
+      for (const secret of [INITIAL_PASSWORD, NEW_PASSWORD, ...hashes]) expect(logged).not.toContain(secret);
+    } finally {
+      for (const spy of spies) spy.mockRestore();
+    }
   });
 });
 
@@ -399,6 +570,18 @@ describe("B8 role changes, the last Management user and sessions", () => {
     const res = await http.patch(`/users/${li}`, { status: "Active" }).set("Cookie", cookie);
     expect(res.status).toBe(200);
     expect((await http.get("/me").set("Cookie", await signInAs(ctx, LI_WEI))).status).toBe(200);
+  });
+});
+
+describe("passwordMessage", () => {
+  it("follows B9.10 with M8 and M9, and never trims", () => {
+    expect(passwordMessage("")).toBe(MESSAGES.password);
+    expect(passwordMessage("ledger2026")).toBe(MESSAGES.passwordRules);
+    expect(passwordMessage("Ledger")).toBe(MESSAGES.passwordRules);
+    expect(passwordMessage("        ")).toBe(MESSAGES.passwordRules);
+    expect(passwordMessage(`A1${"x".repeat(127)}`)).toBe(MESSAGES.passwordTooLong);
+    expect(passwordMessage(`A1${"x".repeat(126)}`)).toBeUndefined();
+    expect(passwordMessage(" Ledger2026 ")).toBeUndefined();
   });
 });
 
