@@ -76,9 +76,9 @@ Same rules for all seven tabs:
   "A <noun> with this name already exists.". Empty: 422 `fields.name` "Enter the <noun> name.".
 - Other text fields: trimmed, optional, at most 200 characters (address and notes 1000). Too long: 422
   `fields.<field>` "Use 200 characters or fewer." ("Use 1000 characters or fewer." for address and notes).
-- **No delete.** Records are referenced by orders, containers and users; "Deactivate" is `PATCH { status: "Inactive" }`.
-  Inactive records drop out of every option list (they already select `status = 'Active'`) and stay on existing
-  records. The frontend asks for confirmation before deactivating.
+- **Deactivate, or delete only what nothing uses (4.1).** Records are referenced by orders, containers and users;
+  "Deactivate" is `PATCH { status: "Inactive" }`. Inactive records drop out of every option list (they already select
+  `status = 'Active'`) and stay on existing records. The frontend asks for confirmation before deactivating.
 - Lists keep their current shapes; the counts that were fixed at 0 become real:
 
 | Tab | Path, key | Editable fields | Real counts |
@@ -103,6 +103,35 @@ Same rules for all seven tabs:
   `setApiErrors(error, setError)` and `ConfirmDialog` (deactivation). The add action links to `addHref(path)`
   (`?dialog=add`); Edit already links to `editHref(path, id)` (`?dialog=edit&id=<id>`). Body and response types are
   in `src/lib/api/types.ts` (`Create<Entity>Body`, `Update<Entity>Body`, `<Entity>Response`).
+
+### 4.1 Delete a record nothing uses (QA 2026-10-30, changes BR-06; needs management approval)
+
+BR-06 was "master data is never deleted". It becomes: a Settings record that nothing uses (added by mistake) can be
+deleted; a record in use is only deactivated. Orders, payments, receipts, containers, stage records and notifications
+are never deleted or changed by this.
+
+- `DELETE /<path>/:id` on all seven paths (`src/modules/master-data/delete-route.ts`), `admin` Full (Management only):
+  204, empty response. A malformed or unknown id is 404 `not_found` "<Noun> not found.". The request body is ignored
+  (send `{}` for the same-site check).
+- In use: 409 `in_use` "This <noun> is used by <uses>, so it can't be deleted. Deactivate it instead.", nothing
+  deleted. `<uses>` counts what points at the row, for example "2 orders" or "1 user, 1 trip and 1 warehouse receipt":
+
+| Tab | Counted uses |
+| --- | --- |
+| Suppliers | orders (`orders.supplier_id`) |
+| Shipping agents | containers (`containers.shipping_agent_id`); agent payments with the agent's name (`payments.payee`, ignoring case: payments keep the name, not the id) |
+| Clearing agents | containers (`clearings.clearing_agent_id`, one per container) |
+| Transport companies | trips (`transports.transport_company_id`) |
+| Offices & warehouses | users of any status (`users.location_id`), China receipts (`receipts.location_id`), trips (`transports.destination_id`), warehouse receipts (`warehouse_receipts.location_id`) |
+| Teams | warehouse receipts with a line for the team, drafts included (`warehouse_receipt_lines.team_id`) |
+| Items | orders with a line of the item (`order_lines.item_id`) |
+
+- Race-safe: the row is locked `FOR UPDATE` before the counts, so a reference saved meanwhile (its foreign-key check
+  key-share locks the row) is either counted or fails its own check. Every foreign key to these tables is `ON DELETE NO ACTION`,
+  so a use the counts missed still refuses the delete: 409 `in_use` with "used by other records". No migration.
+- Known limit: agent payments recorded before the agent was renamed carry the old name, so they aren't counted.
+- Frontend: `SettingsDialogFooter`'s `remove` (`{ path, name, noun }`) puts Delete on each edit dialog; it confirms
+  ("Delete <name>?"), then toasts "<Noun> deleted" and reloads like a save, or toasts the 409 message and stays open.
 
 ## 5. Clearing, Transport, Warehouse (Agent 5)
 

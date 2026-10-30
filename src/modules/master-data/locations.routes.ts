@@ -3,13 +3,15 @@ import { Router } from "express";
 import { z } from "zod";
 
 import { requirePermission } from "../../auth/current-user";
-import { LOCATION_TYPES, locations, STATUSES, users } from "../../db/schema";
+import { LOCATION_TYPES, locations, receipts, STATUSES, transports, users, warehouseReceipts } from "../../db/schema";
 import { conflict, GENERIC_MESSAGE, HttpError, notFound } from "../../http/errors";
 import { parse } from "../../http/validate";
 import type { RouteContext } from "../context";
+import { deleteRoute } from "./delete-route";
 import { creationOrder, listRoute } from "./list-query";
 
-// Owner: A3 (docs/wave3-contracts.md section 4). MD-13 GET /locations, POST /locations, PATCH /locations/:id.
+// Owner: A3 (docs/wave3-contracts.md section 4). MD-13 GET /locations, POST /locations, PATCH /locations/:id,
+// DELETE /locations/:id (section 4.1).
 
 // Proposed wording (the contract gives the pattern, not the noun).
 const M = {
@@ -92,6 +94,14 @@ export function locationsRoutes({ db }: RouteContext) {
     if (!updated[0]) throw notFound("Office or warehouse");
     res.json({ location: (await load(id))[0] });
   });
+
+  // Users of any status: a user is never deleted, so an inactive user's office stays.
+  deleteRoute(router, db, "/locations", locations, "Office or warehouse", [
+    { what: "user", table: users, of: (id) => eq(users.locationId, id) },
+    { what: "China receipt", table: receipts, of: (id) => eq(receipts.locationId, id) },
+    { what: "trip", table: transports, of: (id) => eq(transports.destinationId, id) },
+    { what: "warehouse receipt", table: warehouseReceipts, of: (id) => eq(warehouseReceipts.locationId, id) },
+  ]);
 
   return router;
 }

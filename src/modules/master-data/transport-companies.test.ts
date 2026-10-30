@@ -120,7 +120,7 @@ describe("PATCH /transport-companies/:id", () => {
     expect((await list("?search=malabar")).body[0]).toMatchObject({ name: "Malabar Carriers", contactPerson: "Mr. Salim P" });
   });
 
-  it("deactivates and reactivates (there is no delete)", async () => {
+  it("deactivates and reactivates", async () => {
     const id = await idOfCompany("Malabar Carriers");
     expect((await edit(id, { status: "Inactive" })).body.transportCompany.status).toBe("Inactive");
     expect((await list("?status=Inactive")).body.map((row: { name: string }) => row.name)).toEqual(["Malabar Carriers"]);

@@ -1,16 +1,17 @@
-import { and, count, eq, inArray } from "drizzle-orm";
+import { and, count, eq, inArray, sql } from "drizzle-orm";
 import { Router } from "express";
 import { z } from "zod";
 
 import { requirePermission } from "../../auth/current-user";
-import { containers, shippingAgents, STATUSES } from "../../db/schema";
+import { containers, payments, shippingAgents, STATUSES } from "../../db/schema";
 import { conflict, GENERIC_MESSAGE, HttpError, notFound } from "../../http/errors";
 import { parse } from "../../http/validate";
 import type { RouteContext } from "../context";
+import { deleteRoute } from "./delete-route";
 import { contactSearch, creationOrder, listRoute } from "./list-query";
 
 // Owner: A1 (docs/wave3-contracts.md section 4). MD-4 GET /shipping-agents, POST /shipping-agents and
-// PATCH /shipping-agents/:id. Management only (B6).
+// PATCH /shipping-agents/:id, DELETE /shipping-agents/:id (section 4.1). Management only (B6).
 
 const NAME_EMPTY = "Enter the shipping agent name.";
 const NAME_TAKEN = "A shipping agent with this name already exists.";
@@ -80,6 +81,20 @@ export function shippingAgentsRoutes({ db }: RouteContext) {
     if (!updated[0]) throw notFound("Shipping agent");
     res.json({ shippingAgent: (await load(id))[0] });
   });
+
+  deleteRoute(router, db, "/shipping-agents", shippingAgents, "Shipping agent", [
+    { what: "container", table: containers, of: (id) => eq(containers.shippingAgentId, id) },
+    // An agent payment keeps the agent's name, not its id.
+    {
+      what: "agent payment",
+      table: payments,
+      of: (id) =>
+        and(
+          eq(payments.payeeRole, "agent"),
+          sql`lower(${payments.payee}) = (select lower(${shippingAgents.name}) from ${shippingAgents} where ${shippingAgents.id} = ${id})`,
+        ),
+    },
+  ]);
 
   return router;
 }

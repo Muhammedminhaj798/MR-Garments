@@ -120,7 +120,7 @@ describe("PATCH /clearing-agents/:id", () => {
     expect((await list("?search=southern")).body[0]).toMatchObject({ name: "Southern Port Agents", port: "Vizhinjam" });
   });
 
-  it("deactivates and reactivates (there is no delete)", async () => {
+  it("deactivates and reactivates", async () => {
     const id = await idOfAgent("Southern Port Agents");
     expect((await edit(id, { status: "Inactive" })).body.clearingAgent.status).toBe("Inactive");
     expect((await list("?status=Inactive")).body.map((row: { name: string }) => row.name)).toEqual(["Southern Port Agents"]);
