@@ -1,4 +1,4 @@
-import { eq, sql } from "drizzle-orm";
+import { eq, inArray, sql } from "drizzle-orm";
 import { Router } from "express";
 import { z } from "zod";
 
@@ -8,9 +8,11 @@ import { items, orderLines, orders, STATUSES } from "../../db/schema";
 import { conflict, GENERIC_MESSAGE, HttpError, notFound, validationFailed } from "../../http/errors";
 import { parse } from "../../http/validate";
 import type { RouteContext } from "../context";
+import { deleteRoute } from "./delete-route";
 import { creationOrder, listRoute } from "./list-query";
 
-// Owner: A4 (docs/wave3-contracts.md section 4). MD-19 GET /items, POST /items, PATCH /items/:id. Management only (B6).
+// Owner: A4 (docs/wave3-contracts.md section 4). MD-19 GET /items, POST /items, PATCH /items/:id,
+// DELETE /items/:id (section 4.1). Management only (B6).
 
 export const MESSAGES = {
   name: "Enter the item name.",
@@ -126,6 +128,10 @@ export function itemsRoutes({ db }: RouteContext) {
       .catch(nameTakenAsConflict);
     res.json({ item: (await itemRows(db, id))[0] });
   });
+
+  deleteRoute(router, db, "/items", items, "Item", [
+    { what: "order", table: orders, of: (id) => inArray(orders.id, db.select({ id: orderLines.orderId }).from(orderLines).where(eq(orderLines.itemId, id))) },
+  ]);
 
   return router;
 }

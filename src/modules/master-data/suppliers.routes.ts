@@ -7,10 +7,11 @@ import { orders, STATUSES, suppliers } from "../../db/schema";
 import { conflict, GENERIC_MESSAGE, HttpError, notFound } from "../../http/errors";
 import { parse } from "../../http/validate";
 import type { RouteContext } from "../context";
+import { deleteRoute } from "./delete-route";
 import { contactSearch, creationOrder, listRoute } from "./list-query";
 
 // Owner: A1 (docs/wave3-contracts.md section 4). MD-1 GET /suppliers, MD-2 POST /suppliers (docs/contracts.md) and
-// PATCH /suppliers/:id. Management only (B6).
+// PATCH /suppliers/:id, DELETE /suppliers/:id (section 4.1). Management only (B6).
 
 const NAME_EMPTY = "Enter the supplier name."; // M21
 const NAME_TAKEN = "A supplier with this name already exists."; // M22
@@ -85,6 +86,8 @@ export function suppliersRoutes({ db }: RouteContext) {
     if (!updated[0]) throw notFound("Supplier");
     res.json({ supplier: (await load(id))[0] });
   });
+
+  deleteRoute(router, db, "/suppliers", suppliers, "Supplier", [{ what: "order", table: orders, of: (id) => eq(orders.supplierId, id) }]);
 
   return router;
 }

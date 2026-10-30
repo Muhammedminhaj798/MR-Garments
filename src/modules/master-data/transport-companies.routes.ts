@@ -7,10 +7,11 @@ import { STATUSES, transportCompanies, transports } from "../../db/schema";
 import { conflict, GENERIC_MESSAGE, HttpError, notFound } from "../../http/errors";
 import { parse } from "../../http/validate";
 import type { RouteContext } from "../context";
+import { deleteRoute } from "./delete-route";
 import { contactSearch, creationOrder, listRoute } from "./list-query";
 
 // Owner: A2 (docs/wave3-contracts.md section 4). MD-10 GET /transport-companies, POST /transport-companies and
-// PATCH /transport-companies/:id. Management only (B6). No delete: deactivating is PATCH { status: "Inactive" }.
+// PATCH /transport-companies/:id, DELETE /transport-companies/:id (section 4.1). Management only (B6).
 
 export const MESSAGES = {
   nameEmpty: "Enter the transport company name.",
@@ -79,6 +80,10 @@ export function transportCompaniesRoutes({ db }: RouteContext) {
     if (!updated[0]) throw notFound("Transport company");
     res.json({ transportCompany: await findRow(id) });
   });
+
+  deleteRoute(router, db, "/transport-companies", transportCompanies, "Transport company", [
+    { what: "trip", table: transports, of: (id) => eq(transports.transportCompanyId, id) },
+  ]);
 
   return router;
 }

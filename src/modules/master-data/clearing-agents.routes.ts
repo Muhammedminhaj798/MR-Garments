@@ -7,10 +7,11 @@ import { clearingAgents, clearings, STATUSES } from "../../db/schema";
 import { conflict, GENERIC_MESSAGE, HttpError, notFound } from "../../http/errors";
 import { parse } from "../../http/validate";
 import type { RouteContext } from "../context";
+import { deleteRoute } from "./delete-route";
 import { contactSearch, creationOrder, listRoute } from "./list-query";
 
 // Owner: A2 (docs/wave3-contracts.md section 4). MD-7 GET /clearing-agents, POST /clearing-agents and
-// PATCH /clearing-agents/:id. Management only (B6). No delete: deactivating is PATCH { status: "Inactive" }.
+// PATCH /clearing-agents/:id, DELETE /clearing-agents/:id (section 4.1). Management only (B6).
 
 export const MESSAGES = {
   nameEmpty: "Enter the clearing agent name.",
@@ -83,6 +84,11 @@ export function clearingAgentsRoutes({ db }: RouteContext) {
     if (!updated[0]) throw notFound("Clearing agent");
     res.json({ clearingAgent: await findRow(id) });
   });
+
+  // One clearing per container.
+  deleteRoute(router, db, "/clearing-agents", clearingAgents, "Clearing agent", [
+    { what: "container", table: clearings, of: (id) => eq(clearings.clearingAgentId, id) },
+  ]);
 
   return router;
 }

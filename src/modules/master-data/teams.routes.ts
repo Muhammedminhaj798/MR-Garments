@@ -1,4 +1,4 @@
-import { and, eq, sql } from "drizzle-orm";
+import { and, eq, inArray, sql } from "drizzle-orm";
 import { Router } from "express";
 import { z } from "zod";
 
@@ -9,9 +9,11 @@ import { parse } from "../../http/validate";
 import { loadLandedCosts } from "../costs/landed-cost";
 import { round2 } from "../orders/orders.routes";
 import type { RouteContext } from "../context";
+import { deleteRoute } from "./delete-route";
 import { creationOrder, listRoute } from "./list-query";
 
-// Owner: A3 (docs/wave3-contracts.md sections 4 and 6.3). MD-16 GET /teams, POST /teams, PATCH /teams/:id.
+// Owner: A3 (docs/wave3-contracts.md sections 4 and 6.3). MD-16 GET /teams, POST /teams, PATCH /teams/:id,
+// DELETE /teams/:id (section 4.1).
 
 // Proposed wording (the contract gives the pattern).
 const M = {
@@ -87,6 +89,16 @@ export function teamsRoutes({ db }: RouteContext) {
     if (!updated[0]) throw notFound("Team");
     res.json({ team: (await load(id))[0] });
   });
+
+  // Draft receipts count too.
+  deleteRoute(router, db, "/teams", teams, "Team", [
+    {
+      what: "warehouse receipt",
+      table: warehouseReceipts,
+      of: (id) =>
+        inArray(warehouseReceipts.id, db.select({ id: warehouseReceiptLines.receiptId }).from(warehouseReceiptLines).where(eq(warehouseReceiptLines.teamId, id))),
+    },
+  ]);
 
   return router;
 }
