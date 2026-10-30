@@ -213,19 +213,30 @@ describe("REC-2 GET /receipts/options", () => {
     expect((await post(chen, body(open.id, [{ orderLineId: main, quantity: 100 }, { orderLineId: fabric, quantity: 120 }]))).status).toBe(201);
     expect((await post(chen, body(done.id, [{ orderLineId: done.lineIds[0]!, quantity: 10 }]))).status).toBe(201);
 
-    const res = await http.get("/receipts/options").set("Cookie", wang);
+    const res = await http.get("/receipts/options").set("Cookie", await signInAs(ctx, SEEDED.management));
     expect(res.status).toBe(200);
     expect(res.body.offices).toEqual([{ id: guangzhou, name: "Guangzhou office" }]);
     const ids = res.body.orders.map((order: { orderId: string }) => order.orderId);
     expect(ids).not.toContain(done.id);
     expect(ids).not.toContain(loading.id);
-    expect(res.body.orders.find((order: { orderId: string }) => order.orderId === open.id)).toEqual({
+    const row = {
       orderId: open.id,
       po: open.po,
       supplier: "Guangzhou Textile Co.",
       orderValueCny: 2750,
       depositsPaidCny: 300,
       lines: [{ orderLineId: fabric, item: "Cotton fabric", unit: "m", ordered: 500, receivedEarlier: 120, unitPriceCny: 3 }],
+    };
+    expect(res.body.orders.find((order: { orderId: string }) => order.orderId === open.id)).toEqual(row);
+
+    // China staff can't view payments (matrix "Deposits and payments"): the same rows, without the money.
+    const staff = await http.get("/receipts/options").set("Cookie", wang);
+    expect(staff.status).toBe(200);
+    expect(staff.body.orders.find((order: { orderId: string }) => order.orderId === open.id)).toEqual({
+      ...row,
+      orderValueCny: null,
+      depositsPaidCny: null,
+      lines: [{ ...row.lines[0], unitPriceCny: null }],
     });
   });
 });
