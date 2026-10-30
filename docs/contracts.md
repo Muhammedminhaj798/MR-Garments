@@ -60,7 +60,11 @@ invite, reset or password links and no emails.
   the hash, sets `password_changed_at` and signs that user out everywhere. For the caller's own account it is 403
   `password_change_disabled` ("Ask another Management user to set your password.") and nothing is saved.
 - **AUTH-5 `POST /auth/change-password`** and **AUTH-4 `POST /auth/reset-password`** answer 403
-  `password_change_disabled` ("Passwords are set by a Management user.") to everyone, signed in or not.
+  `password_change_disabled` ("Passwords are set by a Management user.") to everyone, signed in or not. **PRF-2
+  `PATCH /profile`** refuses a `password` key with 400 like any other unknown key.
+- A user with no password hash (added before this policy; their invite link was only printed in development) can't
+  sign in (AUTH-1 401) until Management sets a password on Edit user. Existing hashes are unchanged and keep working.
+- The last active Management user can't be demoted or deactivated (USR-4 409 `last_management`, M20, B8.2/B8.3).
 - No response includes `password` or `passwordHash`; failed queries are logged without their parameters.
 - Operators can still reset a Management password with `scripts/reset-admin-password.ts` (docs/operator-commands.md).
 
