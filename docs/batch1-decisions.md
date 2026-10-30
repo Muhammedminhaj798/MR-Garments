@@ -9,6 +9,15 @@ Later approved additions: the ME-1 `landing` field and the endpoint formats in `
 (each agent's assignment). The text below is the approved decision sheet, unchanged apart from this header. Where it
 says "Proposed" or "proposed", read "approved". File and line references point to the frontend at `ca94b78`.
 
+**Superseded by the password policy of 2026-10-29** (product owner; see `docs/contracts.md`, "Password policy"):
+Management types each new user's initial password on Add user and can set a new password for another user on Edit
+user; nobody changes or resets their own password in the application, and no links or emails exist. This replaces
+B1.0 option (b) with option (c), retires B1.4-B1.9, B1.11 and B1.12, C5 R1 (now R2 plus "set a new password"), B9.11
+and B9.12, the link part of B9.16, screen S5 (Change password), the Set password page, AUTH-4 and AUTH-5 (both now
+403 `password_change_disabled`), and acceptance tests AT-P1 to AT-P3 and AT-U8 to AT-U10. Still in force: B1.1-B1.3
+(seed passwords), B1.10 and B9.9 (argon2id), B9.10 (rules, checked on USR-3 and USR-4), 5.9 (i) (no Forgot password),
+and the operator reset command (option (d)).
+
 ---
 
 ## Part 1. Batch 1 scope and endpoints

@@ -27,7 +27,7 @@ export function apiRoutes(ctx: RouteContext) {
   const router = Router();
   router.use(coreRoutes(ctx));
   router.use(loginRoutes(ctx));
-  router.use(passwordRoutes(ctx));
+  router.use(passwordRoutes());
   router.use(usersRoutes(ctx));
   router.use(profileRoutes(ctx));
   router.use(suppliersRoutes(ctx));

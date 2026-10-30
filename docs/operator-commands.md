@@ -43,8 +43,8 @@ In one transaction, for the one account named by `--email` (trimmed and lower ca
 exists, is a Management account and is active:
 
 - its password hash, `password_changed_at` and `updated_at`;
-- its unused password links are cancelled, and every session it has is signed out, as when a password is set from a
-  link (B1.6).
+- any unused password links left from before the password policy are cancelled, and every session it has is signed
+  out, as when Management sets a new password on Edit user.
 
 Nothing else changes: no other user, no role, status, name, email or other field, and no new account. If the account
 changes while you type (for example it is deactivated), nothing is written.
@@ -53,4 +53,5 @@ changes while you type (for example it is deactivated), nothing is written.
 
 **Production password recovery is not available yet.** This command must be separately approved and then run safely,
 by an authorized operator, against an explicitly verified production target before it can be relied on. Until then a
-lost Management password in production can only be recovered with direct database access.
+lost Management password in production can be set by another active Management user on Edit user; with no other
+Management user it can only be recovered with direct database access.
