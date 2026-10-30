@@ -1,7 +1,7 @@
 import { and, eq, ne } from "drizzle-orm";
 
 import type { Database } from "../../db/client";
-import { NOTIFICATION_KINDS, type NotificationKind, notifications, type Role, users, userStageGrants } from "../../db/schema";
+import { type Currency, NOTIFICATION_KINDS, type NotificationKind, notifications, type Role, users, userStageGrants } from "../../db/schema";
 import { atLeast, type Capability, effectiveAccess } from "../../permissions/matrix";
 
 // Owner: Agent 2 (notifications). Business routes call notify() inside their own transaction, so a rolled-back write
@@ -60,9 +60,10 @@ export async function notify(tx: Pick<Database, "select" | "insert">, event: Not
 
 const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
 
-/** ¥1,41,000 or ¥2,345.60: Indian digit grouping, as the frontend shows money. */
-export const cny = (amount: number) =>
-  `¥${amount.toLocaleString("en-IN", { minimumFractionDigits: Number.isInteger(amount) ? 0 : 2, maximumFractionDigits: 2 })}`;
+const SYMBOL: Record<Currency, string> = { CNY: "¥", USD: "$", INR: "₹" };
+/** ¥1,41,000, $2,345.60 or ₹0.50: the order currency's symbol and Indian digit grouping, as the frontend shows money. */
+export const money = (amount: number, currency: Currency) =>
+  `${SYMBOL[currency]}${amount.toLocaleString("en-IN", { minimumFractionDigits: Number.isInteger(amount) ? 0 : 2, maximumFractionDigits: 2 })}`;
 /** 1,800 pcs */
 export const qty = (value: number, unit: string) => `${value.toLocaleString("en-IN")} ${unit}`;
 /** 30 Sep 2026, from YYYY-MM-DD (the frontend's formatDate). */

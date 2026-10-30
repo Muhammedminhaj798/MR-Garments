@@ -223,6 +223,7 @@ describe("REC-2 GET /receipts/options", () => {
       orderId: open.id,
       po: open.po,
       supplier: "Guangzhou Textile Co.",
+      currency: "CNY", // not money: China staff get it too
       orderValueCny: 2750,
       depositsPaidCny: 300,
       lines: [{ orderLineId: fabric, item: "Cotton fabric", unit: "m", ordered: 500, receivedEarlier: 120, unitPriceCny: 3 }],

@@ -168,6 +168,7 @@ export function orderDetailRoutes({ db }: RouteContext) {
       deliveryDate: row.deliveryDate,
       stage: row.stage,
       supplier: { id: row.supplierId, name: row.supplierName, ...supplier[0]! },
+      currency: row.currency,
       item: row.item,
       quantity: row.quantity,
       unit: unit(row.countedIn),

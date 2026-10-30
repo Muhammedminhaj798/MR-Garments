@@ -7,10 +7,12 @@ import { orders, PAYEE_ROLES, PAYMENT_KINDS, payments, shippingAgents, suppliers
 import { validationFailed } from "../../http/errors";
 import { parse } from "../../http/validate";
 import type { RouteContext } from "../context";
-import { cny, notify } from "../notifications/notify";
+import { money, notify } from "../notifications/notify";
+import { rateProblem } from "../orders/orders.routes";
 
 // Owner: BE-payments. PAY-2 POST /payments (docs/live-screens-contracts.md, "Five-tab completion"). Payments are
-// records only: nothing here moves money.
+// records only: nothing here moves money. The amount is in the order's currency; `rateInr` is INR per 1 of it (none, stored
+// as 1, for an INR order).
 
 export const MESSAGES = {
   order: "Choose an order from the list.",
@@ -38,20 +40,22 @@ const newPayment = z.strictObject({
   agentId: z.uuid({ error: M.agent }).nullable().default(null),
   amountCny: z.number({ error: M.amount }).min(0.01, M.amount).max(999_999_999_999, M.amount),
   paidOn: z.iso.date({ error: M.paidOn }).refine((day) => day <= todayInIndia(), M.paidOnFuture),
-  rateInr: z.number({ error: M.rateInr }).min(0.0001, M.rateInr).max(99_999_999, M.rateInr),
+  rateInr: z.number({ error: M.rateInr }).min(0.0001, M.rateInr).max(99_999_999, M.rateInr).optional(),
   mode: z.string({ error: M.mode }).trim().min(1, M.mode).max(100, M.modeTooLong),
 });
 type NewPayment = z.infer<typeof newPayment>;
 
-/** The payee's name (the order's supplier, or the active agent) and the PO, or 422 with every problem found (E1). */
+/** The payee's name (the order's supplier, or the active agent), the PO and its currency, or 422 with every problem found (E1). */
 async function payeeName(db: RouteContext["db"], input: NewPayment) {
   const problems: Record<string, string> = {};
   const order = await db
-    .select({ supplier: suppliers.name, po: orders.poNumber })
+    .select({ supplier: suppliers.name, po: orders.poNumber, currency: orders.currency })
     .from(orders)
     .innerJoin(suppliers, eq(suppliers.id, orders.supplierId))
     .where(eq(orders.id, input.orderId));
   if (order.length === 0) problems.orderId = M.order;
+  const rate = order[0] && rateProblem(order[0].currency, input.rateInr, M.rateInr);
+  if (rate) problems.rateInr = rate;
 
   let agent: string | undefined;
   if (input.payeeRole === "supplier") {
@@ -68,7 +72,7 @@ async function payeeName(db: RouteContext["db"], input: NewPayment) {
   }
 
   if (Object.keys(problems).length > 0) throw validationFailed(problems);
-  return { payee: input.payeeRole === "supplier" ? order[0]!.supplier : agent!, po: order[0]!.po };
+  return { payee: input.payeeRole === "supplier" ? order[0]!.supplier : agent!, po: order[0]!.po, currency: order[0]!.currency };
 }
 
 export function paymentsRoutes({ db }: RouteContext) {
@@ -77,7 +81,7 @@ export function paymentsRoutes({ db }: RouteContext) {
   // PAY-2. A payment already made: saved as paid, at any stage. No overpayment check (the balance may go below 0).
   router.post("/payments", requirePermission("payments", "Enter"), async (req, res) => {
     const input = parse(newPayment, req.body);
-    const { payee, po } = await payeeName(db, input);
+    const { payee, po, currency } = await payeeName(db, input);
     const payment = await db.transaction(async (tx) => {
       const created = (
         await tx
@@ -90,7 +94,7 @@ export function paymentsRoutes({ db }: RouteContext) {
             amountCny: input.amountCny,
             status: "paid",
             paidOn: input.paidOn,
-            rateInr: input.rateInr,
+            rateInr: input.rateInr ?? 1,
             mode: input.mode,
             createdBy: req.user!.id,
           })
@@ -101,7 +105,7 @@ export function paymentsRoutes({ db }: RouteContext) {
         actorId: req.user!.id,
         sourceId: created.id,
         title: `${po} payment recorded`,
-        details: [`${input.kind} ${cny(input.amountCny)}`, payee],
+        details: [`${input.kind} ${money(input.amountCny, currency)}`, payee],
         href: (canView) => (canView("ordersView") ? `/orders/${po}/payments` : "/payments"),
       });
       return created;
