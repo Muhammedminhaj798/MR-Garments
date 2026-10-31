@@ -66,6 +66,17 @@ invite, reset or password links and no emails.
 - A user with no password hash (added before this policy; their invite link was only printed in development) can't
   sign in (AUTH-1 401) until Management sets a password on Edit user. Existing hashes are unchanged and keep working.
 - The last active Management user can't be demoted or deactivated (USR-4 409 `last_management`, M20, B8.2/B8.3).
+- **USR-4** also refuses setting the caller's **own** status to Inactive: 409 `own_account`, `fields.status` = "You
+  can't deactivate your own account." (D3, sprint 2026-10-31, proposed wording). Checked after the body, before the
+  user is looked up; nothing is saved.
+- **USR-5 `DELETE /users/{id}`** (D3, sprint 2026-10-31, proposed wording), `requirePermission("admin", "Full")`:
+  removes an account only when it is unused. 204 when removed (grants, password links and the user's own
+  notifications go by their cascades; nothing else is deleted); 404 `not_found` for an unknown or malformed id; 409
+  `own_account` "You can't remove your own account."; 409 `last_management` (M20) for the last active Management user;
+  409 `in_use` "{Name} has {signed in and recorded 1 order and 3 receipts}, so they can't be removed. Deactivate them
+  instead." when `last_sign_in_at` is set or any author column names the user. Those columns have no foreign key and
+  are listed in `REFERENCES` (`src/modules/users/users.routes.ts`); a test fails if a `*_by` uuid column is missing
+  from it. The user row is locked (`for update`) before the checks.
 - No response includes `password` or `passwordHash`; failed queries are logged without their parameters.
 - Operators can still reset a Management password with `scripts/reset-admin-password.ts` (docs/operator-commands.md).
 
@@ -94,6 +105,33 @@ Optional filters on MD-1 and these lists: `status` is `Active` or `Inactive` (om
 one of the tab's searchable columns contains it, ignoring case and spaces, as the frontend's `filterRecords` does.
 Searchable columns: name, contact person and phone (suppliers, agents, transport companies); name, address and staff
 (locations); name (teams); name and orders (items). Unknown query keys or another `status` value give 400.
+
+## Orders: edit and delete (sprint 2026-10-31, not released)
+
+ORD-1 to ORD-4 are in `docs/live-screens-contracts.md`. Both routes are in `src/modules/orders/order-detail.routes.ts`;
+`:po` that isn't `PO-<digits>`, or an unknown PO, is 404 `not_found` "Order not found.".
+
+| Id | Method and path | Permission | Owner |
+| --- | --- | --- | --- |
+| ORD-5 | `PATCH /orders/:po` | ordersEdit >= Enter (Management, Procurement) | BE-orders |
+| ORD-6 | `DELETE /orders/:po` | admin = Full (Management) | BE-orders |
+
+- **ORD-5** body (strict, at least one key; empty or unknown keys 400): `orderDate?`, `deliveryDate?`,
+  `lines? {id?, itemId, quantity, rateCny}[]` (1-50, ORD-3 limits and messages). `lines` replaces the list in array
+  order: a line with `id` updates that line, one without is added, a saved line not sent is removed; `position` is
+  the array index. 200 `{ order: { id, po, stage, orderDate, deliveryDate } }`. Stage 6: 409 `order_locked` "This
+  order has reached the warehouse, so it can't be changed."; stages 2-5 with `orderDate` or `lines`: 409
+  `order_locked` "Goods have been received for this order, so only the delivery date can change.". 422 on
+  `deliveryDate` for BR-09 (saved values for keys not sent); on `lines` for an inactive or unknown item (a line keeping
+  its saved item is not re-checked), an `id` that isn't one of this order's lines (or repeated) ("A line on this order
+  changed. Reload the order and try again."), or a total (sum of quantity x rateCny) below the paid payments ("The
+  order total can't be less than the ¥1,23,456.78 already paid.", 2 decimals, Indian grouping). One transaction with
+  the order row locked `for update`.
+- **ORD-6** 204 when deleted with its own lines. 409 `in_use` "This order has {2 payments, 1 receipt and 1
+  container}, so it can't be deleted." when it has payments (any status), receipts (its own, or any holding one of
+  its lines), containers or warehouse receipts holding one of its lines. The order row and its lines are locked
+  `for update` before counting; a foreign-key violation (23503) gives the same 409 ("other records"). Notifications
+  are left as they are.
 
 ## Authentication and permissions (coordinator-owned)
 

@@ -1,11 +1,12 @@
 import { randomUUID } from "node:crypto";
-import { eq, sql } from "drizzle-orm";
+import { eq, getTableName, sql } from "drizzle-orm";
 import { afterAll, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { verifyPassword } from "../../auth/passwords";
-import { locations, passwordTokens, users } from "../../db/schema";
+import { locations, notifications, orders, passwordTokens, receipts, users, userStageGrants } from "../../db/schema";
 import { api, createTestContext, resetData, SEEDED, signInAs, TEST_PASSWORD } from "../../test/harness";
-import { MESSAGES, passwordMessage, stageProblem } from "./users.routes";
+import { makeOrder, receive } from "../stock/fixtures";
+import { MESSAGES, passwordMessage, REFERENCES, stageProblem } from "./users.routes";
 
 const ctx = createTestContext();
 const http = api(ctx);
@@ -19,6 +20,9 @@ const idOf = async (email: string) => (await ctx.db.select({ id: users.id }).fro
 const management = () => signInAs(ctx, SEEDED.management);
 const sessionsOf = async (userId: string) =>
   (await ctx.pool.query(`select count(*)::int as n from session where sess->>'userId' = $1`, [userId])).rows[0].n as number;
+const waitingOnLocks = async () =>
+  (await ctx.pool.query(`select count(*)::int as n from pg_stat_activity where datname = current_database() and wait_event_type = 'Lock'`)).rows[0]
+    .n as number;
 
 const INITIAL_PASSWORD = "Welcome2026x";
 const newUser = { name: "Test User", email: "test@mrgarments.com", role: "China staff", stages: [2], password: INITIAL_PASSWORD };
@@ -353,6 +357,23 @@ describe("USR-4 PATCH /users/:id", () => {
     const current = (await http.get(`/users/${li}`).set("Cookie", cookie)).body.user;
     expect((await http.patch(`/users/${li}`, { officeId: current.officeId, phone: "1" }).set("Cookie", cookie)).status).toBe(200);
   });
+
+  it("refuses deactivating your own account with 409 own_account under Status and saves nothing (D3)", async () => {
+    await ctx.db.update(users).set({ role: "Management" }).where(eq(users.email, SEEDED.procurement)); // not the last one
+    const cookie = await management();
+    const suresh = await idOf(SEEDED.management);
+    for (const id of [suresh, suresh.toUpperCase()]) {
+      const res = await http.patch(`/users/${id}`, { phone: "1", status: "Inactive" }).set("Cookie", cookie);
+      expect(res.status, id).toBe(409);
+      expect(res.body.error).toEqual({
+        code: "own_account",
+        message: "You can't deactivate your own account.",
+        fields: { status: "You can't deactivate your own account." },
+      });
+    }
+    expect(await userRow(SEEDED.management)).toMatchObject({ status: "Active", phone: "" });
+    expect((await http.get("/me").set("Cookie", cookie)).status).toBe(200);
+  });
 });
 
 describe("USR-4 setting another user's password (password policy)", () => {
@@ -487,18 +508,20 @@ describe("B8 role changes, the last Management user and sessions", () => {
     expect(ok.body.user).toMatchObject({ role: "Accounts", stages: [] });
   });
 
-  it("the only Management user can't leave Management or go inactive (B8 row 3, AT-U6, M20)", async () => {
+  it("the only Management user can't leave Management (B8 row 3, AT-U6, M20); going inactive is own_account (D3)", async () => {
     const cookie = await management();
     const suresh = await idOf(SEEDED.management);
     const role = await http.patch(`/users/${suresh}`, { role: "Procurement" }).set("Cookie", cookie);
     expect(role.status).toBe(409);
     expect(role.body.error).toMatchObject({ code: "last_management", fields: { role: "At least one active Management user is required." } });
     expect(role.body.error.fields.status).toBeUndefined();
-    const status = await http.patch(`/users/${suresh}`, { status: "Inactive" }).set("Cookie", cookie);
-    expect(status.status).toBe(409);
-    expect(status.body.error.fields).toEqual({ status: MESSAGES.lastManagement });
-    const both = await http.patch(`/users/${suresh}`, { role: "Accounts", status: "Inactive" }).set("Cookie", cookie);
-    expect(both.body.error.fields).toEqual({ role: MESSAGES.lastManagement, status: MESSAGES.lastManagement });
+    // The caller is always an active Management user, so deactivating oneself is refused first; the status side of
+    // last_management is only reachable by a race (AT-R6 below).
+    for (const body of [{ status: "Inactive" }, { role: "Accounts", status: "Inactive" }]) {
+      const res = await http.patch(`/users/${suresh}`, body).set("Cookie", cookie);
+      expect(res.status).toBe(409);
+      expect(res.body.error).toEqual({ code: "own_account", message: MESSAGES.ownDeactivate, fields: { status: MESSAGES.ownDeactivate } });
+    }
     expect((await http.get(`/users/${suresh}`).set("Cookie", cookie)).body.user).toMatchObject({ role: "Management", status: "Active" });
     // Saving the only Management user without demoting him is fine.
     expect((await http.patch(`/users/${suresh}`, { role: "Management", status: "Active", phone: "1" }).set("Cookie", cookie)).status).toBe(200);
@@ -522,20 +545,21 @@ describe("B8 role changes, the last Management user and sessions", () => {
   });
 
   it("two simultaneous demotions of the last two Management users: exactly one succeeds (AT-R6)", async () => {
-    const cookie = await management();
     const suresh = await idOf(SEEDED.management);
     const priya = await idOf(SEEDED.procurement);
-    const waitingOnLocks = async () =>
-      (await ctx.pool.query(`select count(*)::int as n from pg_stat_activity where datname = current_database() and wait_event_type = 'Lock'`)).rows[0]
-        .n as number;
     for (const change of [{ role: "Procurement" }, { status: "Inactive" }]) {
       await ctx.db.update(users).set({ role: "Management", status: "Active" }).where(eq(users.id, priya));
       await ctx.db.update(users).set({ role: "Management", status: "Active" }).where(eq(users.id, suresh));
+      // Each demotes the other: nobody may deactivate themselves (D3).
+      const [sureshCookie, priyaCookie] = [await management(), await signInAs(ctx, SEEDED.procurement)];
       // Hold the Management rows until both requests are past sign-in and waiting on them, so they really overlap.
       const holder = await ctx.pool.connect();
       await holder.query("begin");
       await holder.query(`select id from users where role = 'Management' and status = 'Active' for update`);
-      const pending = Promise.all([http.patch(`/users/${suresh}`, change).set("Cookie", cookie), http.patch(`/users/${priya}`, change).set("Cookie", cookie)]);
+      const pending = Promise.all([
+        http.patch(`/users/${suresh}`, change).set("Cookie", priyaCookie),
+        http.patch(`/users/${priya}`, change).set("Cookie", sureshCookie),
+      ]);
       for (let tries = 0; (await waitingOnLocks()) < 2 && tries < 250; tries++) await new Promise((resolve) => setTimeout(resolve, 20));
       expect(await waitingOnLocks()).toBe(2);
       await holder.query("commit");
@@ -570,6 +594,125 @@ describe("B8 role changes, the last Management user and sessions", () => {
     const res = await http.patch(`/users/${li}`, { status: "Active" }).set("Cookie", cookie);
     expect(res.status).toBe(200);
     expect((await http.get("/me").set("Cookie", await signInAs(ctx, LI_WEI))).status).toBe(200);
+  });
+});
+
+describe("USR-5 DELETE /users/:id (D3)", () => {
+  const MEN_SHORTS = "Men's shorts";
+
+  it("Management removes a user nobody has used: 204, gone with their grants and notifications", async () => {
+    const cookie = await management();
+    const id = (await http.post("/users", newUser).set("Cookie", cookie)).body.user.id as string;
+    await ctx.db.insert(notifications).values({ userId: id, kind: "payment-recorded", title: "Paid", details: [], dedupeKey: "payment-recorded:x" });
+    const res = await http.delete(`/users/${id}`).set("Cookie", cookie);
+    expect(res.status).toBe(204);
+    expect(res.text).toBe("");
+    const list = await http.get("/users").set("Cookie", cookie);
+    expect(list.body.data.map((row: { id: string }) => row.id)).not.toContain(id);
+    expect(list.body.counts).toEqual({ active: 8, inactive: 0 });
+    expect((await http.get(`/users/${id}`).set("Cookie", cookie)).status).toBe(404);
+    expect(await ctx.db.select().from(userStageGrants).where(eq(userStageGrants.userId, id))).toHaveLength(0);
+    expect(await ctx.db.select().from(notifications).where(eq(notifications.userId, id))).toHaveLength(0);
+  });
+
+  it("is Management only: 403 for every other role, 401 signed out, and nobody is removed", async () => {
+    const li = await idOf(LI_WEI);
+    expect((await http.delete(`/users/${li}`)).status).toBe(401);
+    for (const email of NON_MANAGEMENT) {
+      expect((await http.delete(`/users/${li}`).set("Cookie", await signInAs(ctx, email))).status, email).toBe(403);
+    }
+    expect(await userRow(LI_WEI)).toBeDefined();
+  });
+
+  it("is 404 for an unknown or malformed id", async () => {
+    const cookie = await management();
+    for (const id of [randomUUID(), "not-an-id"]) {
+      const res = await http.delete(`/users/${id}`).set("Cookie", cookie);
+      expect(res.status, id).toBe(404);
+      expect(res.body.error.code).toBe("not_found");
+    }
+  });
+
+  it("refuses your own account with 409 own_account, however the id is written", async () => {
+    const cookie = await management();
+    const suresh = await idOf(SEEDED.management);
+    for (const id of [suresh, suresh.toUpperCase()]) {
+      const res = await http.delete(`/users/${id}`).set("Cookie", cookie);
+      expect(res.status, id).toBe(409);
+      expect(res.body.error).toEqual({ code: "own_account", message: "You can't remove your own account." });
+    }
+    expect((await http.get("/me").set("Cookie", cookie)).status).toBe(200);
+  });
+
+  it("refuses a user who has signed in with 409 in_use and keeps them", async () => {
+    await ctx.db.update(users).set({ lastSignInAt: new Date() }).where(eq(users.email, LI_WEI));
+    const res = await http.delete(`/users/${await idOf(LI_WEI)}`).set("Cookie", await management());
+    expect(res.status).toBe(409);
+    expect(res.body.error).toEqual({ code: "in_use", message: "Li Wei has signed in, so they can't be removed. Deactivate them instead." });
+    expect(await userRow(LI_WEI)).toMatchObject({ name: "Li Wei", status: "Active" });
+  });
+
+  it("refuses a user named on other records, counts each record, and leaves those records untouched", async () => {
+    const cookie = await management();
+    const wang = await idOf(SEEDED.chinaStaffTwoStages);
+    const order = await makeOrder(ctx, { lines: [{ item: MEN_SHORTS, quantity: 10, rateCny: 1 }] });
+    for (const quantity of [4, 6]) await receive(ctx, order.id, [{ orderLineId: order.lineIds[0]!, quantity }]); // received_by Wang
+    const removeWang = () => http.delete(`/users/${wang}`).set("Cookie", cookie);
+    const receiptsOnly = await removeWang();
+    expect(receiptsOnly.status).toBe(409);
+    expect(receiptsOnly.body.error).toEqual({
+      code: "in_use",
+      message: "Wang Fang has recorded 2 receipts, so they can't be removed. Deactivate them instead.",
+    });
+    await ctx.db.update(orders).set({ createdBy: wang }).where(eq(orders.id, order.id));
+    await ctx.db.update(users).set({ lastSignInAt: new Date() }).where(eq(users.id, wang));
+    expect((await removeWang()).body.error.message).toBe(
+      "Wang Fang has signed in and recorded 1 order and 2 receipts, so they can't be removed. Deactivate them instead.",
+    );
+    expect(await ctx.db.select().from(receipts).where(eq(receipts.receivedBy, wang))).toHaveLength(2);
+    expect((await ctx.db.select().from(orders).where(eq(orders.id, order.id)))[0]!.createdBy).toBe(wang);
+    expect(await userRow(SEEDED.chinaStaffTwoStages)).toBeDefined();
+  });
+
+  it("counts a user someone added once (created_by and updated_by), and not their own row", async () => {
+    await ctx.db.update(users).set({ role: "Management" }).where(eq(users.email, SEEDED.procurement));
+    const suresh = await idOf(SEEDED.management);
+    await http.post("/users", newUser).set("Cookie", await management());
+    await ctx.db.update(users).set({ updatedBy: suresh }).where(eq(users.id, suresh)); // as when he saves his profile
+    const res = await http.delete(`/users/${suresh}`).set("Cookie", await signInAs(ctx, SEEDED.procurement));
+    expect(res.status).toBe(409);
+    expect(res.body.error.message).toBe("Suresh Menon has recorded 1 user, so they can't be removed. Deactivate them instead.");
+  });
+
+  it("checks every *_by uuid column in the database (none has a foreign key)", async () => {
+    const found = await ctx.db.execute(
+      sql`select table_name || '.' || column_name as name from information_schema.columns where table_schema = 'public' and data_type = 'uuid' and column_name like '%\\_by'`,
+    );
+    const listed = REFERENCES.flatMap((use) => use.columns.map((column) => `${getTableName(use.table)}.${column.name}`));
+    expect(listed.sort()).toEqual(found.rows.map((row) => String(row.name)).sort());
+  });
+
+  it("refuses the last active Management user when the caller lost Management meanwhile (B8.2)", async () => {
+    await ctx.db.update(users).set({ role: "Management" }).where(eq(users.email, SEEDED.procurement));
+    const suresh = await idOf(SEEDED.management);
+    const priyaCookie = await signInAs(ctx, SEEDED.procurement);
+    // Priya removes Suresh; before her request takes his row, someone else deactivates her.
+    const holder = await ctx.pool.connect();
+    await holder.query("begin");
+    await holder.query("select id from users where id = $1 for update", [suresh]);
+    const pending = http
+      .delete(`/users/${suresh}`)
+      .set("Cookie", priyaCookie)
+      .then((res) => res); // sends it now (supertest waits for then)
+    for (let tries = 0; (await waitingOnLocks()) < 1 && tries < 250; tries++) await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(await waitingOnLocks()).toBe(1);
+    await holder.query("update users set status = 'Inactive' where email = $1", [SEEDED.procurement]);
+    await holder.query("commit");
+    holder.release();
+    const res = await pending;
+    expect(res.status).toBe(409);
+    expect(res.body.error).toEqual({ code: "last_management", message: MESSAGES.lastManagement });
+    expect(await userRow(SEEDED.management)).toMatchObject({ role: "Management", status: "Active" });
   });
 });
 
