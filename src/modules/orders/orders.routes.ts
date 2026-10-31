@@ -33,11 +33,13 @@ export const MESSAGES = {
 const M = MESSAGES;
 
 // Upper bounds keep values inside the numeric/integer columns, so an absurd number is a 422, not a 500.
-const line = z.strictObject({
+export const line = z.strictObject({
   itemId: z.uuid({ error: M.item }),
   quantity: z.number({ error: M.quantity }).int(M.quantity).min(1, M.quantity).max(2_147_483_647, M.quantity),
   rateCny: z.number({ error: M.rate }).min(0, M.rate).max(99_999_999, M.rate),
 });
+/** 1-50 lines, shared by ORD-3 create and ORD-5 edit. */
+export const lineList = <T extends z.ZodType>(entry: T) => z.array(entry, { error: M.lines }).min(1, M.lines).max(50, M.tooManyLines);
 const deposit = z.strictObject({
   payee: z.string({ error: M.payee }).trim().min(1, M.payee),
   payeeRole: z.enum(PAYEE_ROLES, { error: M.payee }),
@@ -50,7 +52,7 @@ const newOrder = z.strictObject({
   supplierId: z.uuid({ error: M.supplier }),
   orderDate: z.iso.date({ error: M.orderDate }),
   deliveryDate: z.iso.date({ error: M.deliveryDate }),
-  lines: z.array(line, { error: M.lines }).min(1, M.lines).max(50, M.tooManyLines),
+  lines: lineList(line),
   deposits: z.array(deposit).max(10, M.tooManyDeposits).default([]),
 });
 type NewOrder = z.infer<typeof newOrder>;

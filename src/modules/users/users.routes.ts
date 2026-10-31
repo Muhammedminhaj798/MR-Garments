@@ -1,4 +1,5 @@
-import { and, asc, eq, ne } from "drizzle-orm";
+import { and, asc, count, eq, ne, or } from "drizzle-orm";
+import type { PgColumn, PgTable } from "drizzle-orm/pg-core";
 import { Router } from "express";
 import { z } from "zod";
 
@@ -6,13 +7,29 @@ import { requirePermission } from "../../auth/current-user";
 import { hashPassword, passwordProblems } from "../../auth/passwords";
 import { signOutEverywhere } from "../../auth/session";
 import type { Database } from "../../db/client";
-import { locations, ROLES, type Role, STATUSES, users, userStageGrants } from "../../db/schema";
+import {
+  clearings,
+  containers,
+  locations,
+  orders,
+  payments,
+  receipts,
+  ROLES,
+  type Role,
+  STATUSES,
+  suppliers,
+  transports,
+  users,
+  userStageGrants,
+  warehouseReceipts,
+} from "../../db/schema";
 import { conflict, GENERIC_MESSAGE, HttpError, notFound, validationFailed } from "../../http/errors";
 import { parse } from "../../http/validate";
 import { grantableStages, isStaffRole, STAGE_LABEL } from "../../permissions/matrix";
 import type { RouteContext } from "../context";
 
-// Owner: A2 (users). USR-1 GET /users, USR-2 GET /users/:id, USR-3 POST /users, USR-4 PATCH /users/:id.
+// Owner: A2 (users). USR-1 GET /users, USR-2 GET /users/:id, USR-3 POST /users, USR-4 PATCH /users/:id,
+// USR-5 DELETE /users/:id.
 // All Management only, guarded per route: this router sits at /api/v1, so router.use() would guard every module.
 // Password policy (2026-10-29, supersedes B1 (b), B1.4-B1.9, B1.11, B1.12 and C5 R1): Management types the initial
 // password on Add user and may set a new one for another user on Edit user. No links or emails are sent.
@@ -31,7 +48,30 @@ export const MESSAGES = {
   stageOutsideRole: (role: Role, stage: string) => `${role} can't enter data for ${stage}. Untick it first.`, // M18
   stagesNotUsed: (role: Role) => `${role} doesn't use stage access. Untick all stages first.`, // M19
   lastManagement: "At least one active Management user is required.", // M20
+  ownDeactivate: "You can't deactivate your own account.", // proposed (D3)
+  ownRemove: "You can't remove your own account.", // proposed (D3)
+  inUse: (name: string, what: string) => `${name} has ${what}, so they can't be removed. Deactivate them instead.`, // proposed (D3)
 };
+
+/**
+ * USR-5: every column that holds a user's id as the author or receiver of a record, with the record's name (singular;
+ * the plural adds "s"). None has a foreign key, so this list alone keeps a removed user from leaving dangling ids: add
+ * any new `*_by` uuid column here (a test compares it with the database). transports.loaded_by/received_by and
+ * warehouse_receipts.received_by are typed names, not ids.
+ */
+export const REFERENCES: { what: string; table: PgTable; columns: PgColumn[] }[] = [
+  { what: "user", table: users, columns: [users.createdBy, users.updatedBy] },
+  { what: "supplier", table: suppliers, columns: [suppliers.createdBy] },
+  { what: "order", table: orders, columns: [orders.createdBy] },
+  { what: "payment", table: payments, columns: [payments.createdBy] },
+  { what: "receipt", table: receipts, columns: [receipts.receivedBy] },
+  { what: "container", table: containers, columns: [containers.createdBy] },
+  { what: "clearing", table: clearings, columns: [clearings.createdBy, clearings.updatedBy] },
+  { what: "trip", table: transports, columns: [transports.createdBy, transports.updatedBy] },
+  { what: "warehouse receipt", table: warehouseReceipts, columns: [warehouseReceipts.createdBy, warehouseReceipts.updatedBy] },
+];
+
+const joined = (parts: string[]) => (parts.length > 1 ? `${parts.slice(0, -1).join(", ")} and ${parts.at(-1)}` : parts[0]!);
 
 /** The languages form 48 offers. */
 export const LANGUAGES = ["English"] as const;
@@ -241,6 +281,10 @@ export function usersRoutes({ db, pool }: RouteContext) {
       throw new HttpError(403, "password_change_disabled", MESSAGES.ownPassword);
     }
     const input = parseBody(updateSchema, req.body);
+    // D3: nobody deactivates themselves (the caller is always active, so this is never a no-op save).
+    if (input.status === "Inactive" && String(req.params.id).toLowerCase() === req.user!.id) {
+      throw conflict("own_account", MESSAGES.ownDeactivate, { status: MESSAGES.ownDeactivate });
+    }
     const current = await findUser(db, String(req.params.id));
     if (!current) throw notFound("User");
     const role = input.role ?? current.role;
@@ -284,6 +328,47 @@ export function usersRoutes({ db, pool }: RouteContext) {
     // B8.4: deactivating, or a new password, signs the user out at once; role and grant changes apply on their next request.
     if (password !== undefined || (current.status === "Active" && status === "Inactive")) await signOutEverywhere(pool, current.id);
     res.json({ user: await findUser(db, current.id) });
+  });
+
+  // USR-5 (D3). Only an account nobody uses is removed; one that is used gets 409 `in_use` and is deactivated instead.
+  // Grants, password links and the user's own notifications go with it (ON DELETE CASCADE); nothing else is deleted.
+  router.delete("/users/:id", admin, async (req, res) => {
+    const id = String(req.params.id).toLowerCase();
+    if (!isUuid(id)) throw notFound("User");
+    if (id === req.user!.id) throw conflict("own_account", MESSAGES.ownRemove);
+    await db.transaction(async (tx) => {
+      // Locked, so the user can't sign in (which sets last_sign_in_at) between the checks and the delete. Every
+      // reference column is written with the signed-in user's id, so a user who never signed in can't gain one meanwhile.
+      const user = (
+        await tx
+          .select({ name: users.name, role: users.role, status: users.status, lastSignInAt: users.lastSignInAt })
+          .from(users)
+          .where(eq(users.id, id))
+          .for("update")
+      )[0];
+      if (!user) throw notFound("User");
+      // B8.2, as on USR-4. The caller is another active Management user, so only a race reaches this.
+      if (user.role === "Management" && user.status === "Active") {
+        const managers = await tx
+          .select({ id: users.id })
+          .from(users)
+          .where(and(eq(users.role, "Management"), eq(users.status, "Active")))
+          .for("update");
+        if (!managers.some((manager) => manager.id !== id)) throw conflict("last_management", MESSAGES.lastManagement);
+      }
+      const recorded: string[] = [];
+      for (const use of REFERENCES) {
+        const of = or(...use.columns.map((column) => eq(column, id)));
+        // A user's own row may name them (they saved their own profile); deleting it leaves nothing behind.
+        const where = use.table === users ? and(of, ne(users.id, id)) : of;
+        const n = (await tx.select({ n: count() }).from(use.table).where(where))[0]!.n;
+        if (n > 0) recorded.push(`${n} ${use.what}${n === 1 ? "" : "s"}`);
+      }
+      const used = [...(user.lastSignInAt ? ["signed in"] : []), ...(recorded.length > 0 ? [`recorded ${joined(recorded)}`] : [])];
+      if (used.length > 0) throw conflict("in_use", MESSAGES.inUse(user.name, joined(used)));
+      await tx.delete(users).where(eq(users.id, id));
+    });
+    res.status(204).end();
   });
 
   return router;
