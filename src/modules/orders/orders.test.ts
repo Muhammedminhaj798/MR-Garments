@@ -93,6 +93,28 @@ describe("ORD-2 GET /orders/options", () => {
     expect(res.body.items).toContainEqual({ id: ids.fabric, name: "Cotton fabric", unit: "m" });
     expect(res.body.agents).toEqual([{ id: expect.any(String), name: "Sino Freight" }]);
   });
+
+  // Regression (2026-10-31, "deleted product still on the order page"): New order and Edit order offer only ORD-2's
+  // items, so a deleted or deactivated item must never be listed here, while the orders that already use it keep it.
+  it("leaves out deactivated and deleted items; an order that uses a deactivated item still shows it", async () => {
+    const order = (await create(orderBody({ deposits: [] }))).body.order as { id: string; po: string };
+    const spare = await http.post("/items", { name: "Spare buttons", countedIn: "Pieces", perBundle: 100 }).set("Cookie", management);
+    expect(spare.status).toBe(201);
+    expect((await http.patch(`/items/${ids.jeans}`, { status: "Inactive" }).set("Cookie", management)).status).toBe(200);
+    expect((await http.delete(`/items/${spare.body.item.id}`).set("Cookie", management)).status).toBe(204);
+    // An item on an order can't be deleted (BR-06), so its order lines are never removed.
+    expect((await http.delete(`/items/${ids.fabric}`).set("Cookie", management)).status).toBe(409);
+
+    const offered = (await get("/orders/options")).body.items.map((row: { id: string }) => row.id);
+    expect(offered).not.toContain(ids.jeans);
+    expect(offered).not.toContain(spare.body.item.id);
+    expect(offered).toContain(ids.fabric);
+
+    const detail = (await get(`/orders/${order.po}`)).body;
+    expect(detail.lines.map((line: { item: { name: string } }) => line.item.name)).toEqual(["Denim jeans", "Cotton fabric"]);
+    expect((await get("/orders")).body.find((row: { po: string }) => row.po === order.po).item).toBe("Denim jeans");
+    expect(await ctx.db.select().from(orderLines).where(eq(orderLines.orderId, order.id))).toHaveLength(2);
+  });
 });
 
 describe("ORD-3 POST /orders and ORD-1 GET /orders", () => {
