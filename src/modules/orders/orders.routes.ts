@@ -108,9 +108,9 @@ async function checkRules(db: Database, input: NewOrder) {
 }
 
 // The main line (position 0) gives the item, quantity and received figures the lists show.
-const main = alias(orderLines, "main_line");
+export const main = alias(orderLines, "main_line");
 const paid = sql`${payments.orderId} = ${orders.id} and ${payments.status} = 'paid'`;
-const orderColumns = {
+export const orderColumns = {
   id: orders.id,
   po: orders.poNumber,
   orderDate: orders.orderDate,
@@ -129,7 +129,7 @@ const orderColumns = {
   paidInr: sql<number>`(select coalesce(sum(round(${payments.amountCny} * ${payments.rateInr}, 2)), 0) from ${payments} where ${paid})`.mapWith(Number),
   nextDue: sql<string | null>`(select min(${payments.dueDate})::text from ${payments} where ${payments.orderId} = ${orders.id} and ${payments.status} = 'due')`,
 };
-const newestFirst = [desc(orders.orderDate), desc(poValue)];
+export const newestFirst = [desc(orders.orderDate), desc(poValue)];
 
 // ponytail: per-order subqueries over every order; add paging or a stage filter when orders reach the thousands.
 export function orderRows(db: Database, orderBy: SQL[], where?: SQL) {

@@ -230,7 +230,8 @@ split, and the goods payments (date, kind, CNY, rate, INR). Agent 6 records the 
 `GET /reports/<name>` (reports >= View), server-side aggregation over the persisted tables, optional filters
 `from`, `to` (dates) and `supplierId` where the report uses them (bad values 400). Names: `order-status`,
 `deliveries-per-day`, `ordered-vs-received`, `containers-timeline`, `payments-per-supplier`,
-`landed-cost-by-month`, plus `summary` for the hub's stat strips. Export: CSV built in the browser from the same
+`landed-cost-by-month`, plus `summary` for the hub's stat strips; and one supplier's detail,
+`GET /reports/payments-per-supplier/:supplierId` (RPT-5D, `docs/supplier-payment-detail-contract.md`). Export: CSV built in the browser from the same
 data (no new dependency); Excel/PDF only if feasible with what is installed, otherwise the existing D5 toast. The
 hub's "recent downloads" list has no table behind it: show the empty state, don't store downloads.
 
@@ -363,6 +364,11 @@ Query parameters are strict: an unknown or repeated key, a malformed date or id,
     {total, atStage1}, deliveries {dueNext7, late}, receiving {shortOrders, shortPcs, shortM}, containers {onTheWay,
     arrivingIn7Days}` (counts) `, payments {dueNext30Cny, dueNext30ByCurrency}, landedCost {finishedOrders,
     finishedTotalInr} }`.
+- **`GET /reports/payments-per-supplier/:supplierId?from=&to=&paymentFrom=&paymentTo=&stage=&paymentsPage=&ordersPage=&linesPage=`**
+  (reports >= View; RPT-5D, `src/modules/reports/supplier-detail.ts`): `SupplierPaymentDetail` exactly as recorded in
+  `docs/supplier-payment-detail-contract.md` (`supplier`, `filter {from, to}`, `summary` with `byCurrency`, and the
+  `payments`, `orders`, `lines` pages of 10). 13.5's money rules (supplier payments only); `from`/`to` scope everything,
+  `paymentFrom`/`paymentTo` and `stage` only their list. Malformed or unknown id 404 `not_found`; bad query 400.
 
 ## 9. Files and owners
 

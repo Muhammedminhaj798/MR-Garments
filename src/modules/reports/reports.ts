@@ -46,7 +46,7 @@ function byCurrency<T extends { currency: Currency }>(rows: T[], pick: (row: T) 
 const inCny = <T extends { currency: Currency }>(rows: T[]) => rows.filter((row) => row.currency === "CNY");
 
 /** Order-based reports keep the orders placed in the period (order date) with the supplier. */
-const orderFilter = (f: Filters) =>
+export const orderFilter = (f: Filters) =>
   and(f.from ? gte(orders.orderDate, f.from) : undefined, f.to ? lte(orders.orderDate, f.to) : undefined, f.supplierId ? eq(orders.supplierId, f.supplierId) : undefined);
 
 /** Orders at stage 6 with the day their last stocked warehouse receipt was received: the day they reached the warehouse. */
@@ -204,6 +204,23 @@ export async function containersTimeline(db: Database, f: Filters, today: string
   };
 }
 
+// The correlations on `orders.id` are nested `sql`: in a single-table select drizzle drops the table name of a field's
+// own columns, and a bare "id" inside the subquery would be the subquery's table's.
+/** Payments of the order in the row (`orders.id`) to its supplier: agent payments are sea freight (6.2), not its money. */
+export const toSupplier = sql`${payments.orderId} = ${orders.id} and ${payments.payeeRole} = 'supplier'`;
+const linesOfOrder = sql`${orderLines.orderId} = ${orders.id}`;
+/**
+ * 13.5's money per order, as correlated subqueries on `orders.id` (also the supplier detail's): order value rounded
+ * per order, paid supplier payments, and their INR at each payment's own rate.
+ */
+export const supplierMoney = {
+  orderValueCny: sql<number>`(select round(coalesce(sum(${orderLines.quantity} * ${orderLines.rateCny}), 0), 2) from ${orderLines}
+    where ${linesOfOrder})`.mapWith(Number),
+  paidCny: sql<number>`(select coalesce(sum(${payments.amountCny}), 0) from ${payments} where ${toSupplier} and ${payments.status} = 'paid')`.mapWith(Number),
+  paidInr: sql<number>`(select coalesce(sum(round(${payments.amountCny} * ${payments.rateInr}, 2)), 0) from ${payments}
+    where ${toSupplier} and ${payments.status} = 'paid')`.mapWith(Number),
+};
+
 /**
  * 13.5: open orders (stage below 6) per supplier. Paid counts payments to the supplier only (agent payments are sea
  * freight, section 6.2); INR at each payment's own rate. `dueNext30Cny`: due supplier payments, today to today + 30.
@@ -211,7 +228,6 @@ export async function containersTimeline(db: Database, f: Filters, today: string
  */
 export async function paymentsPerSupplier(db: Database, f: Filters, today: string) {
   const where = orderFilter(f);
-  const toSupplier = sql`${payments.orderId} = ${orders.id} and ${payments.payeeRole} = 'supplier'`;
   const newestFirst = [desc(orders.orderDate), desc(orders.poNumber)];
   const [open, finished] = await Promise.all([
     db
@@ -220,11 +236,7 @@ export async function paymentsPerSupplier(db: Database, f: Filters, today: strin
         supplier: suppliers.name,
         po: orders.poNumber,
         currency: orders.currency,
-        orderValueCny: sql<number>`(select round(coalesce(sum(${orderLines.quantity} * ${orderLines.rateCny}), 0), 2) from ${orderLines}
-          where ${orderLines.orderId} = ${orders.id})`.mapWith(Number),
-        paidCny: sql<number>`(select coalesce(sum(${payments.amountCny}), 0) from ${payments} where ${toSupplier} and ${payments.status} = 'paid')`.mapWith(Number),
-        paidInr: sql<number>`(select coalesce(sum(round(${payments.amountCny} * ${payments.rateInr}, 2)), 0) from ${payments}
-          where ${toSupplier} and ${payments.status} = 'paid')`.mapWith(Number),
+        ...supplierMoney,
         dueNext30Cny: sql<number>`(select coalesce(sum(${payments.amountCny}), 0) from ${payments}
           where ${toSupplier} and ${payments.status} = 'due' and ${payments.dueDate} between ${today} and ${addDays(today, 30)})`.mapWith(Number),
       })
