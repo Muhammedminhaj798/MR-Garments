@@ -23,6 +23,8 @@ export async function landedCostList(db: Database, { supplierId, teamId }: { sup
       orderId: orders.id,
       po: orders.poNumber,
       supplier: { id: suppliers.id, name: suppliers.name },
+      // The currency of `goodsPayments[].amountCny`; every other figure here is INR.
+      currency: orders.currency,
       item: items.name,
       countedIn: items.countedIn,
       quantity: main.quantity,

@@ -6,6 +6,7 @@ import { z } from "zod";
 import { requirePermission } from "../../auth/current-user";
 import {
   containerLines,
+  type Currency,
   containers,
   items,
   locations,
@@ -174,6 +175,8 @@ export function stockRoutes({ db }: RouteContext) {
         orderId: orders.id,
         po: orders.poNumber,
         supplier: suppliers.name,
+        // Not money: the currency of the (possibly withheld) amounts.
+        currency: orders.currency,
         orderValueCny: money
           ? sql<number>`(select coalesce(round(sum(${allLines.quantity} * ${allLines.rateCny}), 2), 0) from ${orderLines} ${allLines}
           where ${allLines.orderId} = ${orders.id})`.mapWith(Number)
@@ -195,7 +198,7 @@ export function stockRoutes({ db }: RouteContext) {
       .innerJoin(items, eq(items.id, orderLines.itemId))
       .where(and(inArray(orders.stage, [1, 2]), sql`${received} < ${orderLines.quantity}`))
       .orderBy(desc(orders.orderDate), desc(orders.createdAt), asc(orderLines.position));
-    const byOrder = new Map<string, { orderId: string; po: string; supplier: string; orderValueCny: number | null; depositsPaidCny: number | null; lines: object[] }>();
+    const byOrder = new Map<string, { orderId: string; po: string; supplier: string; currency: Currency; orderValueCny: number | null; depositsPaidCny: number | null; lines: object[] }>();
     for (const { orderLineId, item, countedIn, ordered, receivedEarlier, unitPriceCny, ...order } of rows) {
       if (!byOrder.has(order.orderId)) byOrder.set(order.orderId, { ...order, lines: [] });
       byOrder.get(order.orderId)!.lines.push({ orderLineId, item, unit: unit(countedIn), ordered, receivedEarlier, unitPriceCny });

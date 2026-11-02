@@ -5,6 +5,8 @@ import {
   clearings,
   containerLines,
   containers,
+  type Currency,
+  CURRENCIES,
   items,
   orderLines,
   orders,
@@ -30,8 +32,21 @@ export const addDays = (day: string, days: number) => new Date(Date.parse(`${day
 const daysBetween = (from: string, to: string) => (Date.parse(to) - Date.parse(from)) / 86_400_000;
 const sum = <T>(rows: T[], pick: (row: T) => number) => rows.reduce((total, row) => total + pick(row), 0);
 
+/**
+ * Totals of order-currency money, one per currency the rows have (CNY, USD, INR order): amounts in different
+ * currencies are never added together, and none is converted (no rate is known for them).
+ */
+function byCurrency<T extends { currency: Currency }>(rows: T[], pick: (row: T) => number) {
+  return CURRENCIES.filter((currency) => rows.some((row) => row.currency === currency)).map((currency) => ({
+    currency,
+    amount: round2(sum(rows.filter((row) => row.currency === currency), pick)),
+  }));
+}
+/** The rows in CNY: the older single-number totals (`...Cny`) stay CNY-only, so an older frontend never adds ¥ and $. */
+const inCny = <T extends { currency: Currency }>(rows: T[]) => rows.filter((row) => row.currency === "CNY");
+
 /** Order-based reports keep the orders placed in the period (order date) with the supplier. */
-const orderFilter = (f: Filters) =>
+export const orderFilter = (f: Filters) =>
   and(f.from ? gte(orders.orderDate, f.from) : undefined, f.to ? lte(orders.orderDate, f.to) : undefined, f.supplierId ? eq(orders.supplierId, f.supplierId) : undefined);
 
 /** Orders at stage 6 with the day their last stocked warehouse receipt was received: the day they reached the warehouse. */
@@ -122,6 +137,7 @@ export async function orderedVsReceived(db: Database, f: Filters) {
       orderId: orders.id,
       po: orders.poNumber,
       supplier: suppliers.name,
+      currency: orders.currency,
       item: items.name,
       countedIn: items.countedIn,
       ordered: orderLines.quantity,
@@ -144,7 +160,8 @@ export async function orderedVsReceived(db: Database, f: Filters) {
     lines,
     ordersChecked: checked.size,
     shortPos,
-    shortValueCny: round2(sum(lines, (line) => line.shortValueCny ?? 0)),
+    shortValueCny: round2(sum(inCny(lines), (line) => line.shortValueCny ?? 0)),
+    shortValueByCurrency: byCurrency(lines, (line) => line.shortValueCny ?? 0),
     fullOrders: checked.size - shortPos.length,
   };
 }
@@ -187,13 +204,30 @@ export async function containersTimeline(db: Database, f: Filters, today: string
   };
 }
 
+// The correlations on `orders.id` are nested `sql`: in a single-table select drizzle drops the table name of a field's
+// own columns, and a bare "id" inside the subquery would be the subquery's table's.
+/** Payments of the order in the row (`orders.id`) to its supplier: agent payments are sea freight (6.2), not its money. */
+export const toSupplier = sql`${payments.orderId} = ${orders.id} and ${payments.payeeRole} = 'supplier'`;
+const linesOfOrder = sql`${orderLines.orderId} = ${orders.id}`;
+/**
+ * 13.5's money per order, as correlated subqueries on `orders.id` (also the supplier detail's): order value rounded
+ * per order, paid supplier payments, and their INR at each payment's own rate.
+ */
+export const supplierMoney = {
+  orderValueCny: sql<number>`(select round(coalesce(sum(${orderLines.quantity} * ${orderLines.rateCny}), 0), 2) from ${orderLines}
+    where ${linesOfOrder})`.mapWith(Number),
+  paidCny: sql<number>`(select coalesce(sum(${payments.amountCny}), 0) from ${payments} where ${toSupplier} and ${payments.status} = 'paid')`.mapWith(Number),
+  paidInr: sql<number>`(select coalesce(sum(round(${payments.amountCny} * ${payments.rateInr}, 2)), 0) from ${payments}
+    where ${toSupplier} and ${payments.status} = 'paid')`.mapWith(Number),
+};
+
 /**
  * 13.5: open orders (stage below 6) per supplier. Paid counts payments to the supplier only (agent payments are sea
  * freight, section 6.2); INR at each payment's own rate. `dueNext30Cny`: due supplier payments, today to today + 30.
+ * One row per supplier and order currency; `totals` and `dueNext30Cny` are CNY only, `...ByCurrency` has every currency.
  */
 export async function paymentsPerSupplier(db: Database, f: Filters, today: string) {
   const where = orderFilter(f);
-  const toSupplier = sql`${payments.orderId} = ${orders.id} and ${payments.payeeRole} = 'supplier'`;
   const newestFirst = [desc(orders.orderDate), desc(orders.poNumber)];
   const [open, finished] = await Promise.all([
     db
@@ -201,11 +235,8 @@ export async function paymentsPerSupplier(db: Database, f: Filters, today: strin
         supplierId: suppliers.id,
         supplier: suppliers.name,
         po: orders.poNumber,
-        orderValueCny: sql<number>`(select round(coalesce(sum(${orderLines.quantity} * ${orderLines.rateCny}), 0), 2) from ${orderLines}
-          where ${orderLines.orderId} = ${orders.id})`.mapWith(Number),
-        paidCny: sql<number>`(select coalesce(sum(${payments.amountCny}), 0) from ${payments} where ${toSupplier} and ${payments.status} = 'paid')`.mapWith(Number),
-        paidInr: sql<number>`(select coalesce(sum(round(${payments.amountCny} * ${payments.rateInr}, 2)), 0) from ${payments}
-          where ${toSupplier} and ${payments.status} = 'paid')`.mapWith(Number),
+        currency: orders.currency,
+        ...supplierMoney,
         dueNext30Cny: sql<number>`(select coalesce(sum(${payments.amountCny}), 0) from ${payments}
           where ${toSupplier} and ${payments.status} = 'due' and ${payments.dueDate} between ${today} and ${addDays(today, 30)})`.mapWith(Number),
       })
@@ -220,19 +251,36 @@ export async function paymentsPerSupplier(db: Database, f: Filters, today: strin
       .orderBy(...newestFirst),
   ]);
   // ponytail: grouped in memory over the open orders; a GROUP BY over pre-aggregated payments when orders reach thousands.
-  const bySupplier = new Map<string, { supplierId: string; supplier: string; orders: string[]; orderValueCny: number; paidCny: number; paidInr: number }>();
+  type Row = { supplierId: string; supplier: string; currency: Currency; orders: string[]; orderValueCny: number; paidCny: number; paidInr: number };
+  const bySupplier = new Map<string, Row>();
   for (const order of open) {
-    const row = bySupplier.get(order.supplierId) ?? { supplierId: order.supplierId, supplier: order.supplier, orders: [], orderValueCny: 0, paidCny: 0, paidInr: 0 };
-    bySupplier.set(order.supplierId, { ...row, orders: [...row.orders, order.po], orderValueCny: row.orderValueCny + order.orderValueCny, paidCny: row.paidCny + order.paidCny, paidInr: row.paidInr + order.paidInr });
+    const key = `${order.supplierId} ${order.currency}`;
+    const row = bySupplier.get(key) ?? { supplierId: order.supplierId, supplier: order.supplier, currency: order.currency, orders: [], orderValueCny: 0, paidCny: 0, paidInr: 0 };
+    bySupplier.set(key, { ...row, orders: [...row.orders, order.po], orderValueCny: row.orderValueCny + order.orderValueCny, paidCny: row.paidCny + order.paidCny, paidInr: row.paidInr + order.paidInr });
   }
+  const rank = (currency: Currency) => CURRENCIES.indexOf(currency);
   const rows = [...bySupplier.values()]
     .map((row) => ({ ...row, orderValueCny: round2(row.orderValueCny), paidCny: round2(row.paidCny), paidInr: round2(row.paidInr), balanceCny: round2(row.orderValueCny - row.paidCny) }))
-    .sort((a, b) => b.orderValueCny - a.orderValueCny || a.supplier.localeCompare(b.supplier));
-  const total = (pick: (row: (typeof rows)[number]) => number) => round2(sum(rows, pick));
+    .sort((a, b) => rank(a.currency) - rank(b.currency) || b.orderValueCny - a.orderValueCny || a.supplier.localeCompare(b.supplier));
+  const totalsOf = (list: typeof rows) => {
+    const total = (pick: (row: (typeof rows)[number]) => number) => round2(sum(list, pick));
+    return {
+      orders: sum(list, (r) => r.orders.length),
+      orderValueCny: total((r) => r.orderValueCny),
+      paidCny: total((r) => r.paidCny),
+      paidInr: total((r) => r.paidInr),
+      balanceCny: total((r) => r.balanceCny),
+    };
+  };
   return {
     suppliers: rows,
-    totals: { orders: open.length, orderValueCny: total((r) => r.orderValueCny), paidCny: total((r) => r.paidCny), paidInr: total((r) => r.paidInr), balanceCny: total((r) => r.balanceCny) },
-    dueNext30Cny: round2(sum(open, (order) => order.dueNext30Cny)),
+    totals: totalsOf(inCny(rows)),
+    totalsByCurrency: CURRENCIES.filter((currency) => rows.some((row) => row.currency === currency)).map((currency) => ({
+      currency,
+      ...totalsOf(rows.filter((row) => row.currency === currency)),
+    })),
+    dueNext30Cny: round2(sum(inCny(open), (order) => order.dueNext30Cny)),
+    dueNext30ByCurrency: byCurrency(open, (order) => order.dueNext30Cny),
     finishedPos: finished.map((order) => order.po),
   };
 }
@@ -301,7 +349,7 @@ export async function summary(db: Database, f: Filters, today: string) {
     deliveries: { dueNext7: deliveries.dueNext7, late: deliveries.late },
     receiving: { shortOrders: received.shortPos.length, shortPcs: short("pcs"), shortM: short("m") },
     containers: { onTheWay: timeline.active, arrivingIn7Days: timeline.arrivingIn7Days.length },
-    payments: { dueNext30Cny: paid.dueNext30Cny },
+    payments: { dueNext30Cny: paid.dueNext30Cny, dueNext30ByCurrency: paid.dueNext30ByCurrency },
     landedCost: { finishedOrders: byMonth.totals.orders, finishedTotalInr: byMonth.totals.landedCostInr },
   };
 }

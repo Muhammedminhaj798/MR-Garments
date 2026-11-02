@@ -6,7 +6,7 @@ import { locations, notifications, shippingAgents, users } from "../../db/schema
 import { api, createTestContext, resetData, SEEDED, signInAs } from "../../test/harness";
 import { idOf, indiaDay, makeOrder, receive } from "../stock/fixtures";
 import { MESSAGES } from "../stock/stock.routes";
-import { cny, day, notify, qty } from "./notify";
+import { day, money, notify, qty } from "./notify";
 
 const ctx = createTestContext();
 const http = api(ctx);
@@ -406,10 +406,10 @@ describe("notify()", () => {
   });
 
   it("formats like the frontend", () => {
-    expect([cny(141000), cny(2345.6), cny(0.5), qty(1800, "pcs"), day("2026-09-30"), day("2026-01-05")]).toEqual([
+    expect([money(141000, "CNY"), money(2345.6, "USD"), money(0.5, "INR"), qty(1800, "pcs"), day("2026-09-30"), day("2026-01-05")]).toEqual([
       "¥1,41,000",
-      "¥2,345.60",
-      "¥0.50",
+      "$2,345.60",
+      "₹0.50",
       "1,800 pcs",
       "30 Sep 2026",
       "5 Jan 2026",

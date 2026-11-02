@@ -93,6 +93,7 @@ describe("ORD-4 GET /orders/:po", () => {
       deliveryDate: indiaDay(10),
       stage: 3, // 1 -> 2 on the first receipt, 2 -> 3 on loading
       supplier: { id: ids.supplier, name: "Guangzhou Textile Co.", contactPerson: "Mr. Zhao Lin", phone: "+86 138 0013 2244", city: "Guangzhou" },
+      currency: "CNY",
       item: "Denim jeans",
       quantity: 1000,
       unit: "pcs",
