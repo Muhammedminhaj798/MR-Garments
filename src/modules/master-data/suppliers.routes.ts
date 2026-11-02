@@ -3,7 +3,7 @@ import { Router } from "express";
 import { z } from "zod";
 
 import { requirePermission } from "../../auth/current-user";
-import { orders, STATUSES, suppliers } from "../../db/schema";
+import { CURRENCIES, orders, STATUSES, suppliers } from "../../db/schema";
 import { conflict, GENERIC_MESSAGE, HttpError, notFound } from "../../http/errors";
 import { parse } from "../../http/validate";
 import type { RouteContext } from "../context";
@@ -15,6 +15,7 @@ import { contactSearch, creationOrder, listRoute } from "./list-query";
 
 const NAME_EMPTY = "Enter the supplier name."; // M21
 const NAME_TAKEN = "A supplier with this name already exists."; // M22
+const CURRENCY = "Choose CNY, USD or INR.";
 const tooLong = (max: number) => `Use ${max} characters or fewer.`;
 
 const isUuid = (value: string) => z.uuid().safeParse(value).success;
@@ -27,9 +28,10 @@ const fields = {
   phone: text(),
   address: text(1000),
   notes: text(1000),
+  // The default for the supplier's new orders; changing it leaves existing orders in their own currency.
+  currency: z.enum(CURRENCIES, { error: CURRENCY }).optional(),
 };
-const newSupplier = z.strictObject({ ...fields, currency: z.literal("CNY").optional() });
-// The currency stays CNY, so PATCH doesn't take it.
+const newSupplier = z.strictObject(fields);
 const changes = z.strictObject({ ...fields, status: z.enum(STATUSES) }).partial();
 
 /** The unique index on lower(name) decides duplicates, so two simultaneous saves can't both succeed. */

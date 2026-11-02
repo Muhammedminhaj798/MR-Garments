@@ -1,9 +1,9 @@
 import { eq } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
-import { suppliers } from "../../db/schema";
+import { orders, payments, suppliers } from "../../db/schema";
 import { api, createTestContext, resetData, SEEDED, signInAs } from "../../test/harness";
-import { indiaDay } from "../stock/fixtures";
+import { indiaDay, makeOrder, receive } from "../stock/fixtures";
 import { REPORTS } from "./reports";
 import { buildLifecycle } from "./test-data";
 
@@ -163,5 +163,65 @@ describe("GET /reports/<name> on the lifecycle data", () => {
     expect(earlier).toMatchObject({ months: [{ month: lastMonth, pieces: 0, landedCostInr: 0, perPieceInr: null, soFar: false }], totals: { orders: 0 }, biggest: null });
     const guangzhou = await get(`/reports/landed-cost-by-month?supplierId=${await supplierId("Guangzhou Textile Co.")}`);
     expect(guangzhou.totals).toEqual({ orders: 1, pieces: 100, landedCostInr: 40450, perPieceInr: 404.5 });
+  });
+});
+
+describe("reports never add amounts in different currencies (migration 0006)", () => {
+  let data: Awaited<ReturnType<typeof buildLifecycle>>;
+  let usd: Awaited<ReturnType<typeof makeOrder>>;
+  beforeAll(async () => {
+    await resetData(ctx);
+    management = await signInAs(ctx, SEEDED.management);
+    data = await buildLifecycle(ctx);
+    // F: Foshan Fabrics again, in USD: 100 Track pants at $2 ($200), 80 received (short 20 = $40), $50 paid at 88, $30 due.
+    usd = await makeOrder(ctx, { supplier: "Foshan Fabrics", stage: 2, lines: [{ item: "Track pants", quantity: 100, rateCny: 2 }] });
+    await ctx.db.update(orders).set({ currency: "USD" }).where(eq(orders.id, usd.id));
+    await receive(ctx, usd.id, [{ orderLineId: usd.lineIds[0]!, quantity: 80 }]);
+    await ctx.db.insert(payments).values([
+      { orderId: usd.id, kind: "Deposit", payee: "Foshan Fabrics", payeeRole: "supplier", amountCny: 50, rateInr: 88, status: "paid", mode: "Wire", paidOn: indiaDay(-5) },
+      { orderId: usd.id, kind: "Balance", payee: "Foshan Fabrics", payeeRole: "supplier", amountCny: 30, status: "due", dueDate: indiaDay(5) },
+    ]);
+  });
+
+  it("payments-per-supplier: one row per supplier and currency; the single-number totals stay CNY only", async () => {
+    const body = await get("/reports/payments-per-supplier");
+    expect(body.suppliers.map((row: { supplier: string; currency: string }) => `${row.supplier} ${row.currency}`)).toEqual([
+      "Foshan Fabrics CNY",
+      "Yiwu Trims Ltd. CNY",
+      "Hangzhou Knits CNY",
+      "Foshan Fabrics USD",
+    ]);
+    expect(body.suppliers[3]).toEqual({
+      supplierId: await supplierId("Foshan Fabrics"),
+      supplier: "Foshan Fabrics",
+      currency: "USD",
+      orders: [usd.po],
+      orderValueCny: 200,
+      paidCny: 50,
+      paidInr: 4400,
+      balanceCny: 150,
+    });
+    const cny = { orders: 3, orderValueCny: 5800, paidCny: 1000, paidInr: 12000, balanceCny: 4800 };
+    expect(body.totals).toEqual(cny);
+    expect(body.totalsByCurrency).toEqual([
+      { currency: "CNY", ...cny },
+      { currency: "USD", orders: 1, orderValueCny: 200, paidCny: 50, paidInr: 4400, balanceCny: 150 },
+    ]);
+    expect(body).toMatchObject({ dueNext30Cny: 3000, dueNext30ByCurrency: [{ currency: "CNY", amount: 3000 }, { currency: "USD", amount: 30 }] });
+  });
+
+  it("ordered-vs-received and summary: shortages and due payments per currency", async () => {
+    const received = await get("/reports/ordered-vs-received");
+    expect(received.lines.find((line: { po: string }) => line.po === usd.po)).toMatchObject({ currency: "USD", short: 20, shortValueCny: 40 });
+    expect(received.lines.find((line: { po: string }) => line.po === data.e.po)).toMatchObject({ currency: "CNY", shortValueCny: 200 });
+    expect(received).toMatchObject({ shortValueCny: 200, shortValueByCurrency: [{ currency: "CNY", amount: 200 }, { currency: "USD", amount: 40 }] });
+    expect((await get("/reports/summary")).payments).toEqual({ dueNext30Cny: 3000, dueNext30ByCurrency: [{ currency: "CNY", amount: 3000 }, { currency: "USD", amount: 30 }] });
+  });
+
+  it("GET /landed-cost gives each order's currency, the currency of its goods payments", async () => {
+    const res = await http.get("/landed-cost").set("Cookie", management);
+    const row = res.body.orders.find((order: { po: string }) => order.po === usd.po);
+    expect(row).toMatchObject({ currency: "USD", goodsInr: 4400, goodsPayments: [expect.objectContaining({ amountCny: 50, rateInr: 88, amountInr: 4400 })] });
+    expect(res.body.orders.find((order: { po: string }) => order.po === data.a.po).currency).toBe("CNY");
   });
 });

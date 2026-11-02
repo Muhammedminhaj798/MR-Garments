@@ -85,7 +85,9 @@ increasing creation times in `master.ts` order, which is the order the reference
 
 **MD-1 `GET /suppliers?search=&status=`** (A4): array of
 `{ id, name, contactPerson, phone, city, address, notes, currency, openOrders, status }`; `openOrders` is 0 in
-Batch 1. **MD-2 `POST /suppliers`** (A4): `{ name*, city, contactPerson, phone, currency: "CNY", address, notes }`,
+Batch 1. **MD-2 `POST /suppliers`** (A4): `{ name*, city, contactPerson, phone, currency?, address, notes }` (`currency`: `"CNY"`
+(default), `"USD"` or `"INR"` since migration 0006, else 422 "Choose CNY, USD or INR."; PATCH takes it too and it
+only changes the default for the supplier's new orders),
 201 `{ supplier }` (Active, 0 open orders); 409 `name_exists` with `fields.name` (M22); 422 for a missing name (M21).
 
 **Read-only master data** (A3 builds them; A4's Settings tabs read them). All are `GET` only, need

@@ -1,7 +1,7 @@
 import { eq } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
-import { suppliers, users } from "../../db/schema";
+import { orders, suppliers, users } from "../../db/schema";
 import { api, createTestContext, resetData, SEEDED, signInAs } from "../../test/harness";
 import { idOf, makeOrder } from "../stock/fixtures";
 
@@ -22,7 +22,7 @@ const NINGBO = {
   city: "Ningbo",
   contactPerson: "Mr. Xu Feng",
   phone: "+86 138 5740 9921",
-  currency: "CNY",
+  currency: "USD", // any of CNY, USD and INR (0006)
   address: "88 Zhongshan Road, Ningbo",
   notes: "Denim only",
 };
@@ -115,14 +115,23 @@ describe("MD-2 POST /suppliers", () => {
     expect((await ctx.db.select().from(suppliers)).length).toBe(5);
   });
 
-  it("refuses an unknown body key with 400 and another currency with 422", async () => {
+  it("refuses an unknown body key with 400 and a currency other than CNY, USD or INR with 422", async () => {
     const unknown = await add({ ...NINGBO, openOrders: 3 });
     expect(unknown.status).toBe(400);
     expect(unknown.body.error.code).toBe("bad_request");
-    const currency = await add({ ...NINGBO, currency: "INR" });
-    expect(currency.status).toBe(422);
-    expect(Object.keys(currency.body.error.fields)).toEqual(["currency"]);
+    for (const other of ["EUR", "cny", ""]) {
+      const currency = await add({ ...NINGBO, currency: other });
+      expect(currency.status, other).toBe(422);
+      expect(currency.body.error.fields).toEqual({ currency: "Choose CNY, USD or INR." });
+    }
     expect((await ctx.db.select().from(suppliers)).length).toBe(5);
+  });
+
+  it("the database refuses any other currency (check constraint, migration 0006)", async () => {
+    const foshan = await idOf(ctx, suppliers, "Foshan Fabrics");
+    await expect(ctx.db.update(suppliers).set({ currency: "EUR" as "CNY" }).where(eq(suppliers.id, foshan))).rejects.toMatchObject({
+      cause: { code: "23514", constraint: "suppliers_currency_check" },
+    });
   });
 
   it("AT-S4: adds the supplier as Active with 0 open orders, stores address, notes and the creator", async () => {
@@ -227,9 +236,22 @@ describe("PATCH /suppliers/:id", () => {
     expect((await edit(id, { address: "a".repeat(1000), notes: "" })).status).toBe(200);
   });
 
-  it("an empty body or an unknown key (the currency included) is 400", async () => {
+  it("changes the currency for new orders only: the supplier's existing orders keep theirs", async () => {
+    const id = await idOf(ctx, suppliers, "Yiwu Trims Ltd.");
+    const order = await makeOrder(ctx, { supplier: "Yiwu Trims Ltd.", lines: [{ item: "Denim jeans", quantity: 10, rateCny: 5 }] });
+    const res = await edit(id, { currency: "USD" });
+    expect(res.status).toBe(200);
+    expect(res.body.supplier).toMatchObject({ name: "Yiwu Trims Ltd.", currency: "USD" });
+    expect((await ctx.db.select({ currency: orders.currency }).from(orders).where(eq(orders.id, order.id)))[0]!.currency).toBe("CNY");
+    expect((await edit(id, { currency: "INR" })).body.supplier.currency).toBe("INR");
+    expect((await edit(id, { currency: "EUR" })).body.error.fields).toEqual({ currency: "Choose CNY, USD or INR." });
+    expect((await edit(id, { currency: "CNY" })).status).toBe(200);
+    await ctx.db.delete(orders).where(eq(orders.id, order.id));
+  });
+
+  it("an empty body or an unknown key is 400", async () => {
     const id = await idOf(ctx, suppliers, "Foshan Fabrics");
-    for (const body of [{}, { currency: "CNY" }, { openOrders: 3 }, { name: "Foshan Fabrics", id: UNKNOWN }]) {
+    for (const body of [{}, { openOrders: 3 }, { name: "Foshan Fabrics", id: UNKNOWN }]) {
       const res = await edit(id, body);
       expect(res.status, JSON.stringify(body)).toBe(400);
       expect(res.body).toEqual({ error: { code: "bad_request", message: "Something went wrong." } });

@@ -6,6 +6,7 @@ import {
   clearings,
   containerLines,
   containers,
+  type Currency,
   orderLines,
   orders,
   payments,
@@ -57,8 +58,11 @@ export type LandedCostFacts = {
   orders: { id: string; stage: number; valueCny: number }[];
   /** Paid payments only. `inr` is round2(amountCny * rateInr), rounded in SQL so it matches PAY-1 to the paisa. */
   payments: { orderId: string; payeeRole: string; amountCny: number; inr: number }[];
-  /** Every container line of every container carrying one of the orders, other orders' lines included (shares). */
-  loads: { containerId: string; orderId: string; quantity: number; valueCny: number }[];
+  /**
+   * Every container line of every container carrying one of the orders, other orders' lines included (shares).
+   * `valueCny` is quantity x rate in the order's `currency`.
+   */
+  loads: { containerId: string; orderId: string; currency: Currency; quantity: number; valueCny: number }[];
   containers: ContainerFacts[];
   /** Pieces on stocked receipts, per order. */
   stocked: { orderId: string; pieces: number }[];
@@ -94,9 +98,12 @@ export function computeLandedCosts(facts: LandedCostFacts): Map<string, OrderLan
   }
 
   // Each order's share of a container: its goods value there (quantity * rateCny), or its quantity when the container's
-  // value is 0. Rounded per share, so the shares can differ from the container's total by a paisa.
+  // value is 0 or its orders are in different currencies (values in ¥ and $ don't compare). Rounded per share, so the
+  // shares can differ from the container's total by a paisa.
   const shares = new Map<string, Map<string, { value: number; quantity: number }>>();
+  const currencies = new Map<string, Set<Currency>>();
   for (const load of facts.loads) {
+    currencies.set(load.containerId, (currencies.get(load.containerId) ?? new Set()).add(load.currency));
     const byOrder = shares.get(load.containerId) ?? new Map<string, { value: number; quantity: number }>();
     shares.set(load.containerId, byOrder);
     const share = byOrder.get(load.orderId) ?? { value: 0, quantity: 0 };
@@ -104,7 +111,7 @@ export function computeLandedCosts(facts: LandedCostFacts): Map<string, OrderLan
   }
   for (const container of facts.containers) {
     const byOrder = [...(shares.get(container.id) ?? [])];
-    const byValue = byOrder.some(([, share]) => share.value > 0);
+    const byValue = (currencies.get(container.id)?.size ?? 0) <= 1 && byOrder.some(([, share]) => share.value > 0);
     const weight = (share: { value: number; quantity: number }) => (byValue ? share.value : share.quantity);
     const whole = byOrder.reduce((sum, [, share]) => sum + weight(share), 0);
     for (const [orderId, share] of byOrder) {
@@ -180,11 +187,13 @@ export async function loadLandedCosts(db: Pick<Database, "select">, orderIds?: s
       .select({
         containerId: containerLines.containerId,
         orderId: orderLines.orderId,
+        currency: orders.currency,
         quantity: containerLines.quantity,
         valueCny: sql<number>`${containerLines.quantity} * ${orderLines.rateCny}`.mapWith(Number),
       })
       .from(containerLines)
       .innerJoin(orderLines, eq(orderLines.id, containerLines.orderLineId))
+      .innerJoin(orders, eq(orders.id, orderLines.orderId))
       .where(inArray(containerLines.containerId, carriers)),
     db
       .select({

@@ -36,6 +36,7 @@ const container = (id: string, facts: Partial<Container> = {}): Container => ({
 const done = { clearingInr: 0, cleared: true, tripInr: 0, unloaded: true, stocked: true };
 const facts = (partial: Partial<LandedCostFacts>): LandedCostFacts => ({ orders: [], payments: [], loads: [], containers: [], stocked: [], ...partial });
 const paidInFull = { orderId: "a", payeeRole: "supplier", amountCny: 1000, inr: 12000 };
+const CNY = "CNY" as const;
 
 describe("computeLandedCosts", () => {
   it("shares a container's clearing and trip by goods value, rounded per share", () => {
@@ -46,8 +47,8 @@ describe("computeLandedCosts", () => {
           { id: "b", stage: 5, valueCny: 2000 },
         ],
         loads: [
-          { containerId: "c1", orderId: "a", quantity: 900, valueCny: 1000 },
-          { containerId: "c1", orderId: "b", quantity: 100, valueCny: 2000 },
+          { containerId: "c1", orderId: "a", currency: CNY, quantity: 900, valueCny: 1000 },
+          { containerId: "c1", orderId: "b", currency: CNY, quantity: 100, valueCny: 2000 },
         ],
         containers: [container("c1", { clearingInr: 100, tripInr: 2000 })],
       }),
@@ -64,8 +65,8 @@ describe("computeLandedCosts", () => {
           { id: "b", stage: 4, valueCny: 0 },
         ],
         loads: [
-          { containerId: "c1", orderId: "a", quantity: 100, valueCny: 0 },
-          { containerId: "c1", orderId: "b", quantity: 300, valueCny: 0 },
+          { containerId: "c1", orderId: "a", currency: CNY, quantity: 100, valueCny: 0 },
+          { containerId: "c1", orderId: "b", currency: CNY, quantity: 300, valueCny: 0 },
         ],
         containers: [container("c1", { clearingInr: 400 })],
       }),
@@ -74,10 +75,28 @@ describe("computeLandedCosts", () => {
     expect(costs.get("a")?.transportInr).toBeNull();
   });
 
+  it("shares by quantity when the container carries orders in different currencies (¥ and $ values don't compare)", () => {
+    const costs = computeLandedCosts(
+      facts({
+        orders: [
+          { id: "a", stage: 5, valueCny: 10000 },
+          { id: "b", stage: 5, valueCny: 500 },
+        ],
+        loads: [
+          { containerId: "c1", orderId: "a", currency: CNY, quantity: 300, valueCny: 10000 },
+          { containerId: "c1", orderId: "b", currency: "USD", quantity: 100, valueCny: 500 },
+        ],
+        containers: [container("c1", { clearingInr: 400, tripInr: 800 })],
+      }),
+    );
+    expect(costs.get("a")).toMatchObject({ clearingInr: 300, transportInr: 600 });
+    expect(costs.get("b")).toMatchObject({ clearingInr: 100, transportInr: 200 });
+  });
+
   it("counts agent payments as sea freight for FOB, not for CNF", () => {
     const order = { id: "a", stage: 3, valueCny: 1000 };
     const paid = [paidInFull, { orderId: "a", payeeRole: "agent", amountCny: 100, inr: 1234.56 }];
-    const load = { containerId: "c1", orderId: "a", quantity: 10, valueCny: 1000 };
+    const load = { containerId: "c1", orderId: "a", currency: CNY, quantity: 10, valueCny: 1000 };
     const fob = computeLandedCosts(facts({ orders: [order], payments: paid, loads: [load], containers: [container("c1")] })).get("a");
     const cnf = computeLandedCosts(facts({ orders: [order], payments: paid, loads: [load], containers: [container("c1", { terms: "CNF" })] })).get("a");
     expect(fob).toMatchObject({ goodsInr: 12000, seaFreightInr: 1234.56, clearingInr: null, transportInr: null, totalInr: 13234.56 });
@@ -87,8 +106,8 @@ describe("computeLandedCosts", () => {
   it("names the first missing part: supplier payment, duty, transport, warehouse", () => {
     const order = { id: "a", stage: 6, valueCny: 1000 };
     const loads = [
-      { containerId: "c1", orderId: "a", quantity: 10, valueCny: 500 },
-      { containerId: "c2", orderId: "a", quantity: 10, valueCny: 500 },
+      { containerId: "c1", orderId: "a", currency: CNY, quantity: 10, valueCny: 500 },
+      { containerId: "c2", orderId: "a", currency: CNY, quantity: 10, valueCny: 500 },
     ];
     const waiting = (partial: Partial<LandedCostFacts>) => computeLandedCosts(facts({ orders: [order], loads, payments: [paidInFull], ...partial })).get("a");
     expect(waiting({ payments: [{ ...paidInFull, amountCny: 999.99 }], containers: [container("c1", done), container("c2", done)] })?.waitingFor).toBe(

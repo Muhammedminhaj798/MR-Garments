@@ -87,7 +87,7 @@ describe("ORD-2 GET /orders/options", () => {
     expect(res.status).toBe(200);
     expect(res.body.nextPo).toBe("PO-2050");
     expect(res.body.suppliers.map((row: { name: string }) => row.name)).toEqual(["Guangzhou Textile Co.", "Shenzhen Apparel", "Yiwu Trims Ltd.", "Hangzhou Knits"]);
-    expect(res.body.suppliers[0]).toEqual({ id: ids.supplier, name: "Guangzhou Textile Co.", contactPerson: "Mr. Zhao Lin", phone: "+86 138 0013 2244", city: "Guangzhou" });
+    expect(res.body.suppliers[0]).toEqual({ id: ids.supplier, name: "Guangzhou Textile Co.", contactPerson: "Mr. Zhao Lin", phone: "+86 138 0013 2244", city: "Guangzhou", currency: "CNY" });
     expect(res.body.items).toHaveLength(8);
     expect(res.body.items).toContainEqual({ id: ids.jeans, name: "Denim jeans", unit: "pcs" });
     expect(res.body.items).toContainEqual({ id: ids.fabric, name: "Cotton fabric", unit: "m" });
@@ -127,6 +127,7 @@ describe("ORD-3 POST /orders and ORD-1 GET /orders", () => {
       deliveryDate: "2026-11-30",
       stage: 1,
       supplier: { id: ids.supplier, name: "Guangzhou Textile Co." },
+      currency: "CNY",
       item: "Denim jeans",
       quantity: 1000,
       unit: "pcs",
@@ -242,11 +243,12 @@ describe("PAY-1 GET /payments", () => {
     const res = await get("/payments");
     expect(res.status).toBe(200);
     expect(res.body.orders).toEqual([
-      { orderId: bare.id, po: bare.po, supplier: "Guangzhou Textile Co.", orderValueCny: 14975, paidCny: 0, paidInr: 0, balanceCny: 14975, nextDue: null },
+      { orderId: bare.id, po: bare.po, supplier: "Guangzhou Textile Co.", currency: "CNY", orderValueCny: 14975, paidCny: 0, paidInr: 0, balanceCny: 14975, nextDue: null },
       {
         orderId: withDeposits.id,
         po: withDeposits.po,
         supplier: "Guangzhou Textile Co.",
+        currency: "CNY",
         orderValueCny: 14975,
         paidCny: 2234.56,
         paidInr: 26562.25,
@@ -259,6 +261,7 @@ describe("PAY-1 GET /payments", () => {
       id: expect.any(String),
       orderId: withDeposits.id,
       po: withDeposits.po,
+      currency: "CNY",
       kind: "Balance",
       payee: "Guangzhou Textile Co.",
       payeeRole: "supplier",
@@ -270,5 +273,66 @@ describe("PAY-1 GET /payments", () => {
       mode: null,
     });
     expect(res.body.payments).toContainEqual(expect.objectContaining({ kind: "Deposit", status: "paid", amountCny: 1234.56, rateInr: 11.8765, paidOn: "2026-10-21", dueDate: null, mode: "Bank transfer" }));
+  });
+});
+
+describe("currencies (migration 0006): CNY, USD and INR orders", () => {
+  const supplierDeposit = (overrides: object = {}) => ({
+    payee: "Guangzhou Textile Co.",
+    payeeRole: "supplier",
+    amountCny: 1000,
+    paidOn: "2026-10-21",
+    rateInr: 88.25,
+    mode: "Wire",
+    ...overrides,
+  });
+
+  it("stores the order's currency (CNY when left out) and returns it on ORD-1, ORD-4 and PAY-1", async () => {
+    const usd = (await create(orderBody({ currency: "USD", deposits: [supplierDeposit()] }))).body.order;
+    const cny = (await create(orderBody({ deposits: [] }))).body.order;
+    const stored = await ctx.db.select({ id: orders.id, currency: orders.currency }).from(orders);
+    expect(stored).toEqual(expect.arrayContaining([{ id: usd.id, currency: "USD" }, { id: cny.id, currency: "CNY" }]));
+
+    const listed = (await get("/orders")).body.find((row: { id: string }) => row.id === usd.id);
+    expect(listed).toMatchObject({ currency: "USD", orderValueCny: 14975, paidCny: 1000, paidInr: 88250 });
+    expect((await get(`/orders/${usd.po}`)).body).toMatchObject({ currency: "USD", balanceCny: 13975 });
+    const pay = (await get("/payments")).body;
+    expect(pay.orders.find((row: { orderId: string }) => row.orderId === usd.id)).toMatchObject({ currency: "USD", paidInr: 88250 });
+    expect(pay.payments).toEqual([expect.objectContaining({ orderId: usd.id, currency: "USD", amountCny: 1000, rateInr: 88.25 })]);
+  });
+
+  it("an INR order's deposits take no rate: stored as 1, so INR is the amount", async () => {
+    const inr = await create(orderBody({ currency: "INR", deposits: [supplierDeposit({ rateInr: undefined, amountCny: 50000 }), supplierDeposit({ rateInr: 1 })] }));
+    expect(inr.status).toBe(201);
+    const rows = await ctx.db.select({ rateInr: payments.rateInr }).from(payments).where(eq(payments.orderId, inr.body.order.id));
+    expect(rows).toEqual([{ rateInr: 1 }, { rateInr: 1 }]);
+    expect((await get("/orders")).body[0]).toMatchObject({ currency: "INR", paidCny: 51000, paidInr: 51000 });
+  });
+
+  it("refuses a rate on an INR deposit, a missing rate otherwise, and another currency, storing nothing", async () => {
+    const cases: [object, Record<string, string>][] = [
+      [{ currency: "INR", deposits: [supplierDeposit({ rateInr: 12 })] }, { deposits: MESSAGES.rateForInr }],
+      [{ currency: "USD", deposits: [supplierDeposit({ rateInr: undefined })] }, { deposits: MESSAGES.rateInr }],
+      [{ deposits: [supplierDeposit({ rateInr: undefined })] }, { deposits: MESSAGES.rateInr }],
+      [{ currency: "EUR" }, { currency: MESSAGES.currency }],
+      [{ currency: "usd" }, { currency: MESSAGES.currency }],
+    ];
+    for (const [overrides, fields] of cases) {
+      const res = await create(orderBody(overrides));
+      expect(res.status, JSON.stringify(overrides)).toBe(422);
+      expect(res.body.error.fields).toEqual(fields);
+    }
+    expect(await countOrders()).toBe(0);
+  });
+
+  it("ORD-2 gives each supplier's currency, the new-order default", async () => {
+    await ctx.db.update(suppliers).set({ currency: "USD" }).where(eq(suppliers.id, ids.supplier));
+    expect((await get("/orders/options")).body.suppliers[0]).toMatchObject({ id: ids.supplier, currency: "USD" });
+  });
+
+  it("the database refuses any other currency (check constraint)", async () => {
+    await expect(
+      ctx.db.insert(orders).values({ poNumber: "PO-1", supplierId: ids.supplier, orderDate: "2026-10-20", deliveryDate: "2026-10-30", currency: "EUR" as "CNY" }),
+    ).rejects.toMatchObject({ cause: { code: "23514", constraint: "orders_currency_check" } });
   });
 });

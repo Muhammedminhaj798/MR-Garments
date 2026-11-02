@@ -1,7 +1,7 @@
 import { eq } from "drizzle-orm";
 import { afterAll, beforeEach, describe, expect, it } from "vitest";
 
-import { items, payments, shippingAgents, suppliers, users } from "../../db/schema";
+import { items, notifications, orders, payments, shippingAgents, suppliers, users } from "../../db/schema";
 import { api, createTestContext, resetData, SEEDED, signInAs } from "../../test/harness";
 import { MESSAGES } from "./payments.routes";
 
@@ -159,5 +159,33 @@ describe("PAY-2 POST /payments", () => {
     expect((await record(body({ status: "due" }))).status).toBe(400);
     expect((await record(body({ payee: "Someone" }))).status).toBe(400);
     expect(await stored()).toHaveLength(0);
+  });
+});
+
+describe("PAY-2 in the order's currency (migration 0006)", () => {
+  const recordFor = async (currency: "USD" | "INR", payload: object) => {
+    await ctx.db.update(orders).set({ currency }).where(eq(orders.id, orderId));
+    return record(body(payload));
+  };
+
+  it("an INR order takes no rate: the payment is stored at 1, so its INR is the amount", async () => {
+    for (const rateInr of [undefined, 1]) expect((await recordFor("INR", { rateInr, amountCny: 5000 })).status).toBe(201);
+    expect((await stored()).map((row) => row.rateInr)).toEqual([1, 1]);
+    expect((await get("/payments")).body.orders[0]).toMatchObject({ currency: "INR", paidCny: 11000, paidInr: 22000 }); // ¥-era deposit 1000 x 12
+  });
+
+  it("refuses a rate on an INR order and a missing rate on a USD or CNY order", async () => {
+    expect((await recordFor("INR", { rateInr: 12 })).body.error.fields).toEqual({ rateInr: "Leave the rate empty for an INR order." });
+    expect((await recordFor("USD", { rateInr: undefined })).body.error.fields).toEqual({ rateInr: MESSAGES.rateInr });
+    await ctx.db.update(orders).set({ currency: "CNY" }).where(eq(orders.id, orderId));
+    expect((await record(body({ rateInr: undefined }))).body.error.fields).toEqual({ rateInr: MESSAGES.rateInr });
+    expect(await stored()).toHaveLength(0);
+  });
+
+  it("the notification shows the order's currency", async () => {
+    expect((await recordFor("USD", { amountCny: 500, rateInr: 88 })).status).toBe(201);
+    const sent = await ctx.db.select({ details: notifications.details }).from(notifications).where(eq(notifications.kind, "payment-recorded"));
+    expect(sent.length).toBeGreaterThan(0);
+    for (const row of sent) expect(row.details[0]).toBe("Balance $500");
   });
 });

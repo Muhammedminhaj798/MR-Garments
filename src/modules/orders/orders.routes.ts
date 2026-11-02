@@ -5,13 +5,14 @@ import { z } from "zod";
 
 import { requirePermission } from "../../auth/current-user";
 import type { Database } from "../../db/client";
-import { items, orderLines, orders, PAYEE_ROLES, payments, receiptLines, shippingAgents, suppliers } from "../../db/schema";
+import { type Currency, CURRENCIES, items, orderLines, orders, PAYEE_ROLES, payments, receiptLines, shippingAgents, suppliers } from "../../db/schema";
 import { validationFailed } from "../../http/errors";
 import { parse } from "../../http/validate";
 import type { RouteContext } from "../context";
 
 // Owner: BE-orders. ORD-1 GET /orders, ORD-2 GET /orders/options, ORD-3 POST /orders, CAL-1 GET /deliveries,
 // PAY-1 GET /payments (docs/live-screens-contracts.md). Payments are records only: nothing here moves money.
+// Money is in the order's `currency` (the *Cny names stay for compatibility); `rateInr` is INR per 1 of it.
 
 export const MESSAGES = {
   supplier: "Choose a supplier from the list.",
@@ -28,7 +29,9 @@ export const MESSAGES = {
   amount: "Enter a deposit amount above 0.",
   paidOn: "Enter the date the deposit was paid.",
   rateInr: "Enter the INR rate.",
+  rateForInr: "Leave the rate empty for an INR order.",
   mode: "Enter the payment mode.",
+  currency: "Choose CNY, USD or INR.",
 };
 const M = MESSAGES;
 
@@ -45,11 +48,13 @@ const deposit = z.strictObject({
   payeeRole: z.enum(PAYEE_ROLES, { error: M.payee }),
   amountCny: z.number({ error: M.amount }).min(0.01, M.amount).max(999_999_999_999, M.amount),
   paidOn: z.iso.date({ error: M.paidOn }),
-  rateInr: z.number({ error: M.rateInr }).min(0.0001, M.rateInr).max(99_999_999, M.rateInr),
+  rateInr: z.number({ error: M.rateInr }).min(0.0001, M.rateInr).max(99_999_999, M.rateInr).optional(),
   mode: z.string({ error: M.mode }).trim().min(1, M.mode),
 });
 const newOrder = z.strictObject({
   supplierId: z.uuid({ error: M.supplier }),
+  // Left out (an older frontend), the order is CNY: that frontend shows every amount in yuan.
+  currency: z.enum(CURRENCIES, { error: M.currency }).default("CNY"),
   orderDate: z.iso.date({ error: M.orderDate }),
   deliveryDate: z.iso.date({ error: M.deliveryDate }),
   lines: lineList(line),
@@ -59,6 +64,13 @@ type NewOrder = z.infer<typeof newOrder>;
 
 export const unit = (countedIn: string) => (countedIn === "Metres" ? "m" : "pcs");
 export const round2 = (value: number) => Math.round(value * 100) / 100;
+
+/**
+ * What is wrong with a paid payment's INR rate for an order in `currency`, or null. An INR order takes no rate (it is
+ * stored as 1, so INR = the amount); every other currency needs the rate typed for that payment. Never a guessed rate.
+ */
+export const rateProblem = (currency: Currency, rateInr: number | undefined, missing: string) =>
+  currency === "INR" ? (rateInr === undefined || rateInr === 1 ? null : M.rateForInr) : rateInr === undefined ? missing : null;
 
 // PO numbers: "PO-" + (highest number + 1); the first is PO-2050.
 const FIRST_PO = 2050;
@@ -90,6 +102,8 @@ async function checkRules(db: Database, input: NewOrder) {
     .from(items)
     .where(and(inArray(items.id, itemIds), eq(items.status, "Active")));
   if (active.length < itemIds.length) problems.lines = M.item;
+  const rate = input.deposits.map((entry) => rateProblem(input.currency, entry.rateInr, M.rateInr)).find(Boolean);
+  if (rate) problems.deposits = rate;
   if (Object.keys(problems).length > 0) throw validationFailed(problems);
 }
 
@@ -101,6 +115,7 @@ const orderColumns = {
   po: orders.poNumber,
   orderDate: orders.orderDate,
   deliveryDate: orders.deliveryDate,
+  currency: orders.currency,
   stage: orders.stage,
   supplierId: suppliers.id,
   supplierName: suppliers.name,
@@ -142,6 +157,7 @@ export function ordersRoutes({ db }: RouteContext) {
         deliveryDate: row.deliveryDate,
         stage: row.stage,
         supplier: { id: row.supplierId, name: row.supplierName },
+        currency: row.currency,
         item: row.item,
         quantity: row.quantity,
         unit: unit(row.countedIn),
@@ -158,7 +174,14 @@ export function ordersRoutes({ db }: RouteContext) {
     const [po, supplierRows, itemRows, agents] = await Promise.all([
       nextPo(db),
       db
-        .select({ id: suppliers.id, name: suppliers.name, contactPerson: suppliers.contactPerson, phone: suppliers.phone, city: suppliers.city })
+        .select({
+          id: suppliers.id,
+          name: suppliers.name,
+          contactPerson: suppliers.contactPerson,
+          phone: suppliers.phone,
+          city: suppliers.city,
+          currency: suppliers.currency,
+        })
         .from(suppliers)
         .where(eq(suppliers.status, "Active"))
         .orderBy(asc(suppliers.createdAt), asc(suppliers.name)),
@@ -193,14 +216,21 @@ export function ordersRoutes({ db }: RouteContext) {
           await tx.execute(sql`select pg_advisory_xact_lock(hashtext('orders.po_number'))`);
           const created = await tx
             .insert(orders)
-            .values({ poNumber: await nextPo(tx), supplierId: input.supplierId, orderDate: input.orderDate, deliveryDate: input.deliveryDate, createdBy: userId })
+            .values({
+              poNumber: await nextPo(tx),
+              supplierId: input.supplierId,
+              orderDate: input.orderDate,
+              deliveryDate: input.deliveryDate,
+              currency: input.currency,
+              createdBy: userId,
+            })
             .returning({ id: orders.id, po: orders.poNumber });
           const orderId = created[0]!.id;
           await tx.insert(orderLines).values(input.lines.map((entry, position) => ({ ...entry, orderId, position })));
           if (input.deposits.length > 0) {
             await tx
               .insert(payments)
-              .values(input.deposits.map((entry) => ({ ...entry, orderId, kind: "Deposit", status: "paid", createdBy: userId })));
+              .values(input.deposits.map((entry) => ({ ...entry, rateInr: entry.rateInr ?? 1, orderId, kind: "Deposit", status: "paid", createdBy: userId })));
           }
           return created[0]!;
         });
@@ -251,6 +281,7 @@ export function ordersRoutes({ db }: RouteContext) {
           id: payments.id,
           orderId: payments.orderId,
           po: orders.poNumber,
+          currency: orders.currency,
           kind: payments.kind,
           payee: payments.payee,
           payeeRole: payments.payeeRole,
@@ -270,6 +301,7 @@ export function ordersRoutes({ db }: RouteContext) {
         orderId: row.id,
         po: row.po,
         supplier: row.supplierName,
+        currency: row.currency,
         orderValueCny: row.orderValueCny,
         paidCny: row.paidCny,
         paidInr: row.paidInr,
