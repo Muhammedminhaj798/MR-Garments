@@ -158,6 +158,35 @@ recorded here are payments already made (status `paid`); containers move forward
 - **Errors without fields** (409 `order_not_receivable`, `container_arrived`, `invalid_status_change`): the frontend
   shows the API's own message (`handleApiError` in `src/lib/feedback.ts`).
 
+## Deleting receipts and containers (2026-11-03)
+
+No migration. So an order's receipts and containers can be removed before ORD-6 deletes the order. Management only.
+
+| Id | Method and path | Permission | Owner |
+| --- | --- | --- | --- |
+| REC-4 | `DELETE /receipts/:id` | receiving = Full (Management) | BE-stock (`stock.routes.ts`) |
+| CON-6 | `DELETE /containers/:id` | containers = Full (Management) | BE-containers (`stock/container-detail.routes.ts`) |
+| ORD-4 | `GET /orders/:po` (changed) | ordersView >= View | BE-orders (`order-detail.routes.ts`) |
+
+- **REC-4** 204 when the receipt and its own lines are deleted. One transaction with the order row locked `for update`
+  (as REC-3 and CON-3 lock it). Received may never fall below loaded: when, without this receipt, a line's other
+  receipts don't cover what is loaded, 409 `in_use` "This receipt can't be deleted: container N already holds 30 pcs
+  of Denim jeans from it. Delete that container first." (plural: "containers A and B already hold … Delete those
+  containers first."). Malformed, unknown or already deleted id: 404 `not_found` "Receipt not found.".
+- **CON-6** 204 when the container and its lines (every order's) are deleted. One transaction: the container row, then
+  its orders (id order), locked `for update`. Clearings, trips and warehouse receipts cascade from a container, so each
+  refuses the delete instead: 409 `in_use` "Container N has a clearing record (Clearing in India), a transport trip
+  (Transport) and a warehouse receipt (Warehouse), so it can't be deleted. Those records can't be removed in the
+  app." (only the ones it has). Any container status may be deleted. Malformed, unknown or already deleted id: 404
+  `not_found` "Container not found.".
+- **Stages after REC-4 and CON-6** (`settleStages` in `src/modules/stages-shared.ts`): each affected order steps back,
+  never forward. Still in a container: unchanged. Else a receipt left: 2 (or lower). Else 1.
+- Payments, notifications, clearings, trips and warehouse receipts (their team quantities) are never removed by these.
+  Each delete writes one server log line: "Receipt <id> of PO-x deleted by user <id>." or "Container N (<id>)
+  deleted by user <id>.". There is no audit table (that would need a migration).
+- **ORD-4 change**: each `containers` entry adds `orders: string[]`, every PO in the container (this one included),
+  in PO order, so the delete confirmation can say whose goods leave with it.
+
 ## Notifications (NTF-1 to NTF-4, migration 0005)
 
 The binding contract is `D:\SDEC\MR Garments\docs\notifications-contract.md` (lead-owned). Migration 0005

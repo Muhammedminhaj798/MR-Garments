@@ -22,6 +22,7 @@ import { conflict, GENERIC_MESSAGE, HttpError, notFound, validationFailed } from
 import { parse } from "../../http/validate";
 import { atLeast, type Capability, effectiveAccess } from "../../permissions/matrix";
 import type { RouteContext } from "../context";
+import { containerOrders } from "../stages/common";
 import { line, lineList, MESSAGES as M, orderRows, round2, unit } from "./orders.routes";
 
 // Owner: BE-orders. ORD-4 GET /orders/:po (docs/live-screens-contracts.md, "Five-tab completion"); ORD-5 PATCH and
@@ -40,7 +41,8 @@ const orderEdit = z.strictObject({
   deliveryDate: z.iso.date({ error: M.deliveryDate }).optional(),
   lines: lineList(line.extend({ id: z.uuid({ error: EDIT.lineChanged }).optional() })).optional(),
 });
-const joined = (parts: string[]) => (parts.length > 1 ? `${parts.slice(0, -1).join(", ")} and ${parts.at(-1)}` : parts[0]!);
+/** "a, b and c". */
+export const joined = (parts: string[]) => (parts.length > 1 ? `${parts.slice(0, -1).join(", ")} and ${parts.at(-1)}` : parts[0]!);
 const received = sql<number>`(select coalesce(sum(${receiptLines.quantity}), 0) from ${receiptLines} where ${receiptLines.orderLineId} = ${orderLines.id})`.mapWith(Number);
 const loaded = sql<number>`(select coalesce(sum(${containerLines.quantity}), 0) from ${containerLines} where ${containerLines.orderLineId} = ${orderLines.id})`.mapWith(Number);
 
@@ -168,9 +170,15 @@ export function orderDetailRoutes({ db }: RouteContext) {
           .innerJoin(shippingAgents, eq(shippingAgents.id, containers.shippingAgentId))
           .where(inArray(containers.id, [...new Set(lineList.map((line) => line.containerId))]))
           .orderBy(asc(containers.loadedOn), asc(containers.createdAt));
+        const pos = await containerOrders(
+          db,
+          list.map((container) => container.id),
+        );
         return list.map(({ agentId, agentName, ...container }) => ({
           ...container,
           agent: { id: agentId, name: agentName },
+          // Every PO in the container, this one included: deleting the container (CON-6) takes all their goods out.
+          orders: pos.get(container.id)?.orders ?? [],
           lines: lineList
             .filter((line) => line.containerId === container.id)
             .map((line) => ({ orderLineId: line.orderLineId, item: line.item, unit: unit(line.countedIn), bundles: line.bundles, quantity: line.quantity })),

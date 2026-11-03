@@ -20,14 +20,17 @@ import {
   TERMS,
   users,
 } from "../../db/schema";
-import { conflict, validationFailed } from "../../http/errors";
+import { conflict, notFound, validationFailed } from "../../http/errors";
 import { parse } from "../../http/validate";
 import { atLeast, effectiveAccess } from "../../permissions/matrix";
 import type { RouteContext } from "../context";
 import { day, notify, qty } from "../notifications/notify";
+import { joined } from "../orders/order-detail.routes";
+import { settleStages } from "../stages-shared";
+import { isUuid } from "../stages/common";
 
-// Owner: BE-stock. REC-1 GET /receipts, REC-2 GET /receipts/options, REC-3 POST /receipts, CON-1 GET /containers,
-// CON-2 GET /containers/options, CON-3 POST /containers (docs/live-screens-contracts.md).
+// Owner: BE-stock. REC-1 GET /receipts, REC-2 GET /receipts/options, REC-3 POST /receipts, REC-4 DELETE /receipts/:id,
+// CON-1 GET /containers, CON-2 GET /containers/options, CON-3 POST /containers (docs/live-screens-contracts.md).
 
 export const MESSAGES = {
   order: "Choose an order from the list.",
@@ -55,6 +58,11 @@ export const MESSAGES = {
   unknownLine: "Choose lines from the list.",
   notLoadable: (po: string) => `${po} can't be loaded: only orders being received or loaded.`,
   overLoad: (item: string, po: string, left: number, unit: string) => `${item} (${po}): only ${left} ${unit} left to load.`,
+  // Proposed wording (REC-4).
+  receiptLoaded: (goods: string[], numbers: string[]) =>
+    numbers.length === 1
+      ? `This receipt can't be deleted: container ${numbers[0]} already holds ${joined(goods)} from it. Delete that container first.`
+      : `This receipt can't be deleted: containers ${joined(numbers)} already hold ${joined(goods)} from it. Delete those containers first.`,
 };
 
 const unit = (countedIn: string) => (countedIn === "Metres" ? "m" : "pcs");
@@ -266,6 +274,51 @@ export function stockRoutes({ db }: RouteContext) {
       return created.id;
     });
     res.status(201).json({ receipt: { id } });
+  });
+
+  // REC-4. Management only (receiving Full). One transaction with the order row locked, as REC-3 and CON-3 lock it, so
+  // no load can land between the check and the delete. Received may never fall below loaded: goods of this receipt
+  // already in a container refuse it. Only the receipt and its own lines go; the order steps back (settleStages), and
+  // payments and notifications stay.
+  router.delete("/receipts/:id", requirePermission("receiving", "Full"), async (req, res) => {
+    const id = String(req.params.id);
+    if (!isUuid(id)) throw notFound("Receipt");
+    const po = await db.transaction(async (tx) => {
+      const found = (await tx.select({ orderId: receipts.orderId }).from(receipts).where(eq(receipts.id, id)))[0];
+      if (!found) throw notFound("Receipt");
+      const order = (await tx.select({ id: orders.id, po: orders.poNumber }).from(orders).where(eq(orders.id, found.orderId)).for("update"))[0]!;
+      // Read again under the lock: a delete of the same receipt that got there first leaves nothing (404).
+      const lines = await tx
+        .select({ quantity: receiptLines.quantity, orderLineId: orderLines.id, received: receivedOf(), loaded: loadedOf(), item: items.name, countedIn: items.countedIn })
+        .from(receipts)
+        .leftJoin(receiptLines, eq(receiptLines.receiptId, receipts.id))
+        .leftJoin(orderLines, eq(orderLines.id, receiptLines.orderLineId))
+        .leftJoin(items, eq(items.id, orderLines.itemId))
+        .where(eq(receipts.id, id))
+        .orderBy(asc(orderLines.position));
+      if (lines.length === 0) throw notFound("Receipt");
+      // What of this receipt is loaded: the part of `loaded` the other receipts can't cover.
+      const inContainers = lines.flatMap((line) => {
+        const fromIt = line.quantity === null ? 0 : Math.min(line.quantity, line.loaded - (line.received - line.quantity));
+        return fromIt > 0 ? [{ ...line, fromIt }] : [];
+      });
+      if (inContainers.length > 0) {
+        const holding = await tx
+          .selectDistinct({ number: containers.number })
+          .from(containerLines)
+          .innerJoin(containers, eq(containers.id, containerLines.containerId))
+          .where(inArray(containerLines.orderLineId, inContainers.map((line) => line.orderLineId!)))
+          .orderBy(asc(containers.number));
+        const goods = inContainers.map((line) => `${qty(line.fromIt, unit(line.countedIn!))} of ${line.item}`);
+        throw conflict("in_use", MESSAGES.receiptLoaded(goods, holding.map((container) => container.number)));
+      }
+      await tx.delete(receipts).where(eq(receipts.id, id));
+      await settleStages(tx, [order.id]);
+      return order.po;
+    });
+    // ponytail: the server log is the deletion record; an audit table needs a migration, add one when audits are asked for.
+    console.info(`Receipt ${id} of ${po} deleted by user ${req.user!.id}.`);
+    res.status(204).end();
   });
 
   // CON-1. Newest first; `part` when any line of that order is not fully (its ordered quantity) in this container.
