@@ -39,7 +39,7 @@ export async function makeOrder(
   return { id: order.id, po, lineIds };
 }
 
-/** A receipt written straight to the database (for container tests). */
+/** A receipt written straight to the database (for container tests); returns its id. */
 export async function receive(ctx: TestContext, orderId: string, lines: { orderLineId: string; quantity: number }[]) {
   const receipt = (
     await ctx.db
@@ -54,4 +54,5 @@ export async function receive(ctx: TestContext, orderId: string, lines: { orderL
       .returning({ id: receipts.id })
   )[0]!;
   await ctx.db.insert(receiptLines).values(lines.map((line) => ({ ...line, receiptId: receipt.id })));
+  return receipt.id;
 }

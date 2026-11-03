@@ -1,7 +1,23 @@
-import { and, eq, inArray, lt } from "drizzle-orm";
+import { and, eq, inArray, lt, sql } from "drizzle-orm";
 
 import type { Database } from "../db/client";
-import { containerLines, orderLines, orders } from "../db/schema";
+import { containerLines, orderLines, orders, receipts } from "../db/schema";
+
+/**
+ * After a receipt or container is deleted (REC-4, CON-6): each order goes back to what it still has, never forward. An
+ * order still in a container keeps its stage (those deletes refuse anything past loading); otherwise 2 with a receipt
+ * left, else 1. Call it inside the delete's transaction, with the orders locked.
+ */
+export async function settleStages(tx: Pick<Database, "update">, orderIds: string[]) {
+  if (orderIds.length === 0) return;
+  const loaded = sql`exists (select 1 from ${containerLines} join ${orderLines} on ${orderLines.id} = ${containerLines.orderLineId}
+    where ${orderLines.orderId} = ${orders.id})`;
+  const received = sql`exists (select 1 from ${receipts} where ${receipts.orderId} = ${orders.id})`;
+  await tx
+    .update(orders)
+    .set({ stage: sql`case when ${loaded} then ${orders.stage} when ${received} then least(${orders.stage}, 2) else 1 end`, updatedAt: new Date() })
+    .where(inArray(orders.id, orderIds));
+}
 
 /**
  * Moves every order with goods in the container forward to `stage`, never backward (docs/wave3-contracts.md section 2:

@@ -1,17 +1,19 @@
-import { asc, eq, inArray } from "drizzle-orm";
+import { asc, count, eq, inArray } from "drizzle-orm";
 import { Router } from "express";
 import { z } from "zod";
 
 import { requirePermission } from "../../auth/current-user";
-import { containerLines, containers, items, orderLines, orders, shippingAgents } from "../../db/schema";
+import { clearings, containerLines, containers, items, orderLines, orders, shippingAgents, transports, warehouseReceipts } from "../../db/schema";
 import { conflict, GENERIC_MESSAGE, HttpError, notFound, validationFailed } from "../../http/errors";
 import { parse } from "../../http/validate";
 import type { RouteContext } from "../context";
 import { day, notify } from "../notifications/notify";
+import { joined } from "../orders/order-detail.routes";
+import { settleStages } from "../stages-shared";
 import { MESSAGES } from "./stock.routes";
 
 // Owner: BE-containers. CON-4 GET /containers/:id, CON-5 PATCH /containers/:id (docs/live-screens-contracts.md,
-// "Five-tab completion").
+// "Five-tab completion"), CON-6 DELETE /containers/:id.
 
 export const DETAIL_MESSAGES = {
   arrived: "This container has arrived and can't be changed.",
@@ -23,6 +25,8 @@ export const DETAIL_MESSAGES = {
   sailedFuture: "The sailing date can't be after today.",
   etaBeforeLoading: MESSAGES.etaBeforeLoading,
   etaBeforeSailing: "The ETA can't be before the sailing date.",
+  // Proposed wording (CON-6).
+  inUse: (number: string, records: string) => `Container ${number} has ${records}, so it can't be deleted. Those records can't be removed in the app.`,
 };
 
 // Copied from stock.routes.ts (private there).
@@ -157,6 +161,42 @@ export function containerDetailRoutes({ db }: RouteContext) {
       return saved;
     });
     res.json({ container });
+  });
+
+  // CON-6. Management only (containers Full). One transaction: the container row, then its orders, locked (clearing,
+  // transport and warehouse saves lock the container first too). Clearings, trips and warehouse receipts cascade from
+  // a container, so each is checked here and refuses the delete: they and their team quantities are never removed with
+  // it. Only the container and its own lines (every order's in it) go; those orders step back (settleStages). Payments
+  // and notifications stay.
+  router.delete("/containers/:id", requirePermission("containers", "Full"), async (req, res) => {
+    const id = String(req.params.id);
+    if (!isUuid(id)) throw notFound("Container");
+    const number = await db.transaction(async (tx) => {
+      const row = (await tx.select({ number: containers.number }).from(containers).where(eq(containers.id, id)).for("update"))[0];
+      if (!row) throw notFound("Container");
+      const later: [string, PromiseLike<{ n: number }[]>][] = [
+        ["a clearing record (Clearing in India)", tx.select({ n: count() }).from(clearings).where(eq(clearings.containerId, id))],
+        ["a transport trip (Transport)", tx.select({ n: count() }).from(transports).where(eq(transports.containerId, id))],
+        [
+          "a warehouse receipt (Warehouse)",
+          tx.select({ n: count() }).from(warehouseReceipts).innerJoin(transports, eq(transports.id, warehouseReceipts.transportId)).where(eq(transports.containerId, id)),
+        ],
+      ];
+      const used: string[] = [];
+      for (const [what, query] of later) if ((await query)[0]!.n > 0) used.push(what);
+      if (used.length > 0) throw conflict("in_use", DETAIL_MESSAGES.inUse(row.number, joined(used)));
+
+      const owners = await tx.selectDistinct({ id: orderLines.orderId }).from(containerLines).innerJoin(orderLines, eq(orderLines.id, containerLines.orderLineId)).where(eq(containerLines.containerId, id));
+      const orderIds = owners.map((owner) => owner.id);
+      // In id order, as CON-3 locks them.
+      if (orderIds.length > 0) await tx.select({ id: orders.id }).from(orders).where(inArray(orders.id, orderIds)).orderBy(asc(orders.id)).for("update");
+      await tx.delete(containers).where(eq(containers.id, id));
+      await settleStages(tx, orderIds);
+      return row.number;
+    });
+    // ponytail: the server log is the deletion record; an audit table needs a migration, add one when audits are asked for.
+    console.info(`Container ${number} (${id}) deleted by user ${req.user!.id}.`);
+    res.status(204).end();
   });
 
   return router;

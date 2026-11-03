@@ -152,6 +152,7 @@ describe("ORD-4 GET /orders/:po", () => {
           loadedOn: indiaDay(-1),
           sailedOn: null,
           eta: indiaDay(20),
+          orders: [po],
           lines: [{ orderLineId: jeans, item: "Denim jeans", unit: "pcs", bundles: 15, quantity: 700 }],
         },
       ],
