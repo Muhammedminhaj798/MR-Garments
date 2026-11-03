@@ -3,12 +3,12 @@ import { Router } from "express";
 import { z } from "zod";
 
 import { requirePermission } from "../../auth/current-user";
-import { clearingAgents, clearings, containers } from "../../db/schema";
+import { clearingAgents, clearings, containers, transports, warehouseReceipts } from "../../db/schema";
 import { conflict, notFound, validationFailed } from "../../http/errors";
 import { parse } from "../../http/validate";
 import type { RouteContext } from "../context";
 import { round2 } from "../orders/orders.routes";
-import { moveOrdersToStage } from "../stages-shared";
+import { moveOrdersToStage, settleStages } from "../stages-shared";
 import {
   addDays,
   closed,
@@ -20,6 +20,7 @@ import {
   inr,
   isUuid,
   lockContainer,
+  lockContainerOrders,
   optionalDate,
   STAGE_MESSAGES,
   text,
@@ -27,7 +28,7 @@ import {
 } from "./common";
 
 // Owner: A5. CLR-1 GET /clearings, CLR-2 GET /clearings/:containerId, CLR-3 PUT /clearings/:containerId
-// (docs/wave3-contracts.md sections 2, 3 and 5; shapes in section 8).
+// (docs/wave3-contracts.md sections 2, 3 and 5; shapes in section 8), CLR-4 DELETE /clearings/:containerId.
 
 export const CLEARING_MESSAGES = {
   agent: "Choose a clearing agent from the list.",
@@ -39,6 +40,11 @@ export const CLEARING_MESSAGES = {
   billOfEntry: "Enter the bill of entry number.",
   dutyPaidOn: "Enter the date the duty was paid.",
   clearedOn: "Enter the date it was cleared.",
+  // Proposed wording (CLR-4).
+  tripDepends: (number: string, lr: string, stocked: boolean) =>
+    stocked
+      ? `The clearing of container ${number} can't be deleted: transport trip ${lr} and its warehouse receipt depend on it. Warehouse receipts can't be removed in the app.`
+      : `The clearing of container ${number} can't be deleted: transport trip ${lr} depends on it. Delete that trip first.`,
 };
 const M = CLEARING_MESSAGES;
 
@@ -100,23 +106,30 @@ export function clearingRoutes({ db }: RouteContext) {
         clearedOn: clearings.clearedOn,
         status: clearings.status,
         clearingCostInr: costOf,
+        tripLr: transports.lrNumber,
+        tripStatus: transports.status,
+        warehouseReceipt: warehouseReceipts.status,
       })
       .from(containers)
       .leftJoin(clearings, eq(clearings.containerId, containers.id))
       .leftJoin(clearingAgents, eq(clearingAgents.id, clearings.clearingAgentId))
+      .leftJoin(transports, eq(transports.containerId, containers.id))
+      .leftJoin(warehouseReceipts, eq(warehouseReceipts.transportId, transports.id))
       .where(eq(containers.status, "arrived"))
       .orderBy(desc(sql`coalesce(${clearings.arrivedOn}, ${containers.eta})`), desc(containers.createdAt));
     const byContainer = await containerOrders(
       db,
       rows.map((row) => row.containerId),
     );
-    const list = rows.map(({ agentId, agentName, status, clearingCostInr, ...row }) => ({
+    const list = rows.map(({ agentId, agentName, status, clearingCostInr, tripLr, tripStatus, warehouseReceipt, ...row }) => ({
       ...row,
       agent: agentId ? { id: agentId, name: agentName! } : null,
       billOfEntry: row.billOfEntry ?? "",
       orders: byContainer.get(row.containerId)?.orders ?? [],
       status: status ?? "waiting",
       clearingCostInr: status ? clearingCostInr : 0,
+      // What depends on the clearing (CLR-4 refuses while there is a trip).
+      trip: tripLr ? { lrNumber: tripLr, status: tripStatus!, warehouseReceipt } : null,
     }));
 
     const since = addDays(todayInIndia(), -29);
@@ -226,6 +239,36 @@ export function clearingRoutes({ db }: RouteContext) {
       return written[0]!;
     });
     res.json({ clearing });
+  });
+
+  // CLR-4. Management only (clearing Full). One transaction: the container, then the clearing, locked as CLR-3 and TRN-3
+  // lock them, so no trip can start between the check and the delete. A trip (TRN-3 needs a cleared clearing), and
+  // with it any warehouse receipt, refuses it. Only the clearing row goes, cleared or not: its charges leave the landed
+  // cost (computed live), the container stays arrived (waiting for clearing again), its orders step back
+  // (settleStages). Payments are recorded per order, never per clearing, and stay.
+  router.delete("/clearings/:containerId", requirePermission("clearing", "Full"), async (req, res) => {
+    const id = String(req.params.containerId);
+    if (!isUuid(id)) throw notFound("Clearing");
+    const number = await db.transaction(async (tx) => {
+      const container = (await tx.select({ number: containers.number }).from(containers).where(eq(containers.id, id)).for("update"))[0];
+      const clearing = container && (await tx.select({ id: clearings.id }).from(clearings).where(eq(clearings.containerId, id)).for("update"))[0];
+      if (!container || !clearing) throw notFound("Clearing");
+      const trip = (
+        await tx
+          .select({ lr: transports.lrNumber, receipt: warehouseReceipts.status })
+          .from(transports)
+          .leftJoin(warehouseReceipts, eq(warehouseReceipts.transportId, transports.id))
+          .where(eq(transports.containerId, id))
+      )[0];
+      if (trip) throw conflict("in_use", M.tripDepends(container.number, trip.lr, trip.receipt !== null));
+      const orderIds = await lockContainerOrders(tx, id);
+      await tx.delete(clearings).where(eq(clearings.id, clearing.id));
+      await settleStages(tx, orderIds);
+      return container.number;
+    });
+    // ponytail: the server log is the deletion record; an audit table needs a migration, add one when audits are asked for.
+    console.info(`Clearing of container ${number} (${id}) deleted by user ${req.user!.id}.`);
+    res.status(204).end();
   });
 
   return router;
