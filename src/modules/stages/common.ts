@@ -55,6 +55,18 @@ export async function lockContainer(tx: Pick<Database, "select">, id: string) {
 
 export const closed = () => conflict("record_closed", STAGE_MESSAGES.closed);
 
+/** The orders with goods in the container, locked `for update` in id order (as CON-3 locks them); their ids. */
+export async function lockContainerOrders(tx: Pick<Database, "select" | "selectDistinct">, containerId: string) {
+  const owners = await tx
+    .selectDistinct({ id: orderLines.orderId })
+    .from(containerLines)
+    .innerJoin(orderLines, eq(orderLines.id, containerLines.orderLineId))
+    .where(eq(containerLines.containerId, containerId));
+  const ids = owners.map((owner) => owner.id);
+  if (ids.length > 0) await tx.select({ id: orders.id }).from(orders).where(inArray(orders.id, ids)).orderBy(asc(orders.id)).for("update");
+  return ids;
+}
+
 /** A container's goods, PO then line position, with each line's supplier. */
 export async function goodsIn(db: Pick<Database, "select">, containerId: string) {
   const rows = await db

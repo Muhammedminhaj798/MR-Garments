@@ -1,21 +1,29 @@
 import { and, eq, inArray, lt, sql } from "drizzle-orm";
 
 import type { Database } from "../db/client";
-import { containerLines, orderLines, orders, receipts } from "../db/schema";
+import { clearings, containerLines, orderLines, orders, receipts, transports, warehouseReceipts } from "../db/schema";
 
 /**
- * After a receipt or container is deleted (REC-4, CON-6): each order goes back to what it still has, never forward. An
- * order still in a container keeps its stage (those deletes refuse anything past loading); otherwise 2 with a receipt
- * left, else 1. Call it inside the delete's transaction, with the orders locked.
+ * After a receipt, container, clearing or trip is deleted (REC-4, CON-6, CLR-4, TRN-4): each order goes back to the
+ * furthest stage its remaining records reach, never forward. Over the containers holding its goods: a stocked warehouse
+ * receipt 6, a trip 5, a clearing 4, any container 3; else a receipt 2; else 1 (the moves of REC-3, CON-3 and
+ * moveOrdersToStage, read back). Call it inside the delete's transaction, with the orders locked.
  */
 export async function settleStages(tx: Pick<Database, "update">, orderIds: string[]) {
   if (orderIds.length === 0) return;
-  const loaded = sql`exists (select 1 from ${containerLines} join ${orderLines} on ${orderLines.id} = ${containerLines.orderLineId}
+  const mine = sql`(select ${containerLines.containerId} from ${containerLines} join ${orderLines} on ${orderLines.id} = ${containerLines.orderLineId}
     where ${orderLines.orderId} = ${orders.id})`;
-  const received = sql`exists (select 1 from ${receipts} where ${receipts.orderId} = ${orders.id})`;
+  const reached = sql`case
+    when exists (select 1 from ${warehouseReceipts} join ${transports} on ${transports.id} = ${warehouseReceipts.transportId}
+      where ${warehouseReceipts.status} = 'stocked' and ${transports.containerId} in ${mine}) then 6
+    when exists (select 1 from ${transports} where ${transports.containerId} in ${mine}) then 5
+    when exists (select 1 from ${clearings} where ${clearings.containerId} in ${mine}) then 4
+    when exists ${mine} then 3
+    when exists (select 1 from ${receipts} where ${receipts.orderId} = ${orders.id}) then 2
+    else 1 end`;
   await tx
     .update(orders)
-    .set({ stage: sql`case when ${loaded} then ${orders.stage} when ${received} then least(${orders.stage}, 2) else 1 end`, updatedAt: new Date() })
+    .set({ stage: sql`least(${orders.stage}, ${reached})`, updatedAt: new Date() })
     .where(inArray(orders.id, orderIds));
 }
 

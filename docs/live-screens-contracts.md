@@ -187,6 +187,37 @@ No migration. So an order's receipts and containers can be removed before ORD-6 
 - **ORD-4 change**: each `containers` entry adds `orders: string[]`, every PO in the container (this one included),
   in PO order, so the delete confirmation can say whose goods leave with it.
 
+## Deleting clearings and trips (2026-11-03)
+
+No migration. The next links of the chain, so a container's clearing and road trip can be undone before CON-6. Warehouse
+receipts (the stock and team quantities) and payments have no delete and stop the chain.
+
+| Id | Method and path | Permission | Owner |
+| --- | --- | --- | --- |
+| CLR-4 | `DELETE /clearings/:containerId` | clearing = Full (Management) | A5 (`stages/clearing.routes.ts`) |
+| TRN-4 | `DELETE /transports/:containerId` | transport = Full (Management) | A5 (`stages/transport.routes.ts`) |
+| CLR-1, TRN-1 | `GET /clearings`, `GET /transports` (changed) | unchanged | A5 |
+
+- **CLR-4** 204 when the container's clearing row is deleted, in progress or cleared. One transaction: the container,
+  then the clearing, locked `for update` (as CLR-3 and TRN-3 lock them), then the container's orders (id order). A trip
+  refuses it: 409 `in_use` "The clearing of container N can't be deleted: transport trip LR-x depends on it. Delete
+  that trip first." (with a warehouse receipt: "… transport trip LR-x and its warehouse receipt depend on it.
+  Warehouse receipts can't be removed in the app."). No clearing for the container, unknown or malformed id: 404
+  `not_found` "Clearing not found.". The container stays `arrived` (waiting for clearing again).
+- **TRN-4** 204 when the container's trip row is deleted, on the road or unloaded. One transaction: the container, then
+  the trip, locked (WH-3 locks the trip first), then the orders. A warehouse receipt, draft or stocked, refuses it: 409
+  `in_use` "Trip LR-x of container N can't be deleted: its warehouse receipt depends on it. Warehouse receipts can't
+  be removed in the app.". No trip, unknown or malformed id: 404 `not_found` "Trip not found.". The clearing stays;
+  the container is in TRN-1 `ready` again.
+- **Stages** (`settleStages`, now for REC-4, CON-6, CLR-4 and TRN-4): each affected order takes the furthest stage its
+  remaining records reach, never higher than before: over its containers a stocked warehouse receipt 6, a trip 5, a
+  clearing 4, any container 3; else a receipt 2; else 1.
+- Landed cost is computed from the records, so a deleted clearing's charges (or a trip's freight and handling) simply
+  leave it; payments are per order and never touched. Server log lines: "Clearing of container N (<id>) deleted by
+  user <id>." and "Trip LR-x of container N (<id>) deleted by user <id>.".
+- **CLR-1 change**: each row adds `trip: {lrNumber, status, warehouseReceipt: "draft" | "stocked" | null} | null`.
+  **TRN-1 change**: each trip row adds `warehouseReceipt: "draft" | "stocked" | null`. Both say what would refuse a delete.
+
 ## Notifications (NTF-1 to NTF-4, migration 0005)
 
 The binding contract is `D:\SDEC\MR Garments\docs\notifications-contract.md` (lead-owned). Migration 0005

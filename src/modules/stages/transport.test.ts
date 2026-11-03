@@ -85,6 +85,7 @@ describe("TRN-1 GET /transports", () => {
       bundlesReceived: null,
       status: "on_road",
       costInr: 2650,
+      warehouseReceipt: null,
     });
     expect(res.body.rows[1]).toMatchObject({ id: short.tripId, status: "unloaded", unloadedOn: indiaDay(-3), bundlesReceived: 3, costInr: 1000.5 });
     expect(res.body.ready).toEqual([

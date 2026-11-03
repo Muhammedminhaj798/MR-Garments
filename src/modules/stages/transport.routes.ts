@@ -3,12 +3,12 @@ import { Router } from "express";
 import { z } from "zod";
 
 import { requirePermission } from "../../auth/current-user";
-import { clearingAgents, clearings, containers, locations, transportCompanies, transports } from "../../db/schema";
+import { clearingAgents, clearings, containers, locations, transportCompanies, transports, warehouseReceipts } from "../../db/schema";
 import { conflict, notFound, validationFailed } from "../../http/errors";
 import { parse } from "../../http/validate";
 import type { RouteContext } from "../context";
 import { round2 } from "../orders/orders.routes";
-import { moveOrdersToStage } from "../stages-shared";
+import { moveOrdersToStage, settleStages } from "../stages-shared";
 import {
   addDays,
   closed,
@@ -20,6 +20,7 @@ import {
   inr,
   isUuid,
   lockContainer,
+  lockContainerOrders,
   optionalDate,
   required,
   STAGE_MESSAGES,
@@ -28,7 +29,8 @@ import {
 } from "./common";
 
 // Owner: A5. TRN-1 GET /transports, TRN-2 GET /transports/:containerId, TRN-3 PUT /transports/:containerId
-// (docs/wave3-contracts.md sections 2, 3 and 5; shapes in section 8). One road trip per container (default).
+// (docs/wave3-contracts.md sections 2, 3 and 5; shapes in section 8), TRN-4 DELETE /transports/:containerId. One road trip
+// per container (default).
 
 export const TRANSPORT_MESSAGES = {
   company: "Choose a transport company from the list.",
@@ -46,6 +48,9 @@ export const TRANSPORT_MESSAGES = {
   moreThanLoaded: "Bundles received can't be more than the bundles loaded.",
   receivedBy: "Enter who received the goods.",
   shortRemark: "Add a remark about the short bundles.",
+  // Proposed wording (TRN-4).
+  receiptDepends: (lr: string, number: string) =>
+    `Trip ${lr} of container ${number} can't be deleted: its warehouse receipt depends on it. Warehouse receipts can't be removed in the app.`,
 };
 const M = TRANSPORT_MESSAGES;
 
@@ -114,9 +119,12 @@ export function transportRoutes({ db }: RouteContext) {
           bundlesReceived: transports.bundlesReceived,
           status: transports.status,
           costInr: costOf,
+          // What depends on the trip (TRN-4 refuses while there is a warehouse receipt).
+          warehouseReceipt: warehouseReceipts.status,
         })
         .from(transports)
         .innerJoin(containers, eq(containers.id, transports.containerId))
+        .leftJoin(warehouseReceipts, eq(warehouseReceipts.transportId, transports.id))
         .innerJoin(transportCompanies, eq(transportCompanies.id, transports.transportCompanyId))
         .orderBy(desc(transports.loadedOn), desc(transports.createdAt)),
       db
@@ -265,6 +273,31 @@ export function transportRoutes({ db }: RouteContext) {
       return written[0]!;
     });
     res.json({ trip });
+  });
+
+  // TRN-4. Management only (transport Full). One transaction: the container, then the trip, locked as TRN-3 locks them;
+  // WH-3 locks the trip first, so no warehouse receipt can start between the check and the delete. A warehouse receipt
+  // (draft or stocked: the team quantities) refuses it. Only the trip row goes, unloaded or not: its freight and
+  // handling leave the landed cost (computed live), the container is ready for transport again, its orders step back
+  // (settleStages). The clearing and payments stay.
+  router.delete("/transports/:containerId", requirePermission("transport", "Full"), async (req, res) => {
+    const id = String(req.params.containerId);
+    if (!isUuid(id)) throw notFound("Trip");
+    const deleted = await db.transaction(async (tx) => {
+      const container = (await tx.select({ number: containers.number }).from(containers).where(eq(containers.id, id)).for("update"))[0];
+      const trip =
+        container && (await tx.select({ id: transports.id, lr: transports.lrNumber }).from(transports).where(eq(transports.containerId, id)).for("update"))[0];
+      if (!container || !trip) throw notFound("Trip");
+      const receipt = await tx.select({ id: warehouseReceipts.id }).from(warehouseReceipts).where(eq(warehouseReceipts.transportId, trip.id));
+      if (receipt.length > 0) throw conflict("in_use", M.receiptDepends(trip.lr, container.number));
+      const orderIds = await lockContainerOrders(tx, id);
+      await tx.delete(transports).where(eq(transports.id, trip.id));
+      await settleStages(tx, orderIds);
+      return { number: container.number, lr: trip.lr };
+    });
+    // ponytail: the server log is the deletion record; an audit table needs a migration, add one when audits are asked for.
+    console.info(`Trip ${deleted.lr} of container ${deleted.number} (${id}) deleted by user ${req.user!.id}.`);
+    res.status(204).end();
   });
 
   return router;
