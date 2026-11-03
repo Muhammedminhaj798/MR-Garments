@@ -1,10 +1,10 @@
 import { eq } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 
-import { locations, payments, teams, warehouseReceiptLines, warehouseReceipts } from "../../db/schema";
+import { type Currency, locations, orders, payments, suppliers, teams, warehouseReceiptLines, warehouseReceipts } from "../../db/schema";
 import { api, createTestContext, resetData, SEEDED, signInAs } from "../../test/harness";
 import { loadLandedCosts } from "../costs/landed-cost";
-import { indiaDay } from "../stock/fixtures";
+import { indiaDay, makeOrder } from "../stock/fixtures";
 import { STAGE_MESSAGES } from "./common";
 import { makeContainer, masters, stageOf, stageWriter, UNKNOWN } from "./fixtures";
 import { WAREHOUSE_MESSAGES as M } from "./warehouse.routes";
@@ -190,6 +190,7 @@ describe("WH-2 GET /warehouse-receipts/:transportId", () => {
       ],
       warehouses: [{ id: m.warehouse, name: "Main warehouse" }],
       cost: null,
+      previousOutstanding: null,
     });
     const managed = await get(`/warehouse-receipts/${trip.tripId}`, suresh);
     expect(managed.body.cost).toEqual({
@@ -344,5 +345,140 @@ describe("WH-3 PUT /warehouse-receipts/:transportId", () => {
     const results = await Promise.all([put(trip.tripId, body(split, { complete: true })), put(trip.tripId, body(split, { complete: true }), suresh)]);
     expect(results.map((res) => res.status).sort()).toEqual([200, 409]);
     expect((await ctx.db.select().from(warehouseReceipts).where(eq(warehouseReceipts.transportId, trip.tripId))).length).toBe(1);
+  });
+});
+
+describe("WH-2 previous supplier outstanding", () => {
+  let n = 0;
+  /** A supplier of its own (the other tests here share the default one), so its other orders are only this test's. */
+  async function supplier(currency: Currency = "CNY") {
+    const name = `Outstanding Supplier ${++n}`;
+    const [row] = await ctx.db.insert(suppliers).values({ name, currency }).returning({ id: suppliers.id });
+    return { id: row!.id, name };
+  }
+  const moveTo = (orderId: string, supplierId: string) => ctx.db.update(orders).set({ supplierId }).where(eq(orders.id, orderId));
+  /** An earlier order of `owner`: `quantity` Denim jeans at `rate`, in `currency`. */
+  async function earlier(owner: { name: string }, quantity: number, rate: number, currency: Currency = "CNY", stage = 1) {
+    const order = await makeOrder(ctx, { supplier: owner.name, stage, lines: [{ item: "Denim jeans", quantity, rateCny: rate }] });
+    if (currency !== "CNY") await ctx.db.update(orders).set({ currency }).where(eq(orders.id, order.id));
+    return order.id;
+  }
+  const pay = (orderId: string, amountCny: number, extra: Partial<typeof payments.$inferInsert> = {}) =>
+    ctx.db.insert(payments).values({
+      orderId,
+      kind: "Deposit",
+      payee: "supplier",
+      payeeRole: "supplier",
+      amountCny,
+      status: "paid",
+      paidOn: indiaDay(-10),
+      rateInr: 12,
+      mode: "Bank transfer",
+      ...extra,
+    });
+  const due = { status: "due", paidOn: null, rateInr: null, mode: null, dueDate: indiaDay(10) } as const;
+  const owedOn = async (tripId: string) => (await get(`/warehouse-receipts/${tripId}`, suresh)).body.previousOutstanding;
+
+  it("is empty for a supplier with no other orders, and leaves out the trip's own unpaid order", async () => {
+    const owner = await supplier("USD");
+    const trip = await write.unloaded();
+    await moveTo(trip.orders[0]!.id, owner.id);
+    // The trip's own ¥1,000 order is unpaid, but it is this PO, not a previous one.
+    expect(await owedOn(trip.tripId)).toEqual([{ supplierId: owner.id, supplier: owner.name, currency: "USD", orders: 0, byCurrency: [] }]);
+  });
+
+  it("adds each currency's unpaid balances apart, counting deposits and payments once, and never changes the cost", async () => {
+    const owner = await supplier();
+    const trip = await write.unloaded();
+    await moveTo(trip.orders[0]!.id, owner.id);
+    const before = (await get(`/warehouse-receipts/${trip.tripId}`, suresh)).body.cost;
+
+    // Fully paid: ¥2,000 = ¥500 deposit + ¥1,500 balance. Left out.
+    const paid = await earlier(owner, 200, 10);
+    await pay(paid, 500);
+    await pay(paid, 1500, { kind: "Balance" });
+    expect(await owedOn(trip.tripId)).toEqual([{ supplierId: owner.id, supplier: owner.name, currency: "CNY", orders: 0, byCurrency: [] }]);
+
+    // Partly paid: ¥1,000 - ¥300 deposit = ¥700. A scheduled (due) payment and an agent payment don't reduce it.
+    const partly = await earlier(owner, 100, 10);
+    await pay(partly, 300);
+    await pay(partly, 700, { kind: "Balance", ...due });
+    await pay(partly, 999, { payeeRole: "agent", payee: "Sino Freight", kind: "Balance" });
+    expect((await owedOn(trip.tripId))[0]).toMatchObject({ orders: 1, byCurrency: [{ currency: "CNY", amount: 700 }] });
+
+    // More outstanding orders: an unpaid finished one (¥500) and one rounded per order like the report (3 x 3.3333 = ¥10).
+    await earlier(owner, 50, 10, "CNY", 6);
+    await earlier(owner, 3, 3.3333);
+    // Other currencies stay apart: $300 - $100 = $200; INR paid in full (left out) and overpaid (left out, not netted).
+    const usd = await earlier(owner, 30, 10, "USD");
+    await pay(usd, 100, { rateInr: 88 });
+    const inrPaid = await earlier(owner, 100, 10, "INR");
+    await pay(inrPaid, 1000, { rateInr: 1 });
+    const inrOver = await earlier(owner, 100, 10, "INR");
+    await pay(inrOver, 1200, { rateInr: 1 });
+    // Another supplier's unpaid order never counts.
+    await earlier(await supplier(), 100, 10);
+
+    expect(await owedOn(trip.tripId)).toEqual([
+      {
+        supplierId: owner.id,
+        supplier: owner.name,
+        currency: "CNY",
+        orders: 4,
+        byCurrency: [
+          { currency: "CNY", amount: 1210 },
+          { currency: "USD", amount: 200 },
+        ],
+      },
+    ]);
+    // The cost so far (goods, total, pieces: so cost per piece and team costs) is exactly what it was.
+    expect((await get(`/warehouse-receipts/${trip.tripId}`, suresh)).body.cost).toEqual(before);
+  });
+
+  it("counts only orders placed before the trip's date: every PO on the trip, same-day and later orders are left out", async () => {
+    const owner = await supplier();
+    const placedOn = (orderId: string, day: string) => ctx.db.update(orders).set({ orderDate: day }).where(eq(orders.id, orderId));
+    // Two unpaid POs of this supplier (placed 30 days ago) on one trip loaded 6 days ago: neither counts.
+    const trip = await write.unloaded(
+      { orders: [[{ item: "Denim jeans", quantity: 10, rateCny: 10 }], [{ item: "Denim jeans", quantity: 20, rateCny: 10 }]] },
+      { loadedOn: indiaDay(-6) },
+    );
+    for (const order of trip.orders) await moveTo(order.id, owner.id);
+    // Before the trip: the day before (¥500) and long before ($70), unpaid, each in its own currency.
+    await placedOn(await earlier(owner, 50, 10), indiaDay(-7));
+    await placedOn(await earlier(owner, 7, 10, "USD"), indiaDay(-40));
+    // On the trip's day and after it: left out, even unpaid.
+    await placedOn(await earlier(owner, 100, 10), indiaDay(-6));
+    await placedOn(await earlier(owner, 200, 10, "USD"), indiaDay(-1));
+    expect(await owedOn(trip.tripId)).toEqual([
+      {
+        supplierId: owner.id,
+        supplier: owner.name,
+        currency: "CNY",
+        orders: 2,
+        byCurrency: [
+          { currency: "CNY", amount: 500 },
+          { currency: "USD", amount: 70 },
+        ],
+      },
+    ]);
+  });
+
+  it("lists each supplier of a mixed container, leaving out every PO on the trip; only for cost and payments viewers", async () => {
+    const [first, second] = [await supplier(), await supplier()];
+    const trip = await write.unloaded({
+      orders: [[{ item: "Denim jeans", quantity: 10, rateCny: 10 }], [{ item: "Denim jeans", quantity: 20, rateCny: 10 }]],
+    });
+    await moveTo(trip.orders[0]!.id, second.id);
+    await moveTo(trip.orders[1]!.id, first.id);
+    await earlier(first, 40, 10);
+    await earlier(second, 60, 10, "USD");
+    expect(await owedOn(trip.tripId)).toEqual([
+      { supplierId: first.id, supplier: first.name, currency: "CNY", orders: 1, byCurrency: [{ currency: "CNY", amount: 400 }] },
+      { supplierId: second.id, supplier: second.name, currency: "CNY", orders: 1, byCurrency: [{ currency: "USD", amount: 600 }] },
+    ]);
+    // Warehouse staff see neither the cost nor the supplier's money.
+    const staff = await get(`/warehouse-receipts/${trip.tripId}`);
+    expect([staff.status, staff.body.cost, staff.body.previousOutstanding]).toEqual([200, null, null]);
   });
 });

@@ -298,6 +298,12 @@ their names.
   orderedPieces, final} | null`: the `loadLandedCosts` figures of the container's orders added up (a part stays null
   while it is null for every order), `orderedPieces` = the quantity of every line of those orders (cost per piece so
   far = `totalInr / orderedPieces`), `final` when every one of those orders is final; null without landedCost >= View.
+  `previousOutstanding {supplierId, supplier, currency, orders, byCurrency {currency, amount}[]}[] | null` (2026-11-02,
+  informational, never part of `cost`): per supplier of the container's orders (by name), the unpaid balance of its
+  orders placed before the trip (`orders.order_date` < the trip's `transports.loaded_on`, so same-day and later orders
+  are out) other than the POs on this trip: order value - paid supplier payments (13.5's `supplierMoney`), only
+  orders with a balance above 0, one total per order currency, never converted; `orders` counts them. null unless the
+  user has landedCost >= View and payments >= View.
 - **WH-3** `PUT /warehouse-receipts/:transportId` body `SaveReceiptBody`: `locationId, receivedOn, receivedBy,
   bundlesReceived` (0+) required, `lines {orderLineId, teamId, quantity}[]` (default [], at most 1000, one per line and
   team), `complete`. 200 `{ receipt: {id, status} }`. 409 `not_unloaded`, `record_closed`. 422 fields `locationId`,

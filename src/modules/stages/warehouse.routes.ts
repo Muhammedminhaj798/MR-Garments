@@ -1,11 +1,13 @@
-import { and, asc, desc, eq, inArray, isNull, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gt, inArray, isNull, lt, notInArray, or, sql } from "drizzle-orm";
 import { alias } from "drizzle-orm/pg-core";
 import { Router } from "express";
 import { z } from "zod";
 
 import { requirePermission } from "../../auth/current-user";
+import type { Database } from "../../db/client";
 import {
   containers,
+  CURRENCIES,
   items,
   locations,
   orderLines,
@@ -20,7 +22,9 @@ import { conflict, notFound, validationFailed } from "../../http/errors";
 import { parse } from "../../http/validate";
 import { loadLandedCosts } from "../costs/landed-cost";
 import type { RouteContext } from "../context";
+import { atLeast, effectiveAccess } from "../../permissions/matrix";
 import { round2 } from "../orders/orders.routes";
+import { supplierMoney } from "../reports/reports";
 import { moveOrdersToStage } from "../stages-shared";
 import { canSeeCost, closed, complete, containerOrders, count, goodsIn, isUuid, required, STAGE_MESSAGES, todayInIndia } from "./common";
 
@@ -82,6 +86,53 @@ const teamOptions = (db: RouteContext["db"], extra: string[] = []) =>
     .from(teams)
     .where(or(eq(teams.status, "Active"), extra.length ? inArray(teams.id, extra) : undefined))
     .orderBy(asc(teams.createdAt), asc(teams.name));
+
+/**
+ * Previous supplier outstanding, shown beside the cost so far but never part of it: per supplier of the trip's orders,
+ * the unpaid balance of its orders placed before the trip (order date before the trip's `loadedOn`, so same-day orders
+ * are out) other than the trip's own POs: order value - paid supplier payments (the Payments per supplier rule), per
+ * order currency and never converted. Fully paid and overpaid orders are left out. Two queries, none per order.
+ */
+async function previousOutstanding(db: Database, orderIds: string[], tripDate: string) {
+  if (orderIds.length === 0) return [];
+  const tripSuppliers = db.select({ id: orders.supplierId }).from(orders).where(inArray(orders.id, orderIds));
+  const perOrder = db
+    .select({
+      supplierId: orders.supplierId,
+      currency: orders.currency,
+      balance: sql<number>`${supplierMoney.orderValueCny} - ${supplierMoney.paidCny}`.as("balance"),
+    })
+    .from(orders)
+    .where(and(inArray(orders.supplierId, tripSuppliers), notInArray(orders.id, orderIds), lt(orders.orderDate, tripDate)))
+    .as("per_order");
+  const [owners, owed] = await Promise.all([
+    db
+      .select({ id: suppliers.id, name: suppliers.name, currency: suppliers.currency })
+      .from(suppliers)
+      .where(inArray(suppliers.id, tripSuppliers))
+      .orderBy(asc(suppliers.name)),
+    db
+      .select({
+        supplierId: perOrder.supplierId,
+        currency: perOrder.currency,
+        amount: sql<number>`sum(${perOrder.balance})`.mapWith(Number),
+        orders: sql<number>`count(*)`.mapWith(Number),
+      })
+      .from(perOrder)
+      .where(gt(perOrder.balance, 0))
+      .groupBy(perOrder.supplierId, perOrder.currency),
+  ]);
+  return owners.map((owner) => {
+    const rows = owed.filter((row) => row.supplierId === owner.id);
+    return {
+      supplierId: owner.id,
+      supplier: owner.name,
+      currency: owner.currency,
+      orders: rows.reduce((total, row) => total + row.orders, 0),
+      byCurrency: CURRENCIES.flatMap((currency) => rows.filter((row) => row.currency === currency).map((row) => ({ currency, amount: round2(row.amount) }))),
+    };
+  });
+}
 
 export function warehouseRoutes({ db }: RouteContext) {
   const router = Router();
@@ -183,7 +234,7 @@ export function warehouseRoutes({ db }: RouteContext) {
   router.get("/warehouse-receipts/:transportId", requirePermission("warehouse", "View"), async (req, res) => {
     const id = String(req.params.transportId);
     if (!isUuid(id)) throw notFound("Trip");
-    const trip = (
+    const found = (
       await db
         .select({
           id: transports.id,
@@ -197,12 +248,15 @@ export function warehouseRoutes({ db }: RouteContext) {
           unloadedOn: transports.unloadedOn,
           destinationId: transports.destinationId,
           status: transports.status,
+          loadedOn: transports.loadedOn,
         })
         .from(transports)
         .innerJoin(containers, eq(containers.id, transports.containerId))
         .where(eq(transports.id, id))
     )[0];
-    if (!trip) throw notFound("Trip");
+    if (!found) throw notFound("Trip");
+    // The trip's date (loaded on the truck) is the cutoff of the previous outstanding; the response's trip leaves it out.
+    const { loadedOn: tripDate, ...trip } = found;
     const saved = (
       await db
         .select({
@@ -224,7 +278,9 @@ export function warehouseRoutes({ db }: RouteContext) {
       : [];
     const goods = await goodsIn(db, trip.containerId);
     const orderIds = [...new Set(goods.map((line) => line.orderId))];
-    const [teamList, warehouses, costs, ordered] = await Promise.all([
+    // Supplier money: only for users who see the cost and payments (Management today).
+    const seesOwed = canSeeCost(req.user!) && atLeast(effectiveAccess(req.user!.role, req.user!.stages, "payments"), "View");
+    const [teamList, warehouses, costs, ordered, owed] = await Promise.all([
       teamOptions(db, [...new Set(savedLines.map((line) => line.teamId))]),
       db
         .select({ id: locations.id, name: locations.name })
@@ -238,6 +294,7 @@ export function warehouseRoutes({ db }: RouteContext) {
             .from(orderLines)
             .where(inArray(orderLines.orderId, orderIds))
         : [{ pieces: 0 }],
+      seesOwed ? previousOutstanding(db, orderIds, tripDate) : null,
     ]);
 
     // Cost so far: the landed cost of the orders in this container, added up; null parts stay null until one exists.
@@ -261,6 +318,7 @@ export function warehouseRoutes({ db }: RouteContext) {
             final: list.length > 0 && list.every((cost) => cost.final),
           }
         : null,
+      previousOutstanding: owed,
     });
   });
 
