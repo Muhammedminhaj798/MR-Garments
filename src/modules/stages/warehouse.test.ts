@@ -435,6 +435,35 @@ describe("WH-2 previous supplier outstanding", () => {
     expect((await get(`/warehouse-receipts/${trip.tripId}`, suresh)).body.cost).toEqual(before);
   });
 
+  it("counts only orders placed before the trip's date: every PO on the trip, same-day and later orders are left out", async () => {
+    const owner = await supplier();
+    const placedOn = (orderId: string, day: string) => ctx.db.update(orders).set({ orderDate: day }).where(eq(orders.id, orderId));
+    // Two unpaid POs of this supplier (placed 30 days ago) on one trip loaded 6 days ago: neither counts.
+    const trip = await write.unloaded(
+      { orders: [[{ item: "Denim jeans", quantity: 10, rateCny: 10 }], [{ item: "Denim jeans", quantity: 20, rateCny: 10 }]] },
+      { loadedOn: indiaDay(-6) },
+    );
+    for (const order of trip.orders) await moveTo(order.id, owner.id);
+    // Before the trip: the day before (¥500) and long before ($70), unpaid, each in its own currency.
+    await placedOn(await earlier(owner, 50, 10), indiaDay(-7));
+    await placedOn(await earlier(owner, 7, 10, "USD"), indiaDay(-40));
+    // On the trip's day and after it: left out, even unpaid.
+    await placedOn(await earlier(owner, 100, 10), indiaDay(-6));
+    await placedOn(await earlier(owner, 200, 10, "USD"), indiaDay(-1));
+    expect(await owedOn(trip.tripId)).toEqual([
+      {
+        supplierId: owner.id,
+        supplier: owner.name,
+        currency: "CNY",
+        orders: 2,
+        byCurrency: [
+          { currency: "CNY", amount: 500 },
+          { currency: "USD", amount: 70 },
+        ],
+      },
+    ]);
+  });
+
   it("lists each supplier of a mixed container, leaving out every PO on the trip; only for cost and payments viewers", async () => {
     const [first, second] = [await supplier(), await supplier()];
     const trip = await write.unloaded({

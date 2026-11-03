@@ -300,7 +300,8 @@ their names.
   far = `totalInr / orderedPieces`), `final` when every one of those orders is final; null without landedCost >= View.
   `previousOutstanding {supplierId, supplier, currency, orders, byCurrency {currency, amount}[]}[] | null` (2026-11-02,
   informational, never part of `cost`): per supplier of the container's orders (by name), the unpaid balance of its
-  other orders (every PO on this trip left out): order value - paid supplier payments (13.5's `supplierMoney`), only
+  orders placed before the trip (`orders.order_date` < the trip's `transports.loaded_on`, so same-day and later orders
+  are out) other than the POs on this trip: order value - paid supplier payments (13.5's `supplierMoney`), only
   orders with a balance above 0, one total per order currency, never converted; `orders` counts them. null unless the
   user has landedCost >= View and payments >= View.
 - **WH-3** `PUT /warehouse-receipts/:transportId` body `SaveReceiptBody`: `locationId, receivedOn, receivedBy,

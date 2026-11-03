@@ -1,4 +1,4 @@
-import { and, asc, desc, eq, gt, inArray, isNull, notInArray, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gt, inArray, isNull, lt, notInArray, or, sql } from "drizzle-orm";
 import { alias } from "drizzle-orm/pg-core";
 import { Router } from "express";
 import { z } from "zod";
@@ -89,10 +89,11 @@ const teamOptions = (db: RouteContext["db"], extra: string[] = []) =>
 
 /**
  * Previous supplier outstanding, shown beside the cost so far but never part of it: per supplier of the trip's orders,
- * the unpaid balance of its other orders (order value - paid supplier payments, the Payments per supplier rule), per
+ * the unpaid balance of its orders placed before the trip (order date before the trip's `loadedOn`, so same-day orders
+ * are out) other than the trip's own POs: order value - paid supplier payments (the Payments per supplier rule), per
  * order currency and never converted. Fully paid and overpaid orders are left out. Two queries, none per order.
  */
-async function previousOutstanding(db: Database, orderIds: string[]) {
+async function previousOutstanding(db: Database, orderIds: string[], tripDate: string) {
   if (orderIds.length === 0) return [];
   const tripSuppliers = db.select({ id: orders.supplierId }).from(orders).where(inArray(orders.id, orderIds));
   const perOrder = db
@@ -102,7 +103,7 @@ async function previousOutstanding(db: Database, orderIds: string[]) {
       balance: sql<number>`${supplierMoney.orderValueCny} - ${supplierMoney.paidCny}`.as("balance"),
     })
     .from(orders)
-    .where(and(inArray(orders.supplierId, tripSuppliers), notInArray(orders.id, orderIds)))
+    .where(and(inArray(orders.supplierId, tripSuppliers), notInArray(orders.id, orderIds), lt(orders.orderDate, tripDate)))
     .as("per_order");
   const [owners, owed] = await Promise.all([
     db
@@ -233,7 +234,7 @@ export function warehouseRoutes({ db }: RouteContext) {
   router.get("/warehouse-receipts/:transportId", requirePermission("warehouse", "View"), async (req, res) => {
     const id = String(req.params.transportId);
     if (!isUuid(id)) throw notFound("Trip");
-    const trip = (
+    const found = (
       await db
         .select({
           id: transports.id,
@@ -247,12 +248,15 @@ export function warehouseRoutes({ db }: RouteContext) {
           unloadedOn: transports.unloadedOn,
           destinationId: transports.destinationId,
           status: transports.status,
+          loadedOn: transports.loadedOn,
         })
         .from(transports)
         .innerJoin(containers, eq(containers.id, transports.containerId))
         .where(eq(transports.id, id))
     )[0];
-    if (!trip) throw notFound("Trip");
+    if (!found) throw notFound("Trip");
+    // The trip's date (loaded on the truck) is the cutoff of the previous outstanding; the response's trip leaves it out.
+    const { loadedOn: tripDate, ...trip } = found;
     const saved = (
       await db
         .select({
@@ -290,7 +294,7 @@ export function warehouseRoutes({ db }: RouteContext) {
             .from(orderLines)
             .where(inArray(orderLines.orderId, orderIds))
         : [{ pieces: 0 }],
-      seesOwed ? previousOutstanding(db, orderIds) : null,
+      seesOwed ? previousOutstanding(db, orderIds, tripDate) : null,
     ]);
 
     // Cost so far: the landed cost of the orders in this container, added up; null parts stay null until one exists.
