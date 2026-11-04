@@ -218,6 +218,29 @@ receipts (the stock and team quantities) and payments have no delete and stop th
 - **CLR-1 change**: each row adds `trip: {lrNumber, status, warehouseReceipt: "draft" | "stocked" | null} | null`.
   **TRN-1 change**: each trip row adds `warehouseReceipt: "draft" | "stocked" | null`. Both say what would refuse a delete.
 
+## Deleting warehouse receipts (2026-11-04)
+
+No migration. The last link of the chain: with it, every stage record of a container can be undone in order
+(warehouse receipt, trip, clearing, container, receipt), then the order (ORD-6, still refused by payments).
+
+| Id | Method and path | Permission | Owner |
+| --- | --- | --- | --- |
+| WH-4 | `DELETE /warehouse-receipts/:transportId` | warehouse = Full (Management) | A5 (`stages/warehouse.routes.ts`) |
+| WH-1 | `GET /warehouse-receipts` (changed) | unchanged | A5 |
+
+- **WH-4** 204 when the trip's warehouse receipt is deleted with its own team lines, draft or stocked. One transaction:
+  the trip, then the receipt, locked `for update` (as WH-3 locks them), then the container's orders (id order). No
+  receipt for the trip, unknown or malformed id: 404 `not_found` "Warehouse receipt not found.". Nothing refuses it:
+  no table records stock movement, dispatch, transfer or sale, so nothing consumes stocked team quantities; landed
+  cost, WH-1, reports and the master-data "in use" checks read the receipts live. A stocked receipt is therefore
+  reversed by removing it: its pieces leave stock and the team totals, the orders' cost per piece is recomputed
+  (null and not final until stocked again), and the orders step back (`settleStages`: 6 -> 5 unless another of their
+  containers is stocked). A draft never moved a stage. The trip stays unloaded, waiting to be received again; the
+  clearing, payments and notifications are not touched. Server log line: "Warehouse receipt (draft|stocked) of trip
+  LR-x (<id>) deleted by user <id>.".
+- **WH-1 change**: each stocked row adds `lrNumber` and `bundlesReceived` (the receipt's); each `ready` trip adds
+  `draft: {receivedOn, location, bundlesReceived, received, teams: {teamId: pieces}} | null` (its draft's values).
+
 ## Notifications (NTF-1 to NTF-4, migration 0005)
 
 The binding contract is `D:\SDEC\MR Garments\docs\notifications-contract.md` (lead-owned). Migration 0005
