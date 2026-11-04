@@ -126,6 +126,16 @@ const loadedOf = () =>
     Number,
   );
 
+/**
+ * A receipt's goods already in containers: per line, the part of `loaded` the order's other receipts can't cover
+ * (received may never fall below loaded). REC-4 refuses while there is any; REC-1 names the containers holding them.
+ */
+const loadedFrom = <L extends { quantity: number | null; received: number; loaded: number }>(lines: L[]) =>
+  lines.flatMap((line) => {
+    const fromIt = line.quantity === null ? 0 : Math.min(line.quantity, line.loaded - (line.received - line.quantity));
+    return fromIt > 0 ? [{ ...line, fromIt }] : [];
+  });
+
 // Aliases render as their bare name inside sql``, so their FROM clauses name the table first.
 const earlier = alias(receipts, "earlier");
 const allLines = alias(orderLines, "all_lines");
@@ -164,7 +174,44 @@ export function stockRoutes({ db }: RouteContext) {
       .innerJoin(locations, eq(locations.id, receipts.locationId))
       .leftJoin(users, eq(users.id, receipts.receivedBy))
       .orderBy(desc(receipts.receivedOn), desc(receipts.createdAt));
-    res.json(rows.map(({ countedIn, receivedBy, ...row }) => ({ ...row, unit: unit(countedIn), receivedBy: receivedBy ?? "" })));
+    // Every receipt's lines, and the containers holding goods only that receipt covers: what REC-4 names when it refuses.
+    const lines = await db
+      .select({
+        receiptId: receiptLines.receiptId,
+        orderLineId: orderLines.id,
+        quantity: receiptLines.quantity,
+        item: items.name,
+        countedIn: items.countedIn,
+        received: receivedOf(),
+        loaded: loadedOf(),
+      })
+      .from(receiptLines)
+      .innerJoin(orderLines, eq(orderLines.id, receiptLines.orderLineId))
+      .innerJoin(items, eq(items.id, orderLines.itemId))
+      .orderBy(asc(orderLines.position));
+    const held = await db
+      .selectDistinct({ orderLineId: containerLines.orderLineId, number: containers.number })
+      .from(containerLines)
+      .innerJoin(containers, eq(containers.id, containerLines.containerId))
+      .orderBy(asc(containers.number));
+    const linesOf = new Map<string, typeof lines>();
+    for (const line of lines) {
+      if (!linesOf.has(line.receiptId)) linesOf.set(line.receiptId, []);
+      linesOf.get(line.receiptId)!.push(line);
+    }
+    res.json(
+      rows.map(({ countedIn, receivedBy, ...row }) => {
+        const own = linesOf.get(row.id) ?? [];
+        const loaded = new Set(loadedFrom(own).map((line) => line.orderLineId));
+        return {
+          ...row,
+          unit: unit(countedIn),
+          receivedBy: receivedBy ?? "",
+          lines: own.filter((line) => line.quantity > 0).map((line) => ({ item: line.item, unit: unit(line.countedIn), quantity: line.quantity })),
+          containers: [...new Set(held.filter((h) => loaded.has(h.orderLineId)).map((h) => h.number))],
+        };
+      }),
+    );
   });
 
   // REC-2. Orders at stage 1-2, with only the lines that still have something to receive. The money fields are null,
@@ -297,11 +344,7 @@ export function stockRoutes({ db }: RouteContext) {
         .where(eq(receipts.id, id))
         .orderBy(asc(orderLines.position));
       if (lines.length === 0) throw notFound("Receipt");
-      // What of this receipt is loaded: the part of `loaded` the other receipts can't cover.
-      const inContainers = lines.flatMap((line) => {
-        const fromIt = line.quantity === null ? 0 : Math.min(line.quantity, line.loaded - (line.received - line.quantity));
-        return fromIt > 0 ? [{ ...line, fromIt }] : [];
-      });
+      const inContainers = loadedFrom(lines);
       if (inContainers.length > 0) {
         const holding = await tx
           .selectDistinct({ number: containers.number })

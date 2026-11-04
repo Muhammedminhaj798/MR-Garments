@@ -83,9 +83,11 @@ describe("REC-3 POST /receipts and REC-1 GET /receipts", () => {
     expect(list.status).toBe(200);
     const rows = list.body.filter((row: { orderId: string }) => row.orderId === order.id);
     const common = { orderId: order.id, po: order.po, supplier: "Guangzhou Textile Co.", item: "Denim jeans", office: "Guangzhou office", ordered: 100, unit: "pcs" };
+    // `lines`: this receipt's lines received (the fabric received as 0 is left out); nothing loaded, so no containers.
+    const jeans = (quantity: number) => ({ lines: [{ item: "Denim jeans", unit: "pcs", quantity }], containers: [] });
     expect(rows).toEqual([
-      { ...common, id: second.body.receipt.id, receivedOn: indiaDay(0), thisReceipt: 50, totalSoFar: 90, bundles: 3, receivedBy: "Wang Fang" },
-      { ...common, id: first.body.receipt.id, receivedOn: indiaDay(-2), thisReceipt: 40, totalSoFar: 40, bundles: 2, receivedBy: "Chen Yu" },
+      { ...common, ...jeans(50), id: second.body.receipt.id, receivedOn: indiaDay(0), thisReceipt: 50, totalSoFar: 90, bundles: 3, receivedBy: "Wang Fang" },
+      { ...common, ...jeans(40), id: first.body.receipt.id, receivedOn: indiaDay(-2), thisReceipt: 40, totalSoFar: 40, bundles: 2, receivedBy: "Chen Yu" },
     ]);
   });
 
