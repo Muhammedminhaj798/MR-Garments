@@ -241,6 +241,27 @@ No migration. The last link of the chain: with it, every stage record of a conta
 - **WH-1 change**: each stocked row adds `lrNumber` and `bundlesReceived` (the receipt's); each `ready` trip adds
   `draft: {receivedOn, location, bundlesReceived, received, teams: {teamId: pieces}} | null` (its draft's values).
 
+## Deleting deposits and payments (2026-11-04)
+
+No migration. Deposits and payments are one table, `payments`: `kind` Deposit or Balance, `status` paid or due, paid
+to the supplier or a shipping agent, in the order's currency with its own `rateInr`. Nothing references a payment.
+
+| Id | Method and path | Permission | Owner |
+| --- | --- | --- | --- |
+| PAY-3 | `DELETE /payments/:id` | payments = Full (Management) | BE-payments (`payments/payments.routes.ts`) |
+
+- **PAY-3** 204 when the payment row is deleted, any kind or status. One transaction: the payment's order locked `for
+  update` (as ORD-5 and ORD-6 lock it), then the payment. Malformed, unknown or already deleted id: 404 `not_found`
+  "Payment not found.". Accounts (payments Enter) records payments but can't delete them: 403.
+- Nothing refuses it: there is no reconciliation, settlement or allocation in the system, and no figure is stored.
+  Every reader sums the remaining payments live, each at its own rate: ORD-1/ORD-4 and PAY-1 `paidCny`, `paidInr`,
+  `balanceCny`, `nextDue`; payments-per-supplier and supplier detail (supplier payments only); landed cost `goodsInr`
+  (supplier) or `seaFreightInr` (agent); REC-2 `depositsPaidCny`; WH-2 previous supplier outstanding; the dashboard's
+  due-in-30-days. ORD-5's "total can't be less than paid" can't be broken by a delete; ORD-6 no longer counts it.
+- The order, its other payments and the payment-recorded notification stay. Server log line: "Payment <id> (paid
+  Deposit ¥300.00 to Supplier) of PO-x deleted by user <id>.". There is no audit table or soft delete (that would
+  need a migration), so the deleted record itself is gone from the database.
+
 ## Notifications (NTF-1 to NTF-4, migration 0005)
 
 The binding contract is `D:\SDEC\MR Garments\docs\notifications-contract.md` (lead-owned). Migration 0005
