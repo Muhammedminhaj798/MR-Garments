@@ -76,7 +76,9 @@ backend returns exactly those shapes. Summary:
   kind, payee, payeeRole, amountCny, status, paidOn, dueDate, rateInr, mode}[]` (`currency` is the order's).
 - **REC-1** `ReceiptListItem[]` (received date, newest first): `id, receivedOn, orderId, po, supplier, item, office,
   ordered, unit, thisReceipt, totalSoFar, bundles, receivedBy` (user name). Main line figures; `totalSoFar` counts this
-  receipt and every earlier one.
+  receipt and every earlier one. Also `lines {item, unit, quantity}[]` (this receipt; lines received as 0 left out) and
+  `containers` (numbers): the containers holding goods only this receipt covers, which REC-4 names when it refuses;
+  empty when it can be deleted.
 - **REC-2** `ReceiptOptions`: active China `offices {id, name}[]` and `orders {orderId, po, supplier, currency, orderValueCny,
   depositsPaidCny, lines {orderLineId, item, unit, ordered, receivedEarlier, unitPriceCny}[]}[]` for orders at stage
   1-2 with something left to receive. `orderValueCny`, `depositsPaidCny` and `unitPriceCny` are null unless the user

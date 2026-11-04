@@ -143,6 +143,45 @@ describe("REC-4 DELETE /receipts/:id", () => {
     expect(await stageOf(ctx, order.id)).toBe(3);
   });
 
+  it("REC-1 gives each receipt's lines and the containers REC-4 would name (none when the other receipts cover it)", async () => {
+    const order = await makeOrder(ctx, {
+      stage: 2,
+      lines: [
+        { item: "Denim jeans", quantity: 100, rateCny: 10 },
+        { item: "Track pants", quantity: 20, rateCny: 5 },
+      ],
+    });
+    const [jeans, pants] = order.lineIds as [string, string];
+    const first = await receive(ctx, order.id, [
+      { orderLineId: jeans, quantity: 60 },
+      { orderLineId: pants, quantity: 0 },
+    ]);
+    const second = await receive(ctx, order.id, [
+      { orderLineId: jeans, quantity: 40 },
+      { orderLineId: pants, quantity: 20 },
+    ]);
+    const a = await load([{ orderLineId: jeans, quantity: 70 }]);
+    const b = await load([{ orderLineId: pants, quantity: 5 }]);
+    const rowOf = async (id: string) => ((await get("/receipts")).body as { id: string }[]).find((row) => row.id === id);
+    // Jeans: 100 received, 70 loaded, so both receipts hold some (without either, less than 70 is left). Pants: only
+    // the second has them, and 5 are loaded. A line received as 0 isn't listed.
+    expect(await rowOf(first)).toMatchObject({ lines: [{ item: "Denim jeans", unit: "pcs", quantity: 60 }], containers: [a.number] });
+    expect(await rowOf(second)).toMatchObject({
+      lines: [
+        { item: "Denim jeans", unit: "pcs", quantity: 40 },
+        { item: "Track pants", unit: "pcs", quantity: 20 },
+      ],
+      containers: [a.number, b.number],
+    });
+    // Covered: another 30 jeans received, so 130 - 60 = 70 still cover what is loaded without the first.
+    await receive(ctx, order.id, [{ orderLineId: jeans, quantity: 30 }]);
+    expect(await rowOf(first)).toMatchObject({ containers: [] });
+    expect((await del(`/receipts/${first}`)).status).toBe(204);
+    // As REC-4 says for the second: still in both containers.
+    expect(await rowOf(second)).toMatchObject({ containers: [a.number, b.number] });
+    expect((await del(`/receipts/${second}`)).status).toBe(409);
+  });
+
   it("answers 404 for an unknown or deleted receipt; of two deletes at once, one succeeds", async () => {
     expect((await del(`/receipts/${UNKNOWN}`)).status).toBe(404);
     expect((await del("/receipts/not-a-receipt")).status).toBe(404);
