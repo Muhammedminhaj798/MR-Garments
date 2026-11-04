@@ -4,15 +4,16 @@ import { z } from "zod";
 
 import { requirePermission } from "../../auth/current-user";
 import { orders, PAYEE_ROLES, PAYMENT_KINDS, payments, shippingAgents, suppliers } from "../../db/schema";
-import { validationFailed } from "../../http/errors";
+import { notFound, validationFailed } from "../../http/errors";
 import { parse } from "../../http/validate";
 import type { RouteContext } from "../context";
 import { money, notify } from "../notifications/notify";
 import { rateProblem } from "../orders/orders.routes";
+import { isUuid } from "../stages/common";
 
-// Owner: BE-payments. PAY-2 POST /payments (docs/live-screens-contracts.md, "Five-tab completion"). Payments are
-// records only: nothing here moves money. The amount is in the order's currency; `rateInr` is INR per 1 of it (none, stored
-// as 1, for an INR order).
+// Owner: BE-payments. PAY-2 POST /payments (docs/live-screens-contracts.md, "Five-tab completion"), PAY-3 DELETE
+// /payments/:id. Payments are records only: nothing here moves money. The amount is in the order's currency; `rateInr`
+// is INR per 1 of it (none, stored as 1, for an INR order).
 
 export const MESSAGES = {
   order: "Choose an order from the list.",
@@ -111,6 +112,38 @@ export function paymentsRoutes({ db }: RouteContext) {
       return created;
     });
     res.status(201).json({ payment });
+  });
+
+  // PAY-3. Management only (payments Full). A deposit or a balance payment, paid or due. One transaction: the payment's
+  // order locked first (as ORD-5 and ORD-6 lock it, so an order edit or delete can't interleave), then the payment. Only
+  // that row goes. No figure is stored: the order's paid, INR and balance, the supplier's paid and outstanding, landed
+  // cost (goods or sea freight), deposits paid on receiving, reports and the dashboard all sum the payments live, each at
+  // its own rate. Nothing links to a payment (no reconciliation, settlement or allocation exists), so nothing refuses it.
+  // The order, its other payments and the payment-recorded notification stay.
+  router.delete("/payments/:id", requirePermission("payments", "Full"), async (req, res) => {
+    const id = String(req.params.id);
+    if (!isUuid(id)) throw notFound("Payment");
+    const deleted = await db.transaction(async (tx) => {
+      const found = (await tx.select({ orderId: payments.orderId }).from(payments).where(eq(payments.id, id)))[0];
+      if (!found) throw notFound("Payment");
+      const order = (await tx.select({ po: orders.poNumber, currency: orders.currency }).from(orders).where(eq(orders.id, found.orderId)).for("update"))[0]!;
+      // Read again under the lock: a delete of the same payment that got there first leaves nothing (404).
+      const row = (
+        await tx
+          .select({ kind: payments.kind, status: payments.status, payee: payments.payee, amountCny: payments.amountCny })
+          .from(payments)
+          .where(eq(payments.id, id))
+          .for("update")
+      )[0];
+      if (!row) throw notFound("Payment");
+      await tx.delete(payments).where(eq(payments.id, id));
+      return { ...row, ...order };
+    });
+    // ponytail: the server log is the deletion record; an audit table needs a migration, add one when audits are asked for.
+    console.info(
+      `Payment ${id} (${deleted.status} ${deleted.kind} ${money(deleted.amountCny, deleted.currency)} to ${deleted.payee}) of ${deleted.po} deleted by user ${req.user!.id}.`,
+    );
+    res.status(204).end();
   });
 
   return router;
