@@ -25,11 +25,24 @@ import type { RouteContext } from "../context";
 import { atLeast, effectiveAccess } from "../../permissions/matrix";
 import { round2 } from "../orders/orders.routes";
 import { supplierMoney } from "../reports/reports";
-import { moveOrdersToStage } from "../stages-shared";
-import { canSeeCost, closed, complete, containerOrders, count, goodsIn, isUuid, required, STAGE_MESSAGES, todayInIndia } from "./common";
+import { moveOrdersToStage, settleStages } from "../stages-shared";
+import {
+  canSeeCost,
+  closed,
+  complete,
+  containerOrders,
+  count,
+  goodsIn,
+  isUuid,
+  lockContainerOrders,
+  required,
+  STAGE_MESSAGES,
+  todayInIndia,
+} from "./common";
 
 // Owner: A5. WH-1 GET /warehouse-receipts, WH-2 GET /warehouse-receipts/:transportId, WH-3 PUT
-// /warehouse-receipts/:transportId (docs/wave3-contracts.md sections 2, 3 and 5; shapes in section 8).
+// /warehouse-receipts/:transportId (docs/wave3-contracts.md sections 2, 3 and 5; shapes in section 8), WH-4 DELETE
+// /warehouse-receipts/:transportId.
 // Cost figures come from loadLandedCosts and are null unless the user has landedCost >= View (section 3).
 
 export const WAREHOUSE_MESSAGES = {
@@ -78,6 +91,8 @@ type RowTotals = {
 };
 
 const mainLine = alias(orderLines, "main_line");
+/** A draft receipt's warehouse, next to the trip's destination. */
+const draftLocation = alias(locations, "draft_location");
 
 /** Active teams, plus `extra` (teams already on a saved receipt), in creation order. */
 const teamOptions = (db: RouteContext["db"], extra: string[] = []) =>
@@ -150,6 +165,9 @@ export function warehouseRoutes({ db }: RouteContext) {
           locationId: locations.id,
           locationName: locations.name,
           container: containers.number,
+          // The receipt's trip and bundles, for the delete confirmation (WH-4).
+          lrNumber: transports.lrNumber,
+          bundlesReceived: warehouseReceipts.bundlesReceived,
           orderId: orders.id,
           po: orders.poNumber,
           item: items.name,
@@ -179,11 +197,17 @@ export function warehouseRoutes({ db }: RouteContext) {
           bundlesReceived: transports.bundlesReceived,
           destination: locations.name,
           receiptStatus: warehouseReceipts.status,
+          // A draft's own values, for the delete confirmation (WH-4).
+          draftId: warehouseReceipts.id,
+          draftReceivedOn: warehouseReceipts.receivedOn,
+          draftBundles: warehouseReceipts.bundlesReceived,
+          draftLocation: draftLocation.name,
         })
         .from(transports)
         .innerJoin(containers, eq(containers.id, transports.containerId))
         .innerJoin(locations, eq(locations.id, transports.destinationId))
         .leftJoin(warehouseReceipts, eq(warehouseReceipts.transportId, transports.id))
+        .leftJoin(draftLocation, eq(draftLocation.id, warehouseReceipts.locationId))
         .where(and(eq(transports.status, "unloaded"), or(isNull(warehouseReceipts.id), eq(warehouseReceipts.status, "draft"))))
         .orderBy(asc(transports.unloadedOn), asc(transports.createdAt)),
       teamOptions(db),
@@ -199,13 +223,26 @@ export function warehouseRoutes({ db }: RouteContext) {
         .orderBy(asc(locations.createdAt), asc(locations.name)),
     ]);
 
-    const [costs, byContainer] = await Promise.all([
+    const draftIds = ready.flatMap((trip) => (trip.draftId ? [trip.draftId] : []));
+    const [costs, byContainer, draftLines] = await Promise.all([
       canSeeCost(req.user!) ? loadLandedCosts(db, [...new Set(lines.map((line) => line.orderId))]) : null,
       containerOrders(
         db,
         ready.map((trip) => trip.containerId),
       ),
+      draftIds.length
+        ? db
+            .select({ receiptId: warehouseReceiptLines.receiptId, teamId: warehouseReceiptLines.teamId, quantity: warehouseReceiptLines.quantity })
+            .from(warehouseReceiptLines)
+            .where(inArray(warehouseReceiptLines.receiptId, draftIds))
+        : [],
     ]);
+    /** A draft's pieces in all and per team id. */
+    const draftSplit = (receiptId: string) => {
+      const teamsOf: Record<string, number> = {};
+      for (const line of draftLines) if (line.receiptId === receiptId) teamsOf[line.teamId] = (teamsOf[line.teamId] ?? 0) + line.quantity;
+      return { received: Object.values(teamsOf).reduce((sum, pieces) => sum + pieces, 0), teams: teamsOf };
+    };
     // Lines arrive grouped by receipt and PO, so the rows keep that order.
     const rows = new Map<string, Omit<(typeof lines)[number], "teamId" | "quantity" | "locationId" | "locationName"> & RowTotals>();
     for (const { teamId, quantity, locationId, locationName, ...line } of lines) {
@@ -224,7 +261,11 @@ export function warehouseRoutes({ db }: RouteContext) {
     }
     res.json({
       rows: [...rows.values()],
-      ready: ready.map((trip) => ({ ...trip, orders: byContainer.get(trip.containerId)?.orders ?? [] })),
+      ready: ready.map(({ draftId, draftReceivedOn, draftBundles, draftLocation: location, ...trip }) => ({
+        ...trip,
+        orders: byContainer.get(trip.containerId)?.orders ?? [],
+        draft: draftId ? { receivedOn: draftReceivedOn!, location: location!, bundlesReceived: draftBundles!, ...draftSplit(draftId) } : null,
+      })),
       teams: teamList,
       warehouses,
     });
@@ -377,6 +418,30 @@ export function warehouseRoutes({ db }: RouteContext) {
       return written[0]!;
     });
     res.json({ receipt });
+  });
+
+  // WH-4. Management only (warehouse Full). One transaction: the trip, then its receipt, locked as WH-3 locks them,
+  // then the container's orders. Draft or stocked: nothing in the system consumes stocked quantities (no stock movement,
+  // dispatch or transfer records exist; landed cost, the lists and reports read the receipt live), so reversing a
+  // receipt is removing it with its own team lines. Stock, team totals and cost per piece follow from the remaining
+  // records; the trip stays unloaded, waiting to be received again; its orders step back (settleStages: 6 -> 5 unless
+  // another of their containers is stocked). Payments, the trip and the clearing are never touched.
+  router.delete("/warehouse-receipts/:transportId", requirePermission("warehouse", "Full"), async (req, res) => {
+    const id = String(req.params.transportId);
+    if (!isUuid(id)) throw notFound("Warehouse receipt");
+    const deleted = await db.transaction(async (tx) => {
+      const trip = (await tx.select({ containerId: transports.containerId, lr: transports.lrNumber }).from(transports).where(eq(transports.id, id)).for("update"))[0];
+      const receipt =
+        trip && (await tx.select({ id: warehouseReceipts.id, status: warehouseReceipts.status }).from(warehouseReceipts).where(eq(warehouseReceipts.transportId, id)).for("update"))[0];
+      if (!trip || !receipt) throw notFound("Warehouse receipt");
+      const orderIds = await lockContainerOrders(tx, trip.containerId);
+      await tx.delete(warehouseReceipts).where(eq(warehouseReceipts.id, receipt.id));
+      await settleStages(tx, orderIds);
+      return { lr: trip.lr, status: receipt.status };
+    });
+    // ponytail: the server log is the deletion record; an audit table needs a migration, add one when audits are asked for.
+    console.info(`Warehouse receipt (${deleted.status}) of trip ${deleted.lr} (${id}) deleted by user ${req.user!.id}.`);
+    res.status(204).end();
   });
 
   return router;

@@ -108,7 +108,16 @@ describe("WH-1 GET /warehouse-receipts", () => {
     ]);
     expect(res.body.warehouses).toEqual([{ id: m.warehouse, name: "Main warehouse" }]);
     const receipt = (await receiptOf(shared.tripId))!;
-    const common = { receiptId: receipt.id, transportId: shared.tripId, receivedOn: indiaDay(-4), receivedBy: "Joseph M", container: shared.number, supplier: "Guangzhou Textile Co." };
+    const common = {
+      receiptId: receipt.id,
+      transportId: shared.tripId,
+      receivedOn: indiaDay(-4),
+      receivedBy: "Joseph M",
+      container: shared.number,
+      lrNumber: "LR-558214",
+      bundlesReceived: 4,
+      supplier: "Guangzhou Textile Co.",
+    };
     const location = { id: m.warehouse, name: "Main warehouse" };
     expect(res.body.rows).toEqual([
       { ...common, id: `${receipt.id}:${jeans!.id}`, orderId: jeans!.id, po: jeans!.po, item: "Denim jeans", location, received: 100, teams: { [m.retail]: 60, [m.wholesale]: 40 }, costPerPieceInr: null },
@@ -127,8 +136,9 @@ describe("WH-1 GET /warehouse-receipts", () => {
         destination: "Main warehouse",
         receiptStatus: "draft",
         orders: [draft.orders[0]!.po],
+        draft: { receivedOn: indiaDay(-1), location: "Main warehouse", bundlesReceived: 4, received: 0, teams: {} },
       },
-      expect.objectContaining({ transportId: waiting.tripId, unloadedOn: indiaDay(-2), receiptStatus: null }),
+      expect.objectContaining({ transportId: waiting.tripId, unloadedOn: indiaDay(-2), receiptStatus: null, draft: null }),
     ]);
 
     // Management sees each order's landed cost per piece: ₹12,000 + ₹37,050 clearing + ₹2,650 transport over 100 pcs.
