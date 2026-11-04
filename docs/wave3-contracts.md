@@ -130,9 +130,19 @@ are never deleted or changed by this.
 - Race-safe: the row is locked `FOR UPDATE` before the counts, so a reference saved meanwhile (its foreign-key check
   key-share locks the row) is either counted or fails its own check. Every foreign key to these tables is `ON DELETE NO ACTION`,
   so a use the counts missed still refuses the delete: 409 `in_use` with "used by other records". No migration.
-- Known limit: agent payments recorded before the agent was renamed carry the old name, so they aren't counted.
-- Frontend: `SettingsDialogFooter`'s `remove` (`{ path, name, noun }`) puts Delete on each edit dialog; it confirms
-  ("Delete <name>?"), then toasts "<Noun> deleted" and reloads like a save, or toasts the 409 message and stays open.
+- A paid shipping agent keeps its name (2026-11-04): `PATCH /shipping-agents/:id` with a `name` that differs from
+  the current one other than in letter case is 422 `validation_failed`, field `name`: "<n> payment(s) is/are recorded
+  under this name, so it can't change.", while agent payments carry the current name; nothing is saved. Other fields
+  and an agent with no payments are unaffected. This keeps DELETE counting them. New agent payments are tied to a
+  current agent: PAY-2 (by `agentId`) and ORD-3 deposits (by name, any letter case; otherwise 422 on `deposits`) read
+  the active agent inside their transaction with its row locked `FOR SHARE`, so a rename or DELETE of that agent waits
+  for them and then counts them. Known limit: payments recorded under an earlier name before 2026-11-04 still carry
+  that name and match no agent (check: `select distinct payee from payments where payee_role = 'agent' and lower(payee)
+  not in (select lower(name) from shipping_agents)`).
+- Frontend: each tab's `<tab>Deletable(row)` feeds both the edit dialog's Delete (`SettingsDialogFooter`'s `remove`)
+  and the red Delete next to Edit on every table row (`SettingsList`'s `deletable`, `DeleteSettingsRecord`). It
+  confirms with the record's type, name, reference, details and what can use it, then toasts "<Noun> deleted" and
+  reloads; a 409 turns it into "Deactivate <noun> instead?" (or "Can't delete <noun>" when already inactive).
 
 ## 5. Clearing, Transport, Warehouse (Agent 5)
 

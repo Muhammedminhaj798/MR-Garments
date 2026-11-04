@@ -4,7 +4,7 @@ import { z } from "zod";
 
 import { requirePermission } from "../../auth/current-user";
 import { containers, payments, shippingAgents, STATUSES } from "../../db/schema";
-import { conflict, GENERIC_MESSAGE, HttpError, notFound } from "../../http/errors";
+import { conflict, GENERIC_MESSAGE, HttpError, notFound, validationFailed } from "../../http/errors";
 import { parse } from "../../http/validate";
 import type { RouteContext } from "../context";
 import { deleteRoute } from "./delete-route";
@@ -15,6 +15,7 @@ import { contactSearch, creationOrder, listRoute } from "./list-query";
 
 const NAME_EMPTY = "Enter the shipping agent name.";
 const NAME_TAKEN = "A shipping agent with this name already exists.";
+const NAME_PAID = (n: number) => `${n} payment${n === 1 ? " is" : "s are"} recorded under this name, so it can't change.`;
 const tooLong = (max: number) => `Use ${max} characters or fewer.`;
 
 const isUuid = (value: string) => z.uuid().safeParse(value).success;
@@ -73,10 +74,32 @@ export function shippingAgentsRoutes({ db }: RouteContext) {
     const input = parse(changes, req.body);
     if (Object.keys(input).length === 0) throw new HttpError(400, "bad_request", GENERIC_MESSAGE);
     const updated = await db
-      .update(shippingAgents)
-      .set(input)
-      .where(eq(shippingAgents.id, id))
-      .returning({ id: shippingAgents.id })
+      .transaction(async (tx) => {
+        // Agent payments keep the agent's name, not its id: a rename would cut them off from the agent (and let DELETE
+        // miss them), so a paid agent keeps its name; only its letter case may change. The row lock makes a rename or
+        // delete of the same agent wait.
+        // PAY-2 and ORD-3 read an agent payee's name under a share lock on this row, so they wait for a rename here.
+        if (input.name !== undefined) {
+          // Compared in SQL with lower(), as DELETE and the unique name index compare them.
+          const current = (
+            await tx
+              .select({ name: shippingAgents.name, sameName: sql<boolean>`lower(${shippingAgents.name}) = lower(${input.name})` })
+              .from(shippingAgents)
+              .where(eq(shippingAgents.id, id))
+              .for("update")
+          )[0];
+          if (current && !current.sameName) {
+            const paid = (
+              await tx
+                .select({ n: count() })
+                .from(payments)
+                .where(and(eq(payments.payeeRole, "agent"), sql`lower(${payments.payee}) = lower(${current.name})`))
+            )[0]!.n;
+            if (paid > 0) throw validationFailed({ name: NAME_PAID(paid) });
+          }
+        }
+        return tx.update(shippingAgents).set(input).where(eq(shippingAgents.id, id)).returning({ id: shippingAgents.id });
+      })
       .catch(nameTakenAsConflict);
     if (!updated[0]) throw notFound("Shipping agent");
     res.json({ shippingAgent: (await load(id))[0] });

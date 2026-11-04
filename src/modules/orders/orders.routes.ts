@@ -227,6 +227,16 @@ export function ordersRoutes({ db }: RouteContext) {
             .returning({ id: orders.id, po: orders.poNumber });
           const orderId = created[0]!.id;
           await tx.insert(orderLines).values(input.lines.map((entry, position) => ({ ...entry, orderId, position })));
+          // An agent deposit keeps the agent's name, not its id: it must name an active agent (any letter case), read
+          // with the row share-locked, so a rename or delete of that agent waits for this order and then counts it.
+          for (const payee of new Set(input.deposits.filter((entry) => entry.payeeRole === "agent").map((entry) => entry.payee))) {
+            const agent = await tx
+              .select({ id: shippingAgents.id })
+              .from(shippingAgents)
+              .where(and(eq(shippingAgents.status, "Active"), sql`lower(${shippingAgents.name}) = lower(${payee})`))
+              .for("share");
+            if (agent.length === 0) throw validationFailed({ deposits: M.payee });
+          }
           if (input.deposits.length > 0) {
             await tx
               .insert(payments)
