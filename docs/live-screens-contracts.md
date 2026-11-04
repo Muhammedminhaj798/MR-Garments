@@ -67,7 +67,9 @@ backend returns exactly those shapes. Summary:
   `deposits`: "Enter the INR rate." / "Leave the rate empty for an INR order.").
   201 `{ order: { id, po } }`. 422 `validation_failed` with fields `supplierId`, `orderDate`, `deliveryDate`
   ("The delivery date can't be before the order date."), `currency` ("Choose CNY, USD or INR."), `lines`, `deposits`. Inactive or unknown supplier/item: 422 on
-  that field. One transaction.
+  that field. An agent deposit's `payee` must be an active shipping agent's name (any letter case), read inside the
+  transaction with the agent's row locked `FOR SHARE`, otherwise 422 on `deposits` "Choose who the deposit was paid
+  to." (2026-11-04, so agent payments always match an agent: see wave3-contracts 4.1). One transaction.
 - **CAL-1** `DeliveryItem[]` (due date, oldest first): orders at stage 1-2: `orderId, po, supplier` (name), `item,
   quantity, unit, received, due` (= deliveryDate), `fullyReceived` (every line has received >= its quantity; `item`,
   `quantity` and `received` are the main line's). The frontend leaves fully received orders off the calendar.

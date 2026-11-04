@@ -167,6 +167,28 @@ describe("a record in use is refused with 409 in_use and kept", () => {
     await expectInUse("shippingAgent", other, "1 agent payment");
   });
 
+  it("shipping agent: once paid it keeps its name (only the case may change), so DELETE still finds its payments", async () => {
+    const id = await add("shippingAgent", "Harbour Line");
+    const order = await makeOrder(ctx, { lines: [{ item: "Polo shirts", quantity: 10, rateCny: 5 }] });
+    await ctx.db.insert(payments).values({ orderId: order.id, kind: "Deposit", payee: "Harbour Line", payeeRole: "agent", amountCny: 50, status: "paid", paidOn: indiaDay(-1), rateInr: 12, mode: "Wire" });
+    const rename = (agent: string, name: string) => http.patch(`/shipping-agents/${agent}`, { name }).set("Cookie", management);
+
+    const refused = await rename(id, "Harbour Lines Ltd");
+    expect(refused.status, JSON.stringify(refused.body)).toBe(422);
+    expect(refused.body.error).toMatchObject({ code: "validation_failed", fields: { name: "1 payment is recorded under this name, so it can't change." } });
+    expect((await ctx.db.select({ name: shippingAgents.name }).from(shippingAgents).where(eq(shippingAgents.id, id)))[0]!.name).toBe("Harbour Line");
+    // Other fields still save, and so does a change of letter case (the payments still match it).
+    expect((await http.patch(`/shipping-agents/${id}`, { phone: "+86 1" }).set("Cookie", management)).status).toBe(200);
+    expect((await rename(id, "HARBOUR LINE")).status).toBe(200);
+    await expectInUse("shippingAgent", id, "1 agent payment");
+
+    // An agent with no payments can still be renamed, and so can one whose name only a supplier payment carries.
+    const unpaid = await add("shippingAgent", "Quiet Seas");
+    await ctx.db.insert(payments).values({ orderId: order.id, kind: "Deposit", payee: "Quiet Seas", payeeRole: "supplier", amountCny: 5, status: "paid", paidOn: indiaDay(-1), rateInr: 12, mode: "Wire" });
+    expect((await rename(unpaid, "Quiet Seas Co")).status).toBe(200);
+    expect((await rename(UNKNOWN, "Anything")).status).toBe(404);
+  });
+
   it("clearing agent: the containers it clears", async () => {
     const id = await add("clearingAgent", "Cochin Customs");
     await ctx.db.insert(clearings).values({ containerId: await container(), clearingAgentId: id, arrivedOn: indiaDay(-2), createdBy: suresh, updatedBy: suresh });

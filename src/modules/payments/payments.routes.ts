@@ -3,6 +3,7 @@ import { Router } from "express";
 import { z } from "zod";
 
 import { requirePermission } from "../../auth/current-user";
+import type { Database } from "../../db/client";
 import { orders, PAYEE_ROLES, PAYMENT_KINDS, payments, shippingAgents, suppliers } from "../../db/schema";
 import { notFound, validationFailed } from "../../http/errors";
 import { parse } from "../../http/validate";
@@ -47,7 +48,7 @@ const newPayment = z.strictObject({
 type NewPayment = z.infer<typeof newPayment>;
 
 /** The payee's name (the order's supplier, or the active agent), the PO and its currency, or 422 with every problem found (E1). */
-async function payeeName(db: RouteContext["db"], input: NewPayment) {
+async function payeeName(db: Pick<Database, "select">, input: NewPayment) {
   const problems: Record<string, string> = {};
   const order = await db
     .select({ supplier: suppliers.name, po: orders.poNumber, currency: orders.currency })
@@ -67,7 +68,8 @@ async function payeeName(db: RouteContext["db"], input: NewPayment) {
     const rows = await db
       .select({ name: shippingAgents.name })
       .from(shippingAgents)
-      .where(and(eq(shippingAgents.id, input.agentId), eq(shippingAgents.status, "Active")));
+      .where(and(eq(shippingAgents.id, input.agentId), eq(shippingAgents.status, "Active")))
+      .for("share");
     agent = rows[0]?.name;
     if (!agent) problems.agentId = M.agent;
   }
@@ -82,8 +84,10 @@ export function paymentsRoutes({ db }: RouteContext) {
   // PAY-2. A payment already made: saved as paid, at any stage. No overpayment check (the balance may go below 0).
   router.post("/payments", requirePermission("payments", "Enter"), async (req, res) => {
     const input = parse(newPayment, req.body);
-    const { payee, po, currency } = await payeeName(db, input);
     const payment = await db.transaction(async (tx) => {
+      // Read inside the transaction, the agent's row share-locked: an agent payment keeps the agent's name, so a rename
+      // or delete of that agent waits for this payment and then counts it (master-data DELETE, shipping-agent PATCH).
+      const { payee, po, currency } = await payeeName(tx, input);
       const created = (
         await tx
           .insert(payments)

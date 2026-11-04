@@ -139,6 +139,15 @@ describe("ORD-3 POST /orders and ORD-1 GET /orders", () => {
     expect(list.body[0]).toMatchObject({ item: "Cotton fabric", quantity: 50, unit: "m", orderValueCny: 150, paidCny: 0, paidInr: 0 });
   });
 
+  it("takes an agent deposit to an active agent in any letter case, and refuses one to an inactive agent", async () => {
+    const agentDeposit = (payee: string) => ({ payee, payeeRole: "agent", amountCny: 5, paidOn: "2026-10-21", rateInr: 11, mode: "Cash" });
+    expect((await create(orderBody({ deposits: [agentDeposit("sino freight")] }))).status).toBe(201);
+    await ctx.db.update(shippingAgents).set({ status: "Inactive" }).where(eq(shippingAgents.name, "Dragon Cargo"));
+    const refused = await create(orderBody({ deposits: [agentDeposit("Dragon Cargo")] }));
+    expect([refused.status, refused.body.error.fields]).toEqual([422, { deposits: MESSAGES.payee }]);
+    expect(await countOrders()).toBe(1);
+  });
+
   it("gives simultaneous creates different PO numbers", async () => {
     const results = await Promise.all([create(orderBody()), create(orderBody()), create(orderBody())]);
     expect(results.map((res) => res.status)).toEqual([201, 201, 201]);
@@ -165,6 +174,8 @@ describe("ORD-3 POST /orders and ORD-1 GET /orders", () => {
       [{ orderDate: "2026-02-30" }, { orderDate: MESSAGES.orderDate }],
       [{ deposits: [{ payee: "X", payeeRole: "supplier", amountCny: 0, paidOn: "2026-10-21", rateInr: 11, mode: "Cash" }] }, { deposits: MESSAGES.amount }],
       [{ deposits: [{ payee: "X", payeeRole: "supplier", amountCny: 5, paidOn: "2026-10-21", rateInr: 11, mode: " " }] }, { deposits: MESSAGES.mode }],
+      // An agent deposit keeps the agent's name, so it must be an active agent's (checked inside the transaction).
+      [{ deposits: [{ payee: "No Such Agent", payeeRole: "agent", amountCny: 5, paidOn: "2026-10-21", rateInr: 11, mode: "Cash" }] }, { deposits: MESSAGES.payee }],
       [
         { supplierId: foshan, deliveryDate: "2026-10-01", lines: [{ itemId: inactiveItem, quantity: 1, rateCny: 1 }] },
         { supplierId: MESSAGES.supplier, deliveryDate: MESSAGES.deliveryBeforeOrder, lines: MESSAGES.item },
