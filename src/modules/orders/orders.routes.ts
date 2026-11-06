@@ -32,6 +32,8 @@ export const MESSAGES = {
   rateForInr: "Leave the rate empty for an INR order.",
   mode: "Enter the payment mode.",
   currency: "Choose CNY, USD or INR.",
+  po: "Enter a PO number like PO-2050.",
+  poTaken: "This PO number is already used by another order.",
 };
 const M = MESSAGES;
 
@@ -52,6 +54,9 @@ const deposit = z.strictObject({
   mode: z.string({ error: M.mode }).trim().min(1, M.mode),
 });
 const newOrder = z.strictObject({
+  // The form's PO number (the offered next one, or what the user changed it to). Left out, the server assigns the
+  // next one. It keeps the PO-<digits> shape that /orders/:po, sorting and the next number rely on; 9 digits fit bigint.
+  po: z.string({ error: M.po }).trim().toUpperCase().regex(/^PO-\d{1,9}$/, M.po).optional(),
   supplierId: z.uuid({ error: M.supplier }),
   // Left out (an older frontend), the order is CNY: that frontend shows every amount in yuan.
   currency: z.enum(CURRENCIES, { error: M.currency }).default("CNY"),
@@ -72,7 +77,7 @@ export const round2 = (value: number) => Math.round(value * 100) / 100;
 export const rateProblem = (currency: Currency, rateInr: number | undefined, missing: string) =>
   currency === "INR" ? (rateInr === undefined || rateInr === 1 ? null : M.rateForInr) : rateInr === undefined ? missing : null;
 
-// PO numbers: "PO-" + (highest number + 1); the first is PO-2050.
+// PO numbers: "PO-" + (highest number + 1); the first is PO-2050. The form may send its own instead (ORD-3 `po`).
 const FIRST_PO = 2050;
 const poValue = sql`substring(${orders.poNumber} from '^PO-([0-9]+)$')::bigint`;
 async function nextPo(db: Pick<Database, "select">) {
@@ -90,6 +95,7 @@ function isPoTaken(error: unknown) {
 /** Rules that need the database, reported together (E1). */
 async function checkRules(db: Database, input: NewOrder) {
   const problems: Record<string, string> = {};
+  if (input.po && (await db.select({ id: orders.id }).from(orders).where(eq(orders.poNumber, input.po))).length > 0) problems.po = M.poTaken;
   if (input.deliveryDate < input.orderDate) problems.deliveryDate = M.deliveryBeforeOrder;
   const supplier = await db
     .select({ id: suppliers.id })
@@ -204,7 +210,7 @@ export function ordersRoutes({ db }: RouteContext) {
     });
   });
 
-  // ORD-3. The order, its lines and its deposits in one transaction; the PO number is assigned inside it.
+  // ORD-3. The order, its lines and its deposits in one transaction; the PO number is the form's or assigned inside it.
   router.post("/orders", requirePermission("ordersEdit", "Enter"), async (req, res) => {
     const input = parse(newOrder, req.body);
     await checkRules(db, input);
@@ -217,7 +223,7 @@ export function ordersRoutes({ db }: RouteContext) {
           const created = await tx
             .insert(orders)
             .values({
-              poNumber: await nextPo(tx),
+              poNumber: input.po ?? (await nextPo(tx)),
               supplierId: input.supplierId,
               orderDate: input.orderDate,
               deliveryDate: input.deliveryDate,
@@ -247,8 +253,10 @@ export function ordersRoutes({ db }: RouteContext) {
         res.status(201).json({ order });
         return;
       } catch (error) {
-        if (attempt < 5 && isPoTaken(error)) continue;
-        throw error;
+        if (!isPoTaken(error)) throw error;
+        // A number the user typed is theirs to change (another order took it meanwhile); a generated one is retried.
+        if (input.po) throw validationFailed({ po: M.poTaken });
+        if (attempt >= 5) throw error;
       }
     }
   });

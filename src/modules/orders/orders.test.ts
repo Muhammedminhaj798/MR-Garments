@@ -148,6 +148,23 @@ describe("ORD-3 POST /orders and ORD-1 GET /orders", () => {
     expect(await countOrders()).toBe(1);
   });
 
+  it("takes the form's PO number (any letter case), refuses one already used, and numbers the next order after it", async () => {
+    const typed = await create(orderBody({ po: " po-3000 " }));
+    expect(typed.status).toBe(201);
+    expect(typed.body.order.po).toBe("PO-3000");
+    const taken = await create(orderBody({ po: "PO-3000" }));
+    expect([taken.status, taken.body.error.fields]).toEqual([422, { po: MESSAGES.poTaken }]);
+    expect((await get("/orders/options")).body.nextPo).toBe("PO-3001");
+    expect((await create(orderBody())).body.order.po).toBe("PO-3001");
+    expect((await get("/orders")).body.map((row: { po: string }) => row.po)).toEqual(["PO-3001", "PO-3000"]);
+    expect(await countOrders()).toBe(2);
+    // Two forms sending the same number at once: the unique index refuses the second, as a field error (no retry).
+    const race = await Promise.all([create(orderBody({ po: "PO-3005" })), create(orderBody({ po: "PO-3005" }))]);
+    expect(race.map((res) => res.status).sort()).toEqual([201, 422]);
+    expect(race.find((res) => res.status === 422)!.body.error.fields).toEqual({ po: MESSAGES.poTaken });
+    expect(await countOrders()).toBe(3);
+  });
+
   it("gives simultaneous creates different PO numbers", async () => {
     const results = await Promise.all([create(orderBody()), create(orderBody()), create(orderBody())]);
     expect(results.map((res) => res.status)).toEqual([201, 201, 201]);
@@ -172,6 +189,11 @@ describe("ORD-3 POST /orders and ORD-1 GET /orders", () => {
       [{ lines: [{ itemId: unknown, quantity: 1, rateCny: 1 }] }, { lines: MESSAGES.item }],
       [{ lines: [{ itemId: ids.jeans, quantity: 1, rateCny: 1 }, { itemId: inactiveItem, quantity: 1, rateCny: 1 }] }, { lines: MESSAGES.item }],
       [{ orderDate: "2026-02-30" }, { orderDate: MESSAGES.orderDate }],
+      [{ po: "" }, { po: MESSAGES.po }],
+      [{ po: "2050" }, { po: MESSAGES.po }],
+      [{ po: "PO-2050A" }, { po: MESSAGES.po }],
+      [{ po: "PO-1234567890" }, { po: MESSAGES.po }], // 10 digits: too many
+      [{ po: 2050 }, { po: MESSAGES.po }],
       [{ deposits: [{ payee: "X", payeeRole: "supplier", amountCny: 0, paidOn: "2026-10-21", rateInr: 11, mode: "Cash" }] }, { deposits: MESSAGES.amount }],
       [{ deposits: [{ payee: "X", payeeRole: "supplier", amountCny: 5, paidOn: "2026-10-21", rateInr: 11, mode: " " }] }, { deposits: MESSAGES.mode }],
       // An agent deposit keeps the agent's name, so it must be an active agent's (checked inside the transaction).
@@ -186,7 +208,7 @@ describe("ORD-3 POST /orders and ORD-1 GET /orders", () => {
       expect(res.status, JSON.stringify(overrides)).toBe(422);
       expect(res.body.error).toEqual({ code: "validation_failed", message: "Some fields need attention.", fields });
     }
-    expect((await create(orderBody({ po: "PO-1" }))).status).toBe(400);
+    expect((await create(orderBody({ stage: 2 }))).status).toBe(400);
     expect(await countOrders()).toBe(0);
     expect((await ctx.db.select().from(payments)).length).toBe(0);
   });
