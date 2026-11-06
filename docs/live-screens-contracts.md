@@ -22,7 +22,11 @@ strict Zod bodies via `parse()`, same-site check, `requirePermission`).
 
 ## Business rules (approved defaults)
 
-- **PO number:** `PO-` + (highest existing number + 1). The first order is `PO-2050`. Assigned by the server.
+- **PO number:** `PO-` + (highest existing number + 1). The first order is `PO-2050`. Offered by the server (ORD-2
+  `nextPo`); the new-order form sends it back as ORD-3 `po`, where the user may have changed it (2026-11-06). A typed
+  number keeps the `PO-<digits>` shape (1-9 digits, any letter case, stored upper-case) and must be unused, else 422 on
+  `po`: "Enter a PO number like PO-2050." / "This PO number is already used by another order.". Left out, the server
+  assigns the next one.
 - **Order status** (computed by the frontend from the facts below, with today in India):
   stage 4 "In clearing", stage 5 "On the road", stage 6 "Received"; stage 3 with `received < quantity`
   "Short by N <unit>"; otherwise by `deliveryDate`: before today and stage <= 2 "Late N day(s)"; today to 7 days ahead
@@ -60,12 +64,13 @@ backend returns exactly those shapes. Summary:
   new-order default), active
   `items {id, name, unit}[]`, active shipping `agents {id, name}[]` (deposit payees). Readable by anyone who can open
   Orders, so Procurement doesn't need Settings access.
-- **ORD-3** body `CreateOrderBody`: `supplierId, currency?` (CNY, USD or INR; CNY when left out, as an older frontend
+- **ORD-3** body `CreateOrderBody`: `po?` (the PO number to use, see "Business rules"; left out, the next one),
+  `supplierId, currency?` (CNY, USD or INR; CNY when left out, as an older frontend
   shows yuan only; fixed afterwards), `orderDate, deliveryDate, lines {itemId, quantity, rateCny}[]` (1-50),
   `deposits {payee, payeeRole, amountCny, paidOn, rateInr?, mode}[]` (0-10, saved as `Deposit` payments, status `paid`;
   `rateInr` required unless the order is INR, where it must be left out or 1 and is stored as 1; otherwise 422 on
   `deposits`: "Enter the INR rate." / "Leave the rate empty for an INR order.").
-  201 `{ order: { id, po } }`. 422 `validation_failed` with fields `supplierId`, `orderDate`, `deliveryDate`
+  201 `{ order: { id, po } }`. 422 `validation_failed` with fields `po`, `supplierId`, `orderDate`, `deliveryDate`
   ("The delivery date can't be before the order date."), `currency` ("Choose CNY, USD or INR."), `lines`, `deposits`. Inactive or unknown supplier/item: 422 on
   that field. An agent deposit's `payee` must be an active shipping agent's name (any letter case), read inside the
   transaction with the agent's row locked `FOR SHARE`, otherwise 422 on `deposits` "Choose who the deposit was paid
