@@ -33,8 +33,9 @@ strict Zod bodies via `parse()`, same-site check, `requirePermission`).
   "Due today" / "Due in N day(s)"; else "On track".
 - **Stages:** a new order is stage 1. The first receipt moves it 1 -> 2. Loading any of its lines into a container
   moves it 2 -> 3. Nothing in this batch moves an order past 3.
-- **Receiving:** quantities are >= 0, at least one line > 0, and `received + this receipt <= ordered` per line
-  (no over-receipt). Only orders at stage 1 or 2. Offices are active China offices. `receivedBy` is the signed-in user.
+- **Receiving:** quantities are >= 0 and at least one line > 0. A line may receive more than was ordered (suppliers
+  deliver more at times; 2026-11-06): nothing caps the quantity, and short is `max(0, ordered - received)`. Only
+  orders at stage 1 or 2. Offices are active China offices. `receivedBy` is the signed-in user.
 - **Loading:** quantity > 0 and `loaded + this container <= received` per line. Only orders at stage 2 or 3.
   New containers are status `loading`. Container numbers are unique, case-insensitive.
 
