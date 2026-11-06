@@ -239,12 +239,11 @@ describe("one order across all five tabs", () => {
     expect(detail.receipts[0].lines).toEqual([{ orderLineId: order.lines[0], item: "Track pants", unit: "pcs", quantity: 40 }]);
   });
 
-  it("REC-3 concurrency: two receipts that together over-receive cannot both succeed", async () => {
+  it("REC-3 concurrency: three simultaneous receipts all land, past the ordered quantity", async () => {
     const make = (quantity: number) => ({ orderId: order.id, receivedOn: indiaDay(-2), locationId: ids.office, bundles: 1, deliveryNote: "", shortRemark: "still short", lines: [{ orderLineId: order.lines[0], quantity }] });
     const results = await Promise.all([post("/receipts", make(15)), post("/receipts", make(15)), post("/receipts", make(15))]);
-    const statuses = results.map((r) => r.status).sort();
-    expect(statuses).toEqual([201, 422, 422]); // 40 + 15 = 55; a second 15 would be 70 > 60
-    state.received = [55, 0];
+    expect(results.map((r) => r.status)).toEqual([201, 201, 201]); // 40 + 3 x 15 = 85 > 60: more than ordered is allowed
+    state.received = [85, 0];
     await expectConsistent(state);
   });
 
@@ -262,10 +261,13 @@ describe("one order across all five tabs", () => {
       ],
     });
     expect(res.status).toBe(201);
-    state.received = [60, 50];
+    state.received = [90, 50];
     await expectConsistent(state); // REC-2 no longer lists it; CON-2 does
+    // The API still takes more for a fully received order (the supplier sent extra); only the form stops offering it.
     const more = await post("/receipts", { orderId: order.id, receivedOn: indiaDay(-1), locationId: ids.office, bundles: 0, deliveryNote: "", shortRemark: "", lines: [{ orderLineId: order.lines[1], quantity: 1 }] });
-    expect(more.status).toBe(422);
+    expect(more.status).toBe(201);
+    state.received = [90, 51];
+    await expectConsistent(state);
   });
 
   it("CON-3 concurrency: two containers loading the same stock, exactly one wins; stage 2 -> 3", async () => {
@@ -307,10 +309,10 @@ describe("one order across all five tabs", () => {
     expect(rest.status).toBe(201);
     containerIds.push(rest.body.container.id);
     state.loaded = [60, 50];
-    const { detail } = await expectConsistent(state); // CON-2 lists nothing for this order
+    const { detail } = await expectConsistent(state); // CON-2 still lists both lines: the excess (30 and 1) is not loaded
     expect(detail.containers).toHaveLength(2);
-    const over = await post("/containers", { number: "MSCU1000004", shippingAgentId: ids.sino, terms: "FOB", portOfLoading: "", portOfArrival: "", loadedOn: indiaDay(0), sailedOn: null, eta: indiaDay(20), lines: [{ orderLineId: order.lines[0], bundles: 1, quantity: 1 }] });
-    expect(over.status).toBe(422);
+    const over = await post("/containers", { number: "MSCU1000004", shippingAgentId: ids.sino, terms: "FOB", portOfLoading: "", portOfArrival: "", loadedOn: indiaDay(0), sailedOn: null, eta: indiaDay(20), lines: [{ orderLineId: order.lines[0], bundles: 1, quantity: 31 }] });
+    expect(over.status).toBe(422); // 60 loaded + 31 > 90 received
     // Both containers hold only part of the order's lines, so both are `part`.
     const list = await get("/containers");
     for (const id of containerIds) expect(list.body.find((c: { id: string }) => c.id === id).orders).toEqual([{ po: order.po, part: true }]);
@@ -359,7 +361,7 @@ describe("access, validation and error handling", () => {
     expect(acc.body.containers).toBeNull();
     const proc = await get(`/orders/${order.po}`, procurement); // payments View, receiving View, containers None
     expect(proc.body.payments).toHaveLength(4);
-    expect(proc.body.receipts).toHaveLength(3);
+    expect(proc.body.receipts).toHaveLength(6);
     expect(proc.body.containers).toBeNull();
     expect((await get(`/orders/${order.po}`, wang)).status).toBe(403); // staff have no Orders access, so never reach ORD-4
     for (const bad of ["po-2050", "PO-", "PO-2050x", "PO-99999999999999999999999", "2050", encodeURIComponent("PO-1 OR 1=1")]) {

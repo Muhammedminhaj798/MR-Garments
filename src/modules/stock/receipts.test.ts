@@ -91,26 +91,51 @@ describe("REC-3 POST /receipts and REC-1 GET /receipts", () => {
     ]);
   });
 
-  it("refuses over-receipt, nothing received and negative quantities with 422 under lines", async () => {
+  it("takes more than was ordered, in one receipt or over several; short is never negative", async () => {
+    // Ordered 360 m: 360, 300 (short 60), 400 and 949 are all saved as typed; only 300 needs the short remark.
+    for (const [quantity, shortRemark] of [[360, ""], [300, "60 m to follow."], [400, ""], [949, ""]] as const) {
+      const order = await makeOrder(ctx, { lines: [{ item: "Cotton fabric", quantity: 360, rateCny: 3 }] });
+      const line = order.lineIds[0]!;
+      if (shortRemark) {
+        expect((await post(chen, body(order.id, [{ orderLineId: line, quantity }], { shortRemark: "" }))).body.error.fields).toEqual({ shortRemark: MESSAGES.shortRemark });
+      }
+      const res = await post(chen, body(order.id, [{ orderLineId: line, quantity }], { shortRemark }));
+      expect(res.status, String(quantity)).toBe(201);
+      const row = (await http.get("/receipts").set("Cookie", chen)).body.find((r: { id: string }) => r.id === res.body.receipt.id);
+      expect(row).toMatchObject({ ordered: 360, unit: "m", thisReceipt: quantity, totalSoFar: quantity });
+    }
+
+    // Several receipts adding up past the order: 300, then 649 (949 in all). REC-2 then no longer offers the order.
+    const order = await makeOrder(ctx, { lines: [{ item: "Cotton fabric", quantity: 360, rateCny: 3 }] });
+    const line = order.lineIds[0]!;
+    expect((await post(chen, body(order.id, [{ orderLineId: line, quantity: 300 }]))).status).toBe(201);
+    const second = await post(wang, body(order.id, [{ orderLineId: line, quantity: 649 }], { shortRemark: "", receivedOn: indiaDay(0) }));
+    expect(second.status).toBe(201);
+    const rows = (await http.get("/receipts").set("Cookie", chen)).body.filter((r: { orderId: string }) => r.orderId === order.id);
+    expect(rows.map((r: { thisReceipt: number; totalSoFar: number }) => [r.thisReceipt, r.totalSoFar])).toEqual([[649, 949], [300, 300]]);
+    const offered = (cookie: string) => http.get("/receipts/options").set("Cookie", cookie).then((res) => res.body.orders.find((o: { orderId: string }) => o.orderId === order.id));
+    expect(await offered(chen)).toBeUndefined();
+
+    // REC-4 deletes the excess receipt like any other; the order is offered again with 300 received.
+    const boss = await signInAs(ctx, SEEDED.management);
+    expect((await http.delete(`/receipts/${second.body.receipt.id}`).set("Cookie", boss)).status).toBe(204);
+    expect((await offered(chen)).lines).toMatchObject([{ ordered: 360, receivedEarlier: 300 }]);
+  });
+
+  it("refuses nothing received, negative, blank, decimal and non-numeric quantities and a repeated line with 422 under lines", async () => {
     const order = await makeOrder(ctx, { lines: twoLines });
     const [main, fabric] = order.lineIds as [string, string];
-    expect((await post(chen, body(order.id, [{ orderLineId: main, quantity: 90 }]))).status).toBe(201);
-    const over = await post(chen, body(order.id, [{ orderLineId: main, quantity: 11 }]));
-    expect(over.status).toBe(422);
-    expect(over.body.error.fields).toEqual({ lines: MESSAGES.overReceipt("Denim jeans", 10, "pcs") });
-    expect((await post(chen, body(order.id, [{ orderLineId: fabric, quantity: 501 }]))).body.error.fields).toEqual({
-      lines: MESSAGES.overReceipt("Cotton fabric", 500, "m"),
-    });
     const zeros = await post(chen, body(order.id, [{ orderLineId: main, quantity: 0 }]));
     expect(zeros.status).toBe(422);
     expect(zeros.body.error.fields).toEqual({ lines: MESSAGES.nothingReceived });
-    const negative = await post(chen, body(order.id, [{ orderLineId: main, quantity: -1 }, { orderLineId: fabric, quantity: 5 }]));
-    expect(negative.status).toBe(422);
-    expect(Object.keys(negative.body.error.fields)).toEqual(["lines"]);
+    for (const quantity of [-1, undefined, null, "", "12a", 1.5]) {
+      const res = await post(chen, body(order.id, [], { lines: [{ orderLineId: main, quantity }, { orderLineId: fabric, quantity: 5 }] }));
+      expect(res.status, String(quantity)).toBe(422);
+      expect(Object.keys(res.body.error.fields), String(quantity)).toEqual(["lines"]);
+    }
     const twice = await post(chen, body(order.id, [{ orderLineId: fabric, quantity: 1 }, { orderLineId: fabric, quantity: 1 }]));
     expect(twice.body.error.fields).toEqual({ lines: MESSAGES.duplicateLine });
-    expect((await post(chen, body(order.id, [{ orderLineId: main, quantity: 10 }]))).status).toBe(201);
-    expect(await receiptCount(order.id)).toBe(2);
+    expect(await receiptCount(order.id)).toBe(0);
   });
 
   it("refuses lines from another order", async () => {
@@ -193,12 +218,14 @@ describe("REC-3 POST /receipts and REC-1 GET /receipts", () => {
     expect(await stageOf(order.id)).toBe(2);
   });
 
-  it("refuses two simultaneous receipts that together over-receive", async () => {
+  it("takes two simultaneous receipts that together exceed the order", async () => {
     const order = await makeOrder(ctx, { lines: twoLines });
     const lines = [{ orderLineId: order.lineIds[0]!, quantity: 60 }];
     const results = await Promise.all([post(chen, body(order.id, lines)), post(wang, body(order.id, lines))]);
-    expect(results.map((res) => res.status).sort()).toEqual([201, 422]);
-    expect(await receiptCount(order.id)).toBe(1);
+    expect(results.map((res) => res.status)).toEqual([201, 201]);
+    expect(await receiptCount(order.id)).toBe(2);
+    const rows = (await http.get("/receipts").set("Cookie", chen)).body.filter((r: { orderId: string }) => r.orderId === order.id);
+    expect(Math.max(...rows.map((r: { totalSoFar: number }) => r.totalSoFar))).toBe(120);
   });
 });
 

@@ -5,7 +5,6 @@ import { afterAll, beforeEach, describe, expect, it } from "vitest";
 import { locations, notifications, shippingAgents, users } from "../../db/schema";
 import { api, createTestContext, resetData, SEEDED, signInAs } from "../../test/harness";
 import { idOf, indiaDay, makeOrder, receive } from "../stock/fixtures";
-import { MESSAGES } from "../stock/stock.routes";
 import { day, money, notify, qty } from "./notify";
 
 const ctx = createTestContext();
@@ -265,10 +264,7 @@ describe("short-receipt (REC-3)", () => {
     expect(await inbox("short-receipt")).toEqual([]);
   });
 
-  it("is not written when the receipt fails (422 over-receipt or missing remark)", async () => {
-    const over = await receipt(cookies.chinaStaff, [101, 0]);
-    expect(over.res.status).toBe(422);
-    expect(over.res.body.error.fields.lines).toBe(MESSAGES.overReceipt("Denim jeans", 100, "pcs"));
+  it("is not written when the receipt fails (422 missing remark)", async () => {
     const noRemark = await receipt(cookies.chinaStaff, [10, 0], { shortRemark: "" });
     expect(noRemark.res.status).toBe(422);
     expect(await ctx.db.select().from(notifications)).toEqual([]);

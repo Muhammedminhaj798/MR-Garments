@@ -42,7 +42,6 @@ export const MESSAGES = {
   nothingReceived: "Enter a quantity for at least one line.",
   duplicateLine: "Each line can appear only once.",
   notOnOrder: "Some lines aren't on this order.",
-  overReceipt: (item: string, left: number, unit: string) => `${item}: only ${left} ${unit} left to receive.`,
   notReceivable: "This order is past receiving and can't take more receipts.",
   shortRemark: "Add a remark about the short items.",
   number: "Enter the container number.",
@@ -261,7 +260,8 @@ export function stockRoutes({ db }: RouteContext) {
     res.json({ offices, orders: [...byOrder.values()] });
   });
 
-  // REC-3. One transaction; the order row is locked first, so two receipts for one order can't both over-receive.
+  // REC-3. One transaction with the order row locked (CON-3 and REC-4 lock it too). A line may receive more than was
+  // ordered, since suppliers deliver more at times (2026-11-06): nothing caps the quantity, and short is never negative.
   router.post("/receipts", requirePermission("receiving", "Enter"), async (req, res) => {
     const input = parse(newReceipt, req.body);
     const id = await db.transaction(async (tx) => {
@@ -281,13 +281,7 @@ export function stockRoutes({ db }: RouteContext) {
         .innerJoin(items, eq(items.id, orderLines.itemId))
         .where(eq(orderLines.orderId, order.id));
       const byId = new Map(lines.map((line) => [line.id, line]));
-      for (const { orderLineId, quantity } of input.lines) {
-        const line = byId.get(orderLineId);
-        if (!line) problems.lines ??= MESSAGES.notOnOrder;
-        else if (line.received + quantity > line.ordered) {
-          problems.lines ??= MESSAGES.overReceipt(line.item, line.ordered - line.received, unit(line.countedIn));
-        }
-      }
+      if (input.lines.some((line) => !byId.has(line.orderLineId))) problems.lines = MESSAGES.notOnOrder;
       // Screen 21: a remark is required while any line of the order is still short after this receipt.
       const now = new Map(input.lines.map((line) => [line.orderLineId, line.quantity]));
       const short = lines
