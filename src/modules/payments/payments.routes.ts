@@ -111,7 +111,7 @@ export function paymentsRoutes({ db }: RouteContext) {
         sourceId: created.id,
         title: `${po} payment recorded`,
         details: [`${input.kind} ${money(input.amountCny, currency)}`, payee],
-        href: (canView) => (canView("ordersView") ? `/orders/${po}/payments` : "/payments"),
+        href: (canView) => (canView("ordersView") ? `/orders/${encodeURIComponent(po)}/payments` : "/payments"),
       });
       return created;
     });

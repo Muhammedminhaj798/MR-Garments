@@ -6,7 +6,7 @@ import type { Database } from "../../db/client";
 import { containerLines, containers, items, orderLines, orders, suppliers } from "../../db/schema";
 import { conflict, notFound } from "../../http/errors";
 import { atLeast, effectiveAccess } from "../../permissions/matrix";
-import { unit } from "../orders/orders.routes";
+import { unitSymbol } from "../orders/orders.routes";
 
 // Owner: A5. What Clearing, Transport and Warehouse (docs/wave3-contracts.md section 5) share.
 
@@ -75,7 +75,7 @@ export async function goodsIn(db: Pick<Database, "select">, containerId: string)
       orderId: orderLines.orderId,
       po: orders.poNumber,
       item: items.name,
-      countedIn: items.countedIn,
+      unit: unitSymbol,
       bundles: containerLines.bundles,
       quantity: containerLines.quantity,
       supplier: suppliers.name,
@@ -87,7 +87,7 @@ export async function goodsIn(db: Pick<Database, "select">, containerId: string)
     .innerJoin(suppliers, eq(suppliers.id, orders.supplierId))
     .where(eq(containerLines.containerId, containerId))
     .orderBy(asc(orders.poNumber), asc(orderLines.position));
-  return rows.map(({ countedIn, ...row }) => ({ ...row, unit: unit(countedIn) }));
+  return rows;
 }
 
 /** The goods as the forms show them, and the suppliers of the orders in the container. */

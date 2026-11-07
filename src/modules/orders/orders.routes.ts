@@ -5,7 +5,7 @@ import { z } from "zod";
 
 import { requirePermission } from "../../auth/current-user";
 import type { Database } from "../../db/client";
-import { type Currency, CURRENCIES, items, orderLines, orders, PAYEE_ROLES, payments, receiptLines, shippingAgents, suppliers } from "../../db/schema";
+import { type Currency, CURRENCIES, items, orderLines, orders, PAYEE_ROLES, payments, receiptLines, shippingAgents, suppliers, units } from "../../db/schema";
 import { validationFailed } from "../../http/errors";
 import { parse } from "../../http/validate";
 import type { RouteContext } from "../context";
@@ -32,10 +32,13 @@ export const MESSAGES = {
   rateForInr: "Leave the rate empty for an INR order.",
   mode: "Enter the payment mode.",
   currency: "Choose CNY, USD or INR.",
-  po: "Enter a PO number like PO-2050.",
+  po: "Enter the PO number.",
+  poTooLong: "Use 50 characters or fewer.",
   poTaken: "This PO number is already used by another order.",
 };
 const M = MESSAGES;
+/** The PO number column is text; this keeps a typed one readable in lists and URLs. */
+export const PO_MAX_LENGTH = 50;
 
 // Upper bounds keep values inside the numeric/integer columns, so an absurd number is a 422, not a 500.
 export const line = z.strictObject({
@@ -54,9 +57,9 @@ const deposit = z.strictObject({
   mode: z.string({ error: M.mode }).trim().min(1, M.mode),
 });
 const newOrder = z.strictObject({
-  // The form's PO number (the offered next one, or what the user changed it to). Left out, the server assigns the
-  // next one. It keeps the PO-<digits> shape that /orders/:po, sorting and the next number rely on; 9 digits fit bigint.
-  po: z.string({ error: M.po }).trim().toUpperCase().regex(/^PO-\d{1,9}$/, M.po).optional(),
+  // The form's PO number (the offered next one, or what the user changed it to) in any format (VM-11340, MR/2026/001),
+  // kept as typed apart from the surrounding spaces. Left out, the server assigns the next PO-<number>.
+  po: z.string({ error: M.po }).trim().min(1, M.po).max(PO_MAX_LENGTH, M.poTooLong).optional(),
   supplierId: z.uuid({ error: M.supplier }),
   // Left out (an older frontend), the order is CNY: that frontend shows every amount in yuan.
   currency: z.enum(CURRENCIES, { error: M.currency }).default("CNY"),
@@ -67,7 +70,10 @@ const newOrder = z.strictObject({
 });
 type NewOrder = z.infer<typeof newOrder>;
 
-export const unit = (countedIn: string) => (countedIn === "Metres" ? "m" : "pcs");
+/** An item's unit as the screens show it: its unit's symbol ("pcs", "m"), or the unit's name when it has none. */
+// Nested, so the columns keep their table names (drizzle drops them from a single-table select's top-level columns).
+const symbolOf = sql`select ${units.symbol} from ${units} where ${units.name} = ${items.countedIn}`;
+export const unitSymbol = sql<string>`coalesce(nullif((${symbolOf}), ''), ${items.countedIn})`;
 export const round2 = (value: number) => Math.round(value * 100) / 100;
 
 /**
@@ -77,9 +83,12 @@ export const round2 = (value: number) => Math.round(value * 100) / 100;
 export const rateProblem = (currency: Currency, rateInr: number | undefined, missing: string) =>
   currency === "INR" ? (rateInr === undefined || rateInr === 1 ? null : M.rateForInr) : rateInr === undefined ? missing : null;
 
-// PO numbers: "PO-" + (highest number + 1); the first is PO-2050. The form may send its own instead (ORD-3 `po`).
+// PO numbers: "PO-" + (highest number + 1); the first is PO-2050. The form may send its own instead (ORD-3 `po`), in
+// any format: only PO-<number> ones (any letter case, up to 15 digits) count towards the next number.
 const FIRST_PO = 2050;
-const poValue = sql`substring(${orders.poNumber} from '^PO-([0-9]+)$')::bigint`;
+export const poValue = sql`substring(upper(${orders.poNumber}) from '^PO-([0-9]{1,15})$')::bigint`;
+/** The order with this PO number in any letter case (the unique index is on lower(po_number)). */
+export const byPo = (po: string) => sql`lower(${orders.poNumber}) = lower(${po})`;
 async function nextPo(db: Pick<Database, "select">) {
   const rows = await db.select({ highest: sql<number | null>`max(${poValue})`.mapWith(Number) }).from(orders);
   return `PO-${Math.max(rows[0]?.highest ?? 0, FIRST_PO - 1) + 1}`;
@@ -95,7 +104,7 @@ function isPoTaken(error: unknown) {
 /** Rules that need the database, reported together (E1). */
 async function checkRules(db: Database, input: NewOrder) {
   const problems: Record<string, string> = {};
-  if (input.po && (await db.select({ id: orders.id }).from(orders).where(eq(orders.poNumber, input.po))).length > 0) problems.po = M.poTaken;
+  if (input.po && (await db.select({ id: orders.id }).from(orders).where(byPo(input.po))).length > 0) problems.po = M.poTaken;
   if (input.deliveryDate < input.orderDate) problems.deliveryDate = M.deliveryBeforeOrder;
   const supplier = await db
     .select({ id: suppliers.id })
@@ -126,7 +135,7 @@ export const orderColumns = {
   supplierId: suppliers.id,
   supplierName: suppliers.name,
   item: items.name,
-  countedIn: items.countedIn,
+  unit: unitSymbol,
   quantity: main.quantity,
   received: sql<number>`(select coalesce(sum(${receiptLines.quantity}), 0) from ${receiptLines} where ${receiptLines.orderLineId} = ${main.id})`.mapWith(Number),
   orderValueCny: sql<number>`(select round(coalesce(sum(${orderLines.quantity} * ${orderLines.rateCny}), 0), 2) from ${orderLines} where ${orderLines.orderId} = ${orders.id})`.mapWith(Number),
@@ -135,7 +144,8 @@ export const orderColumns = {
   paidInr: sql<number>`(select coalesce(sum(round(${payments.amountCny} * ${payments.rateInr}, 2)), 0) from ${payments} where ${paid})`.mapWith(Number),
   nextDue: sql<string | null>`(select min(${payments.dueDate})::text from ${payments} where ${payments.orderId} = ${orders.id} and ${payments.status} = 'due')`,
 };
-export const newestFirst = [desc(orders.orderDate), desc(poValue)];
+// A typed PO without a number sorts after the numbered ones of its day, then by its text.
+export const newestFirst = [desc(orders.orderDate), sql`${poValue} desc nulls last`, desc(orders.poNumber)];
 
 // ponytail: per-order subqueries over every order; add paging or a stage filter when orders reach the thousands.
 export function orderRows(db: Database, orderBy: SQL[], where?: SQL) {
@@ -166,7 +176,7 @@ export function ordersRoutes({ db }: RouteContext) {
         currency: row.currency,
         item: row.item,
         quantity: row.quantity,
-        unit: unit(row.countedIn),
+        unit: row.unit,
         received: row.received,
         orderValueCny: row.orderValueCny,
         paidCny: row.paidCny,
@@ -192,7 +202,7 @@ export function ordersRoutes({ db }: RouteContext) {
         .where(eq(suppliers.status, "Active"))
         .orderBy(asc(suppliers.createdAt), asc(suppliers.name)),
       db
-        .select({ id: items.id, name: items.name, countedIn: items.countedIn })
+        .select({ id: items.id, name: items.name, unit: unitSymbol })
         .from(items)
         .where(eq(items.status, "Active"))
         .orderBy(asc(items.createdAt), asc(items.name)),
@@ -205,7 +215,7 @@ export function ordersRoutes({ db }: RouteContext) {
     res.json({
       nextPo: po,
       suppliers: supplierRows,
-      items: itemRows.map(({ countedIn, ...item }) => ({ ...item, unit: unit(countedIn) })),
+      items: itemRows,
       agents,
     });
   });
@@ -266,7 +276,7 @@ export function ordersRoutes({ db }: RouteContext) {
   router.get("/deliveries", requirePermission("calendar", "View"), async (_req, res) => {
     const lineReceived = sql`(select coalesce(sum(${receiptLines.quantity}), 0) from ${receiptLines} where ${receiptLines.orderLineId} = ${orderLines.id})`;
     const [rows, received] = await Promise.all([
-      orderRows(db, [asc(orders.deliveryDate), asc(poValue)], lte(orders.stage, 2)),
+      orderRows(db, [asc(orders.deliveryDate), asc(poValue), asc(orders.poNumber)], lte(orders.stage, 2)),
       db
         .select({ orderId: orderLines.orderId, full: sql<boolean>`bool_and(${lineReceived} >= ${orderLines.quantity})` })
         .from(orderLines)
@@ -282,7 +292,7 @@ export function ordersRoutes({ db }: RouteContext) {
         supplier: row.supplierName,
         item: row.item,
         quantity: row.quantity,
-        unit: unit(row.countedIn),
+        unit: row.unit,
         received: row.received,
         due: row.deliveryDate,
         fullyReceived: fullyReceived.has(row.id),

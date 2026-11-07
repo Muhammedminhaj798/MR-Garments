@@ -4,7 +4,7 @@ import { alias } from "drizzle-orm/pg-core";
 import type { Database } from "../../db/client";
 import { containerLines, containers, items, orderLines, orders, payments, suppliers, teams, warehouseReceiptLines, warehouseReceipts } from "../../db/schema";
 import { loadLandedCosts } from "../costs/landed-cost";
-import { round2, unit } from "../orders/orders.routes";
+import { round2, unitSymbol } from "../orders/orders.routes";
 
 // GET /landed-cost (docs/wave3-contracts.md sections 6.4 and 8): one row per order with any cost so far, newest first.
 // The figures are loadLandedCosts'; this adds what the screen shows around them.
@@ -26,7 +26,7 @@ export async function landedCostList(db: Database, { supplierId, teamId }: { sup
       // The currency of `goodsPayments[].amountCny`; every other figure here is INR.
       currency: orders.currency,
       item: items.name,
-      countedIn: items.countedIn,
+      unit: unitSymbol,
       quantity: main.quantity,
     })
     .from(orders)
@@ -81,13 +81,12 @@ export async function landedCostList(db: Database, { supplierId, teamId }: { sup
     db.select({ id: teams.id, name: teams.name }).from(teams).where(eq(teams.status, "Active")).orderBy(asc(teams.createdAt), asc(teams.name)),
   ]);
 
-  const list = costed.map(({ countedIn, ...row }) => {
+  const list = costed.map((row) => {
     const cost = costs.get(row.orderId)!;
     // CNF or FOB when every container carrying the order has those terms, "mixed" when they differ, null before loading.
     const kinds = [...new Set(terms.filter((t) => t.orderId === row.orderId).map((t) => t.terms))];
     return {
       ...row,
-      unit: unit(countedIn),
       terms: kinds.length === 0 ? null : kinds.length === 1 ? kinds[0]! : "mixed",
       ...cost,
       // Cost per team = its pieces x the order's per-piece cost (section 6.3); pieces > 0 means perPieceInr is set.

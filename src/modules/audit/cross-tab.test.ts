@@ -364,7 +364,9 @@ describe("access, validation and error handling", () => {
     expect(proc.body.receipts).toHaveLength(6);
     expect(proc.body.containers).toBeNull();
     expect((await get(`/orders/${order.po}`, wang)).status).toBe(403); // staff have no Orders access, so never reach ORD-4
-    for (const bad of ["po-2050", "PO-", "PO-2050x", "PO-99999999999999999999999", "2050", encodeURIComponent("PO-1 OR 1=1")]) {
+    // A PO number is found in any letter case (one is unique in any case); anything else is a 404.
+    expect((await get(`/orders/${order.po.toLowerCase()}`)).body.po).toBe(order.po);
+    for (const bad of ["PO-", "PO-2050x", "PO-99999999999999999999999", "2050", encodeURIComponent("PO-1 OR 1=1")]) {
       const res = await get(`/orders/${bad}`);
       expect(res.status, bad).toBe(404);
       expect(res.body.error.code).toBe("not_found");

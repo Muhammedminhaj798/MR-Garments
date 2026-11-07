@@ -148,21 +148,45 @@ describe("ORD-3 POST /orders and ORD-1 GET /orders", () => {
     expect(await countOrders()).toBe(1);
   });
 
-  it("takes the form's PO number (any letter case), refuses one already used, and numbers the next order after it", async () => {
+  it("takes the form's PO number as typed, refuses one already used in any letter case, and numbers the next order after it", async () => {
     const typed = await create(orderBody({ po: " po-3000 " }));
     expect(typed.status).toBe(201);
-    expect(typed.body.order.po).toBe("PO-3000");
+    expect(typed.body.order.po).toBe("po-3000");
     const taken = await create(orderBody({ po: "PO-3000" }));
     expect([taken.status, taken.body.error.fields]).toEqual([422, { po: MESSAGES.poTaken }]);
     expect((await get("/orders/options")).body.nextPo).toBe("PO-3001");
     expect((await create(orderBody())).body.order.po).toBe("PO-3001");
-    expect((await get("/orders")).body.map((row: { po: string }) => row.po)).toEqual(["PO-3001", "PO-3000"]);
+    expect((await get("/orders")).body.map((row: { po: string }) => row.po)).toEqual(["PO-3001", "po-3000"]);
+    expect((await get("/orders/PO-3000")).body.po).toBe("po-3000");
     expect(await countOrders()).toBe(2);
     // Two forms sending the same number at once: the unique index refuses the second, as a field error (no retry).
     const race = await Promise.all([create(orderBody({ po: "PO-3005" })), create(orderBody({ po: "PO-3005" }))]);
     expect(race.map((res) => res.status).sort()).toEqual([201, 422]);
     expect(race.find((res) => res.status === 422)!.body.error.fields).toEqual({ po: MESSAGES.poTaken });
     expect(await countOrders()).toBe(3);
+  });
+
+  it("takes a PO number in any format, kept as typed, reachable by its encoded URL; only PO-<number> ones count for the next", async () => {
+    const typed = ["VM-11340", "MR/2026/001", "ABC-001", "2026-001", "PO-2050", "SUPPLIER/PO/2026/01", "x".repeat(50)];
+    for (const po of typed) {
+      const res = await create(orderBody({ po: `  ${po} `, deposits: [] }));
+      expect([res.status, res.body.order?.po], po).toEqual([201, po]);
+      expect((await get(`/orders/${encodeURIComponent(po)}`)).body.po, po).toBe(po);
+    }
+    expect((await get("/orders/mr%2F2026%2F001")).body.po).toBe("MR/2026/001");
+    expect((await http.patch("/orders/MR%2F2026%2F001", { deliveryDate: "2026-12-01" }).set("Cookie", management)).body.order.deliveryDate).toBe("2026-12-01");
+    expect((await get("/orders/options")).body.nextPo).toBe("PO-2051");
+    expect((await create(orderBody())).body.order.po).toBe("PO-2051");
+    // Numbered POs first (newest), then the rest by their text, newest first.
+    expect((await get("/orders")).body.map((row: { po: string }) => row.po)).toEqual(["PO-2051", "PO-2050", "x".repeat(50), "VM-11340", "SUPPLIER/PO/2026/01", "MR/2026/001", "ABC-001", "2026-001"]);
+    // A duplicate in another letter case, sent later or at the same moment, is refused under the field.
+    expect((await create(orderBody({ po: "vm-11340" }))).body.error.fields).toEqual({ po: MESSAGES.poTaken });
+    const race = await Promise.all([create(orderBody({ po: "MR-001" })), create(orderBody({ po: "mr-001" }))]);
+    expect(race.map((res) => res.status).sort()).toEqual([201, 422]);
+    expect(race.find((res) => res.status === 422)!.body.error.fields).toEqual({ po: MESSAGES.poTaken });
+    expect((await http.delete("/orders/MR%2F2026%2F001").set("Cookie", management)).status).toBe(204);
+    expect((await get("/orders/MR%2F2026%2F001")).status).toBe(404);
+    expect(await countOrders()).toBe(8);
   });
 
   it("gives simultaneous creates different PO numbers", async () => {
@@ -190,9 +214,8 @@ describe("ORD-3 POST /orders and ORD-1 GET /orders", () => {
       [{ lines: [{ itemId: ids.jeans, quantity: 1, rateCny: 1 }, { itemId: inactiveItem, quantity: 1, rateCny: 1 }] }, { lines: MESSAGES.item }],
       [{ orderDate: "2026-02-30" }, { orderDate: MESSAGES.orderDate }],
       [{ po: "" }, { po: MESSAGES.po }],
-      [{ po: "2050" }, { po: MESSAGES.po }],
-      [{ po: "PO-2050A" }, { po: MESSAGES.po }],
-      [{ po: "PO-1234567890" }, { po: MESSAGES.po }], // 10 digits: too many
+      [{ po: "   " }, { po: MESSAGES.po }],
+      [{ po: "x".repeat(51) }, { po: MESSAGES.poTooLong }],
       [{ po: 2050 }, { po: MESSAGES.po }],
       [{ deposits: [{ payee: "X", payeeRole: "supplier", amountCny: 0, paidOn: "2026-10-21", rateInr: 11, mode: "Cash" }] }, { deposits: MESSAGES.amount }],
       [{ deposits: [{ payee: "X", payeeRole: "supplier", amountCny: 5, paidOn: "2026-10-21", rateInr: 11, mode: " " }] }, { deposits: MESSAGES.mode }],

@@ -4,7 +4,7 @@ import { z } from "zod";
 import type { Database } from "../../db/client";
 import { CURRENCIES, items, orderLines, orders, payments, suppliers } from "../../db/schema";
 import { notFound } from "../../http/errors";
-import { main, newestFirst, orderColumns, round2, unit } from "../orders/orders.routes";
+import { main, newestFirst, orderColumns, round2, unitSymbol } from "../orders/orders.routes";
 import { orderFilter, supplierMoney, toSupplier } from "./reports";
 
 // GET /reports/payments-per-supplier/:supplierId (docs/supplier-payment-detail-contract.md): one supplier's orders,
@@ -135,7 +135,7 @@ export async function supplierPaymentDetail(db: Database, supplierId: string, q:
         metres: quantityIn(true),
         quantity: orderColumns.quantity,
         received: orderColumns.received,
-        countedIn: orderColumns.countedIn,
+        unit: orderColumns.unit,
         orderValueCny: supplierMoney.orderValueCny,
         paidCny: supplierMoney.paidCny,
       })
@@ -153,7 +153,7 @@ export async function supplierPaymentDetail(db: Database, supplierId: string, q:
         po: orders.poNumber,
         itemId: items.id,
         item: items.name,
-        countedIn: items.countedIn,
+        unit: unitSymbol,
         quantity: orderLines.quantity,
         rateCny: orderLines.rateCny,
         amountCny: sql<number>`round(${orderLines.quantity} * ${orderLines.rateCny}, 2)`.mapWith(Number),
@@ -192,20 +192,19 @@ export async function supplierPaymentDetail(db: Database, supplierId: string, q:
     },
     payments: pageOf(paymentRows, paymentCounts?.listed ?? 0, pages.payments),
     orders: pageOf(
-      orderRows.map(({ pcs, metres, countedIn, ...row }) => ({
+      orderRows.map(({ pcs, metres, ...row }) => ({
         ...row,
         quantities: [
           ...(pcs === null ? [] : [{ unit: "pcs" as const, quantity: pcs }]),
           ...(metres === null ? [] : [{ unit: "m" as const, quantity: metres }]),
         ],
-        unit: unit(countedIn),
         balanceCny: round2(row.orderValueCny - row.paidCny),
       })),
       total((row) => row.listed),
       pages.orders,
     ),
     lines: pageOf(
-      lineRows.map(({ countedIn, ...row }) => ({ ...row, unit: unit(countedIn) })),
+      lineRows,
       lineCounts?.all ?? 0,
       pages.lines,
     ),

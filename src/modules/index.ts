@@ -11,6 +11,7 @@ import { shippingAgentsRoutes } from "./master-data/shipping-agents.routes";
 import { suppliersRoutes } from "./master-data/suppliers.routes";
 import { teamsRoutes } from "./master-data/teams.routes";
 import { transportCompaniesRoutes } from "./master-data/transport-companies.routes";
+import { unitsRoutes } from "./master-data/units.routes";
 import { notificationsRoutes } from "./notifications/notifications.routes";
 import { orderDetailRoutes } from "./orders/order-detail.routes";
 import { ordersRoutes } from "./orders/orders.routes";
@@ -36,6 +37,7 @@ export function apiRoutes(ctx: RouteContext) {
   router.use(transportCompaniesRoutes(ctx));
   router.use(locationsRoutes(ctx));
   router.use(teamsRoutes(ctx));
+  router.use(unitsRoutes(ctx));
   router.use(itemsRoutes(ctx));
   router.use(ordersRoutes(ctx));
   router.use(orderDetailRoutes(ctx)); // after ORD-2, so /orders/options isn't read as a PO

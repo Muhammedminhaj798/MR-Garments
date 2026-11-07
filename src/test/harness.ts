@@ -39,6 +39,7 @@ const TABLES = [
   "clearing_agents",
   "transport_companies",
   "teams",
+  "units",
   "items",
   "warehouse_receipt_lines",
   "warehouse_receipts",

@@ -35,7 +35,8 @@ export const orders = pgTable(
     createdBy: uuid("created_by"),
   },
   (t) => [
-    uniqueIndex("orders_po_number_unique").on(t.poNumber),
+    // One PO number in any letter case (MR-001 and mr-001 are the same order).
+    uniqueIndex("orders_po_number_unique").on(sql`lower(${t.poNumber})`),
     check("orders_currency_check", inList("currency", CURRENCIES)),
     check("orders_stage_check", sql`stage between 1 and 6`),
     check("orders_dates_check", sql`delivery_date >= order_date`),

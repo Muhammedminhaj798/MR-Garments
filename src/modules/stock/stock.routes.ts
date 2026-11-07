@@ -24,6 +24,7 @@ import { conflict, notFound, validationFailed } from "../../http/errors";
 import { parse } from "../../http/validate";
 import { atLeast, effectiveAccess } from "../../permissions/matrix";
 import type { RouteContext } from "../context";
+import { unitSymbol } from "../orders/orders.routes";
 import { day, notify, qty } from "../notifications/notify";
 import { joined } from "../orders/order-detail.routes";
 import { settleStages } from "../stages-shared";
@@ -64,7 +65,6 @@ export const MESSAGES = {
       : `This receipt can't be deleted: containers ${joined(numbers)} already hold ${joined(goods)} from it. Delete those containers first.`,
 };
 
-const unit = (countedIn: string) => (countedIn === "Metres" ? "m" : "pcs");
 /** Today in India (Asia/Kolkata, UTC+5:30, no daylight saving) as YYYY-MM-DD. */
 const todayInIndia = () => new Date(Date.now() + 5.5 * 3600_000).toISOString().slice(0, 10);
 
@@ -155,7 +155,7 @@ export function stockRoutes({ db }: RouteContext) {
         item: items.name,
         office: locations.name,
         ordered: orderLines.quantity,
-        countedIn: items.countedIn,
+        unit: unitSymbol,
         thisReceipt: sql<number>`coalesce((select ${receiptLines.quantity} from ${receiptLines}
           where ${receiptLines.receiptId} = ${receipts.id} and ${receiptLines.orderLineId} = ${orderLines.id}), 0)`.mapWith(Number),
         totalSoFar: sql<number>`(select coalesce(sum(${receiptLines.quantity}), 0) from ${receiptLines}
@@ -180,7 +180,7 @@ export function stockRoutes({ db }: RouteContext) {
         orderLineId: orderLines.id,
         quantity: receiptLines.quantity,
         item: items.name,
-        countedIn: items.countedIn,
+        unit: unitSymbol,
         received: receivedOf(),
         loaded: loadedOf(),
       })
@@ -199,14 +199,13 @@ export function stockRoutes({ db }: RouteContext) {
       linesOf.get(line.receiptId)!.push(line);
     }
     res.json(
-      rows.map(({ countedIn, receivedBy, ...row }) => {
+      rows.map(({ receivedBy, ...row }) => {
         const own = linesOf.get(row.id) ?? [];
         const loaded = new Set(loadedFrom(own).map((line) => line.orderLineId));
         return {
           ...row,
-          unit: unit(countedIn),
           receivedBy: receivedBy ?? "",
-          lines: own.filter((line) => line.quantity > 0).map((line) => ({ item: line.item, unit: unit(line.countedIn), quantity: line.quantity })),
+          lines: own.filter((line) => line.quantity > 0).map((line) => ({ item: line.item, unit: line.unit, quantity: line.quantity })),
           containers: [...new Set(held.filter((h) => loaded.has(h.orderLineId)).map((h) => h.number))],
         };
       }),
@@ -241,7 +240,7 @@ export function stockRoutes({ db }: RouteContext) {
           : hidden(),
         orderLineId: orderLines.id,
         item: items.name,
-        countedIn: items.countedIn,
+        unit: unitSymbol,
         ordered: orderLines.quantity,
         receivedEarlier: received,
         unitPriceCny: money ? orderLines.rateCny : hidden(),
@@ -253,9 +252,9 @@ export function stockRoutes({ db }: RouteContext) {
       .where(and(inArray(orders.stage, [1, 2]), sql`${received} < ${orderLines.quantity}`))
       .orderBy(desc(orders.orderDate), desc(orders.createdAt), asc(orderLines.position));
     const byOrder = new Map<string, { orderId: string; po: string; supplier: string; currency: Currency; orderValueCny: number | null; depositsPaidCny: number | null; lines: object[] }>();
-    for (const { orderLineId, item, countedIn, ordered, receivedEarlier, unitPriceCny, ...order } of rows) {
+    for (const { orderLineId, item, unit, ordered, receivedEarlier, unitPriceCny, ...order } of rows) {
       if (!byOrder.has(order.orderId)) byOrder.set(order.orderId, { ...order, lines: [] });
-      byOrder.get(order.orderId)!.lines.push({ orderLineId, item, unit: unit(countedIn), ordered, receivedEarlier, unitPriceCny });
+      byOrder.get(order.orderId)!.lines.push({ orderLineId, item, unit, ordered, receivedEarlier, unitPriceCny });
     }
     res.json({ offices, orders: [...byOrder.values()] });
   });
@@ -276,7 +275,7 @@ export function stockRoutes({ db }: RouteContext) {
         .where(and(eq(locations.id, input.locationId), eq(locations.type, "China office"), eq(locations.status, "Active")));
       if (office.length === 0) problems.locationId = MESSAGES.office;
       const lines = await tx
-        .select({ id: orderLines.id, ordered: orderLines.quantity, received: receivedOf(), item: items.name, countedIn: items.countedIn })
+        .select({ id: orderLines.id, ordered: orderLines.quantity, received: receivedOf(), item: items.name, unit: unitSymbol })
         .from(orderLines)
         .innerJoin(items, eq(items.id, orderLines.itemId))
         .where(eq(orderLines.orderId, order.id));
@@ -308,8 +307,8 @@ export function stockRoutes({ db }: RouteContext) {
           actorId: req.user!.id,
           sourceId: created.id,
           title: `${po} received short`,
-          details: [supplier, short.length === 1 ? `${line.item} short by ${qty(line.left, unit(line.countedIn))}` : `${short.length} lines short`],
-          href: (canView) => (canView("ordersView") ? `/orders/${po}/receiving` : "/receiving"),
+          details: [supplier, short.length === 1 ? `${line.item} short by ${qty(line.left, line.unit)}` : `${short.length} lines short`],
+          href: (canView) => (canView("ordersView") ? `/orders/${encodeURIComponent(po)}/receiving` : "/receiving"),
         });
       }
       return created.id;
@@ -330,7 +329,7 @@ export function stockRoutes({ db }: RouteContext) {
       const order = (await tx.select({ id: orders.id, po: orders.poNumber }).from(orders).where(eq(orders.id, found.orderId)).for("update"))[0]!;
       // Read again under the lock: a delete of the same receipt that got there first leaves nothing (404).
       const lines = await tx
-        .select({ quantity: receiptLines.quantity, orderLineId: orderLines.id, received: receivedOf(), loaded: loadedOf(), item: items.name, countedIn: items.countedIn })
+        .select({ quantity: receiptLines.quantity, orderLineId: orderLines.id, received: receivedOf(), loaded: loadedOf(), item: items.name, unit: unitSymbol })
         .from(receipts)
         .leftJoin(receiptLines, eq(receiptLines.receiptId, receipts.id))
         .leftJoin(orderLines, eq(orderLines.id, receiptLines.orderLineId))
@@ -346,7 +345,7 @@ export function stockRoutes({ db }: RouteContext) {
           .innerJoin(containers, eq(containers.id, containerLines.containerId))
           .where(inArray(containerLines.orderLineId, inContainers.map((line) => line.orderLineId!)))
           .orderBy(asc(containers.number));
-        const goods = inContainers.map((line) => `${qty(line.fromIt, unit(line.countedIn!))} of ${line.item}`);
+        const goods = inContainers.map((line) => `${qty(line.fromIt, line.unit!)} of ${line.item}`);
         throw conflict("in_use", MESSAGES.receiptLoaded(goods, holding.map((container) => container.number)));
       }
       await tx.delete(receipts).where(eq(receipts.id, id));
@@ -432,7 +431,7 @@ export function stockRoutes({ db }: RouteContext) {
         orderId: orders.id,
         po: orders.poNumber,
         item: items.name,
-        countedIn: items.countedIn,
+        unit: unitSymbol,
         received,
         loaded,
       })
@@ -441,7 +440,7 @@ export function stockRoutes({ db }: RouteContext) {
       .innerJoin(items, eq(items.id, orderLines.itemId))
       .where(and(inArray(orders.stage, [2, 3]), sql`${received} > ${loaded}`))
       .orderBy(desc(orders.orderDate), desc(orders.createdAt), asc(orderLines.position));
-    res.json({ agents, lines: lines.map(({ countedIn, ...line }) => ({ ...line, unit: unit(countedIn) })) });
+    res.json({ agents, lines });
   });
 
   // CON-3. One transaction; the orders being loaded are locked first, so two containers can't both load the same stock.
@@ -478,7 +477,7 @@ export function stockRoutes({ db }: RouteContext) {
           orderId: orderLines.orderId,
           po: orders.poNumber,
           item: items.name,
-          countedIn: items.countedIn,
+          unit: unitSymbol,
           received: receivedOf(),
           loaded: loadedOf(),
         })
@@ -493,7 +492,7 @@ export function stockRoutes({ db }: RouteContext) {
         if (!line) problems.lines ??= MESSAGES.unknownLine;
         else if (stage !== 2 && stage !== 3) problems.lines ??= MESSAGES.notLoadable(line.po);
         else if (line.loaded + quantity > line.received) {
-          problems.lines ??= MESSAGES.overLoad(line.item, line.po, line.received - line.loaded, unit(line.countedIn));
+          problems.lines ??= MESSAGES.overLoad(line.item, line.po, line.received - line.loaded, line.unit);
         }
       }
       if (Object.keys(problems).length > 0) throw validationFailed(problems);

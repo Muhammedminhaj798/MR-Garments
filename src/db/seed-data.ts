@@ -34,7 +34,13 @@ export const SEED_TRANSPORT_COMPANIES = [
 
 export const SEED_TEAMS = [{ name: "Retail team" }, { name: "Wholesale team" }, { name: "Online team" }];
 
-export const SEED_ITEMS: { name: string; countedIn: "Pieces" | "Metres"; perBundle: number | null; bundleLabel: string | null }[] = [
+/** The units items were counted in before Settings had a Units tab (migration 0007 adds the same two). */
+export const SEED_UNITS = [
+  { name: "Pieces", symbol: "pcs" },
+  { name: "Metres", symbol: "m" },
+];
+
+export const SEED_ITEMS: { name: string; countedIn: string; perBundle: number | null; bundleLabel: string | null }[] = [
   { name: "Denim jeans", countedIn: "Pieces", perBundle: 50, bundleLabel: null },
   { name: "Track pants", countedIn: "Pieces", perBundle: 50, bundleLabel: null },
   { name: "Kids t-shirts", countedIn: "Pieces", perBundle: 50, bundleLabel: null },

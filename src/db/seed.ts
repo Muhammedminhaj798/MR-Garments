@@ -13,6 +13,7 @@ import {
   suppliers,
   teams,
   transportCompanies,
+  units,
   users,
   userStageGrants,
 } from "./schema";
@@ -24,6 +25,7 @@ import {
   SEED_SUPPLIERS,
   SEED_TEAMS,
   SEED_TRANSPORT_COMPANIES,
+  SEED_UNITS,
   SEED_USERS,
 } from "./seed-data";
 
@@ -58,6 +60,10 @@ export async function seed(db: Database, { nodeEnv, devPassword }: SeedOptions) 
     await tx.insert(clearingAgents).values(inOrder(SEED_CLEARING_AGENTS)).onConflictDoNothing();
     await tx.insert(transportCompanies).values(inOrder(SEED_TRANSPORT_COMPANIES)).onConflictDoNothing();
     await tx.insert(teams).values(inOrder(SEED_TEAMS)).onConflictDoNothing();
+    await tx.insert(units).values(inOrder(SEED_UNITS)).onConflictDoNothing();
+    await tx.insert(units).values(inOrder(SEED_UNITS)).onConflictDoNothing();
+    await tx.insert(units).values(inOrder(SEED_UNITS)).onConflictDoNothing();
+    await tx.insert(units).values(inOrder(SEED_UNITS)).onConflictDoNothing();
     await tx.insert(items).values(inOrder(SEED_ITEMS)).onConflictDoNothing();
 
     const locationRows = await tx.select({ id: locations.id, name: locations.name }).from(locations);

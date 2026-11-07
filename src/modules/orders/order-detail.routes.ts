@@ -23,12 +23,11 @@ import { parse } from "../../http/validate";
 import { atLeast, type Capability, effectiveAccess } from "../../permissions/matrix";
 import type { RouteContext } from "../context";
 import { containerOrders } from "../stages/common";
-import { line, lineList, MESSAGES as M, orderRows, round2, unit } from "./orders.routes";
+import { byPo, line, lineList, MESSAGES as M, orderRows, round2, unitSymbol } from "./orders.routes";
 
 // Owner: BE-orders. ORD-4 GET /orders/:po (docs/live-screens-contracts.md, "Five-tab completion"); ORD-5 PATCH and
 // ORD-6 DELETE /orders/:po (docs/contracts.md, "Orders: edit and delete").
 
-const PO = /^PO-\d+$/;
 const EDIT = {
   warehouse: "This order has reached the warehouse, so it can't be changed.",
   received: "Goods have been received for this order, so only the delivery date can change.",
@@ -51,7 +50,7 @@ export function orderDetailRoutes({ db }: RouteContext) {
 
   router.get("/orders/:po", requirePermission("ordersView", "View"), async (req, res) => {
     const po = String(req.params.po);
-    const row = PO.test(po) ? (await orderRows(db, [], eq(orders.poNumber, po)))[0] : undefined;
+    const row = (await orderRows(db, [], byPo(po)))[0];
     if (!row) throw notFound("Order");
     const orderId = row.id;
     const { role, stages } = req.user!;
@@ -70,7 +69,7 @@ export function orderDetailRoutes({ db }: RouteContext) {
           position: orderLines.position,
           itemId: items.id,
           itemName: items.name,
-          countedIn: items.countedIn,
+          unit: unitSymbol,
           quantity: orderLines.quantity,
           rateCny: orderLines.rateCny,
           valueCny: sql<number>`round(${orderLines.quantity} * ${orderLines.rateCny}, 2)`.mapWith(Number),
@@ -121,7 +120,7 @@ export function orderDetailRoutes({ db }: RouteContext) {
               receiptId: receiptLines.receiptId,
               orderLineId: receiptLines.orderLineId,
               item: items.name,
-              countedIn: items.countedIn,
+              unit: unitSymbol,
               quantity: receiptLines.quantity,
             })
             .from(receiptLines)
@@ -134,7 +133,7 @@ export function orderDetailRoutes({ db }: RouteContext) {
           ...receipt,
           lines: lineList
             .filter((line) => line.receiptId === receipt.id)
-            .map((line) => ({ orderLineId: line.orderLineId, item: line.item, unit: unit(line.countedIn), quantity: line.quantity })),
+            .map((line) => ({ orderLineId: line.orderLineId, item: line.item, unit: line.unit, quantity: line.quantity })),
         }));
       }),
       section("containers", async () => {
@@ -144,7 +143,7 @@ export function orderDetailRoutes({ db }: RouteContext) {
             containerId: containerLines.containerId,
             orderLineId: containerLines.orderLineId,
             item: items.name,
-            countedIn: items.countedIn,
+            unit: unitSymbol,
             bundles: containerLines.bundles,
             quantity: containerLines.quantity,
           })
@@ -181,7 +180,7 @@ export function orderDetailRoutes({ db }: RouteContext) {
           orders: pos.get(container.id)?.orders ?? [],
           lines: lineList
             .filter((line) => line.containerId === container.id)
-            .map((line) => ({ orderLineId: line.orderLineId, item: line.item, unit: unit(line.countedIn), bundles: line.bundles, quantity: line.quantity })),
+            .map((line) => ({ orderLineId: line.orderLineId, item: line.item, unit: line.unit, bundles: line.bundles, quantity: line.quantity })),
         }));
       }),
     ]);
@@ -196,13 +195,13 @@ export function orderDetailRoutes({ db }: RouteContext) {
       currency: row.currency,
       item: row.item,
       quantity: row.quantity,
-      unit: unit(row.countedIn),
+      unit: row.unit,
       received: row.received,
       orderValueCny: row.orderValueCny,
       paidCny: row.paidCny,
       paidInr: row.paidInr,
       balanceCny: round2(row.orderValueCny - row.paidCny),
-      lines: lines.map(({ itemId, itemName, countedIn, ...line }) => ({ ...line, item: { id: itemId, name: itemName }, unit: unit(countedIn) })),
+      lines: lines.map(({ itemId, itemName, ...line }) => ({ ...line, item: { id: itemId, name: itemName } })),
       payments: paymentList,
       receipts: receiptList,
       containers: containerList,
@@ -213,12 +212,11 @@ export function orderDetailRoutes({ db }: RouteContext) {
   // key-share locks it, so no receipt, load or payment can land between the checks below and the change.
   router.patch("/orders/:po", requirePermission("ordersEdit", "Enter"), async (req, res) => {
     const po = String(req.params.po);
-    if (!PO.test(po)) throw notFound("Order");
     const input = parse(orderEdit, req.body);
     if (Object.keys(input).length === 0) throw new HttpError(400, "bad_request", GENERIC_MESSAGE);
 
     const order = await db.transaction(async (tx) => {
-      const row = (await tx.select().from(orders).where(eq(orders.poNumber, po)).for("update"))[0];
+      const row = (await tx.select().from(orders).where(byPo(po)).for("update"))[0];
       if (!row) throw notFound("Order");
       if (row.stage === 6) throw conflict("order_locked", EDIT.warehouse);
       const headerOrLines = input.orderDate !== undefined || input.lines !== undefined;
@@ -286,11 +284,10 @@ export function orderDetailRoutes({ db }: RouteContext) {
   // key-share locks the row it names, so nothing can start depending on the order between the counts and the delete.
   router.delete("/orders/:po", requirePermission("admin", "Full"), async (req, res) => {
     const po = String(req.params.po);
-    if (!PO.test(po)) throw notFound("Order");
     const inUse = (what: string) => conflict("in_use", `This order has ${what}, so it can't be deleted.`);
     await db
       .transaction(async (tx) => {
-        const row = (await tx.select({ id: orders.id }).from(orders).where(eq(orders.poNumber, po)).for("update"))[0];
+        const row = (await tx.select({ id: orders.id }).from(orders).where(byPo(po)).for("update"))[0];
         if (!row) throw notFound("Order");
         await tx.select({ id: orderLines.id }).from(orderLines).where(eq(orderLines.orderId, row.id)).for("update");
         const lines = tx.select({ id: orderLines.id }).from(orderLines).where(eq(orderLines.orderId, row.id));

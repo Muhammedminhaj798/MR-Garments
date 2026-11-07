@@ -18,7 +18,7 @@ import {
   warehouseReceipts,
 } from "../../db/schema";
 import { loadLandedCosts } from "../costs/landed-cost";
-import { round2, unit } from "../orders/orders.routes";
+import { round2, unitSymbol } from "../orders/orders.routes";
 
 // The seven reports behind GET /reports/<name> (docs/wave3-contracts.md sections 7 and 8). Each takes the optional
 // filters and today in India, and returns its JSON body. Shapes are recorded in section 8.
@@ -139,7 +139,7 @@ export async function orderedVsReceived(db: Database, f: Filters) {
       supplier: suppliers.name,
       currency: orders.currency,
       item: items.name,
-      countedIn: items.countedIn,
+      unit: unitSymbol,
       ordered: orderLines.quantity,
       rateCny: orderLines.rateCny,
       received: sql<number>`(select coalesce(sum(${receiptLines.quantity}), 0) from ${receiptLines} where ${receiptLines.orderLineId} = ${orderLines.id})`.mapWith(Number),
@@ -150,9 +150,9 @@ export async function orderedVsReceived(db: Database, f: Filters) {
     .innerJoin(items, eq(items.id, orderLines.itemId))
     .where(and(orderFilter(f), sql`exists (select 1 from ${receipts} where ${receipts.orderId} = ${orders.id})`))
     .orderBy(desc(orders.orderDate), desc(orders.poNumber), asc(orderLines.position));
-  const lines = rows.map(({ countedIn, rateCny, ...row }) => {
+  const lines = rows.map(({ rateCny, ...row }) => {
     const short = Math.max(0, row.ordered - row.received);
-    return { ...row, unit: unit(countedIn), short, shortValueCny: short > 0 ? round2(short * rateCny) : null };
+    return { ...row, short, shortValueCny: short > 0 ? round2(short * rateCny) : null };
   });
   const checked = new Set(lines.map((line) => line.orderId));
   const shortPos = [...new Map(lines.filter((line) => line.short > 0).map((line) => [line.orderId, line.po])).values()];

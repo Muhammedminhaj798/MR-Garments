@@ -4,10 +4,11 @@ import { z } from "zod";
 
 import { requirePermission } from "../../auth/current-user";
 import type { Database } from "../../db/client";
-import { items, orderLines, orders, STATUSES } from "../../db/schema";
+import { items, orderLines, orders, STATUSES, units } from "../../db/schema";
 import { conflict, GENERIC_MESSAGE, HttpError, notFound, validationFailed } from "../../http/errors";
 import { parse } from "../../http/validate";
 import type { RouteContext } from "../context";
+import { poValue } from "../orders/orders.routes";
 import { deleteRoute } from "./delete-route";
 import { creationOrder, listRoute } from "./list-query";
 
@@ -18,7 +19,7 @@ export const MESSAGES = {
   name: "Enter the item name.",
   nameTooLong: "Use 200 characters or fewer.",
   nameTaken: "An item with this name already exists.",
-  countedIn: "Choose Pieces or Metres.",
+  countedIn: "Choose a unit from the list.",
   bundle: "Enter the pieces per bundle or a bundle label.", // contract
   perBundle: "Enter a whole number of pieces from 1 to 100000.",
   bundleLabelTooLong: "Use 200 characters or fewer.",
@@ -28,7 +29,7 @@ const M = MESSAGES;
 
 const fields = {
   name: z.string({ error: M.name }).trim().min(1, M.name).max(200, M.nameTooLong),
-  countedIn: z.enum(["Pieces", "Metres"], { error: M.countedIn }),
+  countedIn: z.string({ error: M.countedIn }).trim().min(1, M.countedIn).max(50, M.countedIn),
   perBundle: z.number({ error: M.perBundle }).int(M.perBundle).min(1, M.perBundle).max(100_000, M.perBundle).nullable(),
   // A blank label is no label.
   bundleLabel: z
@@ -59,15 +60,26 @@ function nameTakenAsConflict(error: unknown): never {
   type PgError = { code?: string; constraint?: string; cause?: PgError };
   const pg = (error as PgError)?.cause ?? (error as PgError);
   if (pg?.code === "23505" && pg.constraint === "items_name_unique") throw conflict("name_exists", M.nameTaken, { name: M.nameTaken });
+  // The unit was deleted between the check and the write.
+  if (pg?.code === "23503" && pg.constraint === "items_counted_in_units_name_fk") throw validationFailed({ countedIn: M.countedIn });
   throw error;
 }
 
-// The distinct PO numbers of the orders with a line of this item, in PO order (PO-999 before PO-1000).
-const poValue = sql`substring(${orders.poNumber} from '^PO-([0-9]+)$')::bigint`;
+/** The active unit named (any letter case), as its name is stored; items.counted_in points at it. */
+async function activeUnit(db: Pick<Database, "select">, name: string) {
+  const found = await db
+    .select({ name: units.name })
+    .from(units)
+    .where(sql`lower(${units.name}) = lower(${name}) and ${units.status} = 'Active'`);
+  if (!found[0]) throw validationFailed({ countedIn: M.countedIn });
+  return found[0].name;
+}
+
+// The distinct PO numbers of the orders with a line of this item, in PO order (PO-999 before PO-1000; others after, by text).
 // ponytail: one subquery per item over every order; add an order_lines(item_id) index if orders reach the thousands.
 const ordersWithItem = sql`select ${orders.poNumber} from ${orders}
   where exists (select 1 from ${orderLines} where ${orderLines.orderId} = ${orders.id} and ${orderLines.itemId} = ${items.id})
-  order by ${poValue}, ${orders.poNumber}`;
+  order by ${poValue} nulls last, ${orders.poNumber}`;
 // Nested, so the columns keep their table names: drizzle drops them from a single-table select's top-level columns.
 const usedInOrders = sql<string[]>`array(${ordersWithItem})`;
 
@@ -95,12 +107,14 @@ export function itemsRoutes({ db }: RouteContext) {
 
   router.post("/items", admin, async (req, res) => {
     const { perBundle, bundleLabel, ...input } = parse(newItem, req.body);
+    const countedIn = await activeUnit(db, input.countedIn);
     // The unique index on lower(name) decides duplicates, so two simultaneous adds can't both succeed.
     const created = await db
       .insert(items)
-      .values({ ...input, ...bundle(perBundle, bundleLabel) })
+      .values({ ...input, countedIn, ...bundle(perBundle, bundleLabel) })
       .onConflictDoNothing()
-      .returning({ id: items.id });
+      .returning({ id: items.id })
+      .catch(nameTakenAsConflict);
     if (!created[0]) throw conflict("name_exists", M.nameTaken, { name: M.nameTaken });
     res.status(201).json({ item: (await itemRows(db, created[0].id))[0] });
   });
@@ -111,7 +125,7 @@ export function itemsRoutes({ db }: RouteContext) {
     if (!isUuid(id)) throw notFound("Item");
     const parsed = parse(itemUpdate, req.body);
     if (Object.keys(parsed).length === 0) throw new HttpError(400, "bad_request", GENERIC_MESSAGE);
-    const { perBundle, bundleLabel, ...input } = parsed;
+    const { perBundle, bundleLabel, countedIn, ...input } = parsed;
     const values = perBundle === undefined && bundleLabel === undefined ? input : { ...input, ...bundle(perBundle ?? null, bundleLabel ?? null) };
 
     await db
@@ -119,11 +133,17 @@ export function itemsRoutes({ db }: RouteContext) {
         // Locked, so no order can take the item between the check and the change (a new order line key-share locks it).
         const current = (await tx.select({ countedIn: items.countedIn }).from(items).where(eq(items.id, id)).for("update"))[0];
         if (!current) throw notFound("Item");
-        if (input.countedIn && input.countedIn !== current.countedIn) {
+        // The same unit again (any letter case) is no change: an item on an order can still be edited with it, and an
+        // item whose unit has since been deactivated keeps it.
+        const unitChanged = countedIn !== undefined && countedIn.toLowerCase() !== current.countedIn.toLowerCase();
+        if (unitChanged) {
           const lines = await tx.select({ id: orderLines.id }).from(orderLines).where(eq(orderLines.itemId, id)).limit(1);
           if (lines.length > 0) throw conflict("item_in_use", M.inUse);
         }
-        await tx.update(items).set(values).where(eq(items.id, id));
+        await tx
+          .update(items)
+          .set(unitChanged ? { ...values, countedIn: await activeUnit(tx, countedIn) } : values)
+          .where(eq(items.id, id));
       })
       .catch(nameTakenAsConflict);
     res.json({ item: (await itemRows(db, id))[0] });

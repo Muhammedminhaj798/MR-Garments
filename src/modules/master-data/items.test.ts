@@ -84,7 +84,7 @@ describe("POST /items", () => {
     expect(fieldsOf(await add({ ...BLAZERS, name: "  " }))).toEqual({ name: M.name });
     expect(fieldsOf(await add({ countedIn: "Pieces", perBundle: 25 }))).toEqual({ name: M.name });
     expect(fieldsOf(await add({ ...BLAZERS, name: "x".repeat(201) }))).toEqual({ name: M.nameTooLong });
-    for (const countedIn of ["Kilos", "pieces", undefined, 1]) {
+    for (const countedIn of ["Kilos", "", undefined, 1]) {
       expect(fieldsOf(await add({ ...BLAZERS, countedIn })), String(countedIn)).toEqual({ countedIn: M.countedIn });
     }
     for (const perBundle of [0, -5, 1.5, 100_001, "25"]) {

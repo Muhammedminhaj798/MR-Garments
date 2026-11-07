@@ -9,6 +9,7 @@ import { parse } from "../../http/validate";
 import type { RouteContext } from "../context";
 import { day, notify } from "../notifications/notify";
 import { joined } from "../orders/order-detail.routes";
+import { unitSymbol } from "../orders/orders.routes";
 import { settleStages } from "../stages-shared";
 import { MESSAGES } from "./stock.routes";
 
@@ -29,8 +30,6 @@ export const DETAIL_MESSAGES = {
   inUse: (number: string, records: string) => `Container ${number} has ${records}, so it can't be deleted. Those records can't be removed in the app.`,
 };
 
-// Copied from stock.routes.ts (private there).
-const unit = (countedIn: string) => (countedIn === "Metres" ? "m" : "pcs");
 /** Today in India (Asia/Kolkata, UTC+5:30, no daylight saving) as YYYY-MM-DD. */
 const todayInIndia = () => new Date(Date.now() + 5.5 * 3600_000).toISOString().slice(0, 10);
 const isUuid = (value: string) => z.uuid().safeParse(value).success;
@@ -76,7 +75,7 @@ export function containerDetailRoutes({ db }: RouteContext) {
         orderId: orderLines.orderId,
         po: orders.poNumber,
         item: items.name,
-        countedIn: items.countedIn,
+        unit: unitSymbol,
         bundles: containerLines.bundles,
         quantity: containerLines.quantity,
       })
@@ -98,7 +97,7 @@ export function containerDetailRoutes({ db }: RouteContext) {
         po,
         part: ordered.some((line) => line.orderId === orderId && (inThis.get(line.id) ?? 0) < line.quantity),
       })),
-      lines: lines.map(({ countedIn, ...line }) => ({ ...line, unit: unit(countedIn) })),
+      lines,
     });
   });
 
