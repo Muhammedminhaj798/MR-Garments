@@ -1,12 +1,14 @@
 import { sql } from "drizzle-orm";
 
-import { containerLines, orderLines, orders, transports, warehouseReceipts } from "../../db/schema";
+import { containerLines, orderLines, orders, transports, warehouseReceiptLines, warehouseReceipts } from "../../db/schema";
 
 // When an order is closed (docs/phase2-contracts.md section 1). Coordinator-owned: Orders, Reports and Deposits read
 // these and never write their own rule.
 //
 // The workflow ends in the India warehouse: an order is **closed** when it is at stage 6 (a warehouse receipt holding
-// its goods was stocked, WH-3) and every container carrying any of its goods has a stocked warehouse receipt. That is
+// its goods was stocked, WH-3), every container carrying any of its goods has a stocked warehouse receipt, and at least
+// one of its own pieces was given to a team (another order's pieces in a shared container never close it;
+// docs/phase2-fixes.md 3). The carrier rule is
 // the landed-cost rule already in force (costs/landed-cost.ts `waitingFor`: "warehouse" while stage < 6 or a carrier
 // is not stocked), so a multi-container order stays open until its last container is stocked. China receiving,
 // loading, clearing and transport never close an order. Nothing is stored: the rule reads the live records, so WH-4
@@ -22,8 +24,14 @@ const unstockedCarrier = sql`exists (select 1 from ${containerLines}
     join ${transports} on ${transports.id} = ${warehouseReceipts.transportId}
     where ${warehouseReceipts.status} = 'stocked' and ${transports.containerId} = ${containerLines.containerId}))`;
 
-/** True when the order is closed (stage 6 and no carrier left to stock). */
-export const orderClosed = sql<boolean>`(${orders.stage} = 6 and not ${unstockedCarrier})`;
+/** This order's own pieces on a stocked receipt (WH-3 refuses a receipt that gives an order none; this is the belt). */
+const ownPiecesStocked = sql`exists (select 1 from ${warehouseReceiptLines}
+  join ${warehouseReceipts} on ${warehouseReceipts.id} = ${warehouseReceiptLines.receiptId}
+  join ${orderLines} on ${orderLines.id} = ${warehouseReceiptLines.orderLineId}
+  where ${warehouseReceipts.status} = 'stocked' and ${warehouseReceiptLines.quantity} > 0 and ${orderLines.orderId} = ${orders.id})`;
+
+/** True when the order is closed (stage 6, no carrier left to stock, and some of its own pieces stocked). */
+export const orderClosed = sql<boolean>`(${orders.stage} = 6 and not ${unstockedCarrier} and ${ownPiecesStocked})`;
 
 /** The day the order closed: the latest `received_on` of the stocked receipts holding its goods; null while open. */
 export const orderClosedOn = sql<string | null>`case when ${orderClosed} then (select max(${warehouseReceipts.receivedOn})::text from ${warehouseReceipts}

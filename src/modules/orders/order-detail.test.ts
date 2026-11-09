@@ -103,9 +103,14 @@ describe("ORD-4 GET /orders/:po", () => {
       closedOn: null,
       orderValueCny: 14975, // 1000 * 12.5 + 300 * 8.25
       paidCny: 2234.56,
-      supplierPaidCny: 1234.56,
       paidInr: 26562.25, // 1234.56 * 11.8765 = 14662.25 (rounded) + 1000 * 11.9
-      balanceCny: 12740.44,
+      supplierPaidCny: 1234.56,
+      supplierPaidInr: 14662.25,
+      balanceCny: 13740.44, // owed to the supplier: the ¥1,000 agent deposit is freight
+      depositRequiredCny: null,
+      depositPaidCny: 1234.56,
+      depositPendingCny: null,
+      depositStatus: "none",
       lines: [
         { id: jeans, position: 0, item: { id: ids.jeans, name: "Denim jeans" }, unit: "pcs", quantity: 1000, rateCny: 12.5, valueCny: 12500, received: 900, loaded: 700 },
         { id: fabric, position: 1, item: { id: ids.fabric, name: "Cotton fabric" }, unit: "m", quantity: 300, rateCny: 8.25, valueCny: 2475, received: 100, loaded: 0 },
@@ -124,6 +129,7 @@ describe("ORD-4 GET /orders/:po", () => {
           mode: "Bank transfer",
           reference: "TXN-778", // trimmed
           notes: "First 10%",
+          amountInr: 14662.25,
         },
         expect.objectContaining({ payee: "Sino Freight", payeeRole: "agent", amountCny: 1000, paidOn: indiaDay(-20), rateInr: 11.9, mode: "Cash" }),
       ],

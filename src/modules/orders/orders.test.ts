@@ -137,8 +137,13 @@ describe("ORD-3 POST /orders and ORD-1 GET /orders", () => {
       closedOn: null,
       orderValueCny: 14975, // 1000 * 12.5 + 300 * 8.25
       paidCny: 2234.56,
-      supplierPaidCny: 1234.56, // the ¥1,000 agent deposit is sea freight
       paidInr: 26562.25, // 1234.56 * 11.8765 = 14662.25 (rounded) + 1000 * 11.9
+      supplierPaidCny: 1234.56, // the ¥1,000 agent deposit is sea freight
+      supplierPaidInr: 14662.25,
+      depositRequiredCny: null,
+      depositPaidCny: 1234.56,
+      depositPendingCny: null,
+      depositStatus: "none",
     });
     expect(list.body[0]).toMatchObject({ item: "Cotton fabric", quantity: 50, unit: "m", orderValueCny: 150, paidCny: 0, paidInr: 0 });
   });
@@ -303,7 +308,23 @@ describe("PAY-1 GET /payments", () => {
     const res = await get("/payments");
     expect(res.status).toBe(200);
     expect(res.body.orders).toEqual([
-      { orderId: bare.id, po: bare.po, supplier: "Guangzhou Textile Co.", currency: "CNY", orderValueCny: 14975, paidCny: 0, paidInr: 0, balanceCny: 14975, nextDue: null },
+      {
+        orderId: bare.id,
+        po: bare.po,
+        supplier: "Guangzhou Textile Co.",
+        currency: "CNY",
+        orderValueCny: 14975,
+        paidCny: 0,
+        paidInr: 0,
+        supplierPaidCny: 0,
+        supplierPaidInr: 0,
+        balanceCny: 14975,
+        depositRequiredCny: null,
+        depositPaidCny: 0,
+        depositPendingCny: null,
+        depositStatus: "none",
+        nextDue: null,
+      },
       {
         orderId: withDeposits.id,
         po: withDeposits.po,
@@ -312,7 +333,13 @@ describe("PAY-1 GET /payments", () => {
         orderValueCny: 14975,
         paidCny: 2234.56,
         paidInr: 26562.25,
-        balanceCny: 12740.44, // due payments are not paid
+        supplierPaidCny: 1234.56,
+        supplierPaidInr: 14662.25,
+        balanceCny: 13740.44, // what the supplier is owed: due payments are not paid, the agent deposit is freight
+        depositRequiredCny: null,
+        depositPaidCny: 1234.56,
+        depositPendingCny: null,
+        depositStatus: "none",
         nextDue: "2026-12-05",
       },
     ]);

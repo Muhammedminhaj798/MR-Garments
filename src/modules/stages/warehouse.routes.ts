@@ -22,6 +22,7 @@ import { conflict, notFound, validationFailed } from "../../http/errors";
 import { parse } from "../../http/validate";
 import { loadLandedCosts } from "../costs/landed-cost";
 import type { RouteContext } from "../context";
+import { notify } from "../notifications/notify";
 import { atLeast, effectiveAccess } from "../../permissions/matrix";
 import { round2 } from "../orders/orders.routes";
 import { supplierMoney } from "../reports/reports";
@@ -58,6 +59,8 @@ export const WAREHOUSE_MESSAGES = {
   duplicateLine: "Each line can appear only once per team.",
   overSplit: (item: string, po: string, quantity: number, unit: string) => `${item} (${po}): only ${quantity} ${unit} in this container.`,
   nothingAssigned: "Give at least one piece to a team.",
+  /** Every order in the container must get some of its own pieces before the receipt closes it (docs/phase2-fixes.md 3). */
+  noPiecesFor: (po: string) => `${po}: give at least one of its pieces to a team before completing, or save a draft.`,
 };
 const M = WAREHOUSE_MESSAGES;
 
@@ -399,6 +402,13 @@ export function warehouseRoutes({ db }: RouteContext) {
         if (pieces > line.quantity) problems.lines ??= M.overSplit(line.item, line.po, line.quantity, line.unit);
       }
       if (input.complete && !problems.lines && [...split.values()].every((pieces) => pieces === 0)) problems.lines = M.nothingAssigned;
+      if (input.complete && !problems.lines) {
+        // Stocking moves every order in the container to stage 6 and closes it, so each must have received something of its own.
+        const perOrder = new Map<string, number>();
+        for (const line of goods) perOrder.set(line.orderId, (perOrder.get(line.orderId) ?? 0) + (split.get(line.orderLineId) ?? 0));
+        const empty = goods.find((line) => perOrder.get(line.orderId) === 0);
+        if (empty) problems.lines = M.noPiecesFor(empty.po);
+      }
       if (Object.keys(problems).length > 0) throw validationFailed(problems);
 
       const { complete: done, lines, ...values } = input;
@@ -437,9 +447,20 @@ export function warehouseRoutes({ db }: RouteContext) {
       const orderIds = await lockContainerOrders(tx, trip.containerId);
       await tx.delete(warehouseReceipts).where(eq(warehouseReceipts.id, receipt.id));
       await settleStages(tx, orderIds);
+      // The audit trail (docs/phase2-fixes.md 4): everyone with warehouse access learns which orders stepped back, and
+      // the row outlives the server log. A stocked receipt's deletion is the only way a received order reopens.
+      const container = (await tx.select({ number: containers.number }).from(containers).where(eq(containers.id, trip.containerId)))[0]!;
+      const pos = (await containerOrders(tx, [trip.containerId])).get(trip.containerId)?.orders ?? [];
+      await notify(tx, {
+        kind: "warehouse-receipt-deleted",
+        actorId: req.user!.id,
+        sourceId: receipt.id,
+        title: `${container.number} warehouse receipt deleted`,
+        details: [`${receipt.status === "stocked" ? "Stocked" : "Draft"} receipt of trip ${trip.lr}`, `${pos.join(", ")}: back to an earlier stage`],
+        href: () => "/warehouse",
+      });
       return { lr: trip.lr, status: receipt.status };
     });
-    // ponytail: the server log is the deletion record; an audit table needs a migration, add one when audits are asked for.
     console.info(`Warehouse receipt (${deleted.status}) of trip ${deleted.lr} (${id}) deleted by user ${req.user!.id}.`);
     res.status(204).end();
   });

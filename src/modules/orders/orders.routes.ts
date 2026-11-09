@@ -24,6 +24,7 @@ import { validationFailed } from "../../http/errors";
 import { parse } from "../../http/validate";
 import type { RouteContext } from "../context";
 import { orderClosed, orderClosedOn } from "./closure";
+import { depositState, orderMoney, round2 } from "./money";
 
 // Owner: BE-orders. ORD-1 GET /orders, ORD-2 GET /orders/options, ORD-3 POST /orders, CAL-1 GET /deliveries,
 // PAY-1 GET /payments (docs/live-screens-contracts.md). Payments are records only: nothing here moves money.
@@ -51,6 +52,7 @@ export const MESSAGES = {
   po: "Enter the PO number.",
   poTooLong: "Use 50 characters or fewer.",
   poTaken: "This PO number is already used by another order.",
+  depositRequired: "Enter the deposit the supplier asked for: above 0, with at most 2 decimals.",
   referenceTooLong: "Use 100 characters or fewer for the reference.",
   notesTooLong: "Use 1,000 characters or fewer for the notes.",
 };
@@ -77,6 +79,12 @@ const deposit = z.strictObject({
   reference: z.string({ error: M.referenceTooLong }).trim().max(100, M.referenceTooLong).default(""),
   notes: z.string({ error: M.notesTooLong }).trim().max(1000, M.notesTooLong).default(""),
 });
+/** 0.01 to 999,999,999,999 with at most 2 decimals (shared with ORD-5). */
+export const depositRequired = z
+  .number({ error: M.depositRequired })
+  .min(0.01, M.depositRequired)
+  .max(999_999_999_999, M.depositRequired)
+  .refine((value) => Number(value.toFixed(2)) === value, M.depositRequired);
 const newOrder = z.strictObject({
   // The form's PO number (the offered next one, or what the user changed it to) in any format (VM-11340, MR/2026/001),
   // kept as typed apart from the surrounding spaces. Left out, the server assigns the next PO-<number>.
@@ -88,6 +96,8 @@ const newOrder = z.strictObject({
   deliveryDate: z.iso.date({ error: M.deliveryDate }),
   lines: lineList(line),
   deposits: z.array(deposit).max(10, M.tooManyDeposits).default([]),
+  // The deposit the supplier asked for (0009), in the order's currency; left out, none was agreed.
+  depositRequiredCny: depositRequired.optional(),
 });
 type NewOrder = z.infer<typeof newOrder>;
 
@@ -95,7 +105,7 @@ type NewOrder = z.infer<typeof newOrder>;
 // Nested, so the columns keep their table names (drizzle drops them from a single-table select's top-level columns).
 const symbolOf = sql`select ${units.symbol} from ${units} where ${units.name} = ${items.countedIn}`;
 export const unitSymbol = sql<string>`coalesce(nullif((${symbolOf}), ''), ${items.countedIn})`;
-export const round2 = (value: number) => Math.round(value * 100) / 100;
+export { round2 };
 
 /**
  * What is wrong with a paid payment's INR rate for an order in `currency`, or null. An INR order takes no rate (it is
@@ -143,11 +153,9 @@ async function checkRules(db: Database, input: NewOrder) {
   if (Object.keys(problems).length > 0) throw validationFailed(problems);
 }
 
-// The main line (position 0) gives the item, quantity and received figures the lists show.
+// The main line (position 0) gives the item, quantity and received figures the lists show; the money comes from
+// ./money.ts (the one place the payee rules live).
 export const main = alias(orderLines, "main_line");
-const paid = sql`${payments.orderId} = ${orders.id} and ${payments.status} = 'paid'`;
-/** Paid payments to the order's supplier only: agent payments are sea freight (docs/wave3-contracts.md 6.2), not the supplier's money. */
-const paidToSupplier = sql`${paid} and ${payments.payeeRole} = 'supplier'`;
 export const orderColumns = {
   id: orders.id,
   po: orders.poNumber,
@@ -167,13 +175,9 @@ export const orderColumns = {
     where ${warehouseReceiptLines.orderLineId} = ${main.id})`.mapWith(Number),
   closed: orderClosed,
   closedOn: orderClosedOn,
-  orderValueCny: sql<number>`(select round(coalesce(sum(${orderLines.quantity} * ${orderLines.rateCny}), 0), 2) from ${orderLines} where ${orderLines.orderId} = ${orders.id})`.mapWith(Number),
-  paidCny: sql<number>`(select coalesce(sum(${payments.amountCny}), 0) from ${payments} where ${paid})`.mapWith(Number),
-  /** What the supplier has been paid (phase 2 1.1): the lists' payment status and balance to the supplier read this, not paidCny. */
-  supplierPaidCny: sql<number>`(select coalesce(sum(${payments.amountCny}), 0) from ${payments} where ${paidToSupplier})`.mapWith(Number),
-  // INR is amountCny * rateInr rounded to 2 decimals per payment, then summed.
-  paidInr: sql<number>`(select coalesce(sum(round(${payments.amountCny} * ${payments.rateInr}, 2)), 0) from ${payments} where ${paid})`.mapWith(Number),
-  nextDue: sql<string | null>`(select min(${payments.dueDate})::text from ${payments} where ${payments.orderId} = ${orders.id} and ${payments.status} = 'due')`,
+  ...orderMoney,
+  /** The deposit the supplier asked for (0009); null when none. depositState() turns it and depositPaidCny into the status. */
+  depositRequiredCny: orders.depositRequiredCny,
 };
 // A typed PO without a number sorts after the numbered ones of its day, then by its text.
 export const newestFirst = [desc(orders.orderDate), sql`${poValue} desc nulls last`, desc(orders.poNumber)];
@@ -214,8 +218,10 @@ export function ordersRoutes({ db }: RouteContext) {
         closedOn: row.closedOn,
         orderValueCny: row.orderValueCny,
         paidCny: row.paidCny,
-        supplierPaidCny: row.supplierPaidCny,
         paidInr: row.paidInr,
+        supplierPaidCny: row.supplierPaidCny,
+        supplierPaidInr: row.supplierPaidInr,
+        ...depositState(row.depositRequiredCny, row.depositPaidCny),
       })),
     );
   });
@@ -273,6 +279,7 @@ export function ordersRoutes({ db }: RouteContext) {
               orderDate: input.orderDate,
               deliveryDate: input.deliveryDate,
               currency: input.currency,
+              depositRequiredCny: input.depositRequiredCny ?? null,
               createdBy: userId,
             })
             .returning({ id: orders.id, po: orders.poNumber });
@@ -335,7 +342,8 @@ export function ordersRoutes({ db }: RouteContext) {
     );
   });
 
-  // PAY-1. Every order's figures (newest first) and every payment record (latest date first).
+  // PAY-1. Every order's figures (newest first) and every payment record (latest date first). `balanceCny` is what
+  // the supplier is still owed (order value less supplier payments); `paidCny`/`paidInr` count every payee.
   router.get("/payments", requirePermission("payments", "View"), async (_req, res) => {
     const [orderList, paymentList] = await Promise.all([
       orderRows(db, newestFirst),
@@ -370,7 +378,10 @@ export function ordersRoutes({ db }: RouteContext) {
         orderValueCny: row.orderValueCny,
         paidCny: row.paidCny,
         paidInr: row.paidInr,
-        balanceCny: round2(row.orderValueCny - row.paidCny),
+        supplierPaidCny: row.supplierPaidCny,
+        supplierPaidInr: row.supplierPaidInr,
+        balanceCny: round2(row.orderValueCny - row.supplierPaidCny),
+        ...depositState(row.depositRequiredCny, row.depositPaidCny),
         nextDue: row.nextDue,
       })),
       payments: paymentList,

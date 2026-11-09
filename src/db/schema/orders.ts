@@ -31,6 +31,11 @@ export const orders = pgTable(
     deliveryDate: date("delivery_date").notNull(),
     currency: text("currency").$type<Currency>().notNull().default("CNY"),
     stage: smallint("stage").notNull().default(1),
+    /**
+     * The deposit the supplier asked for, in the order's currency (0009); null when none was agreed. Paid supplier
+     * deposits count against it; nothing is stored for the pending part (docs/phase2-fixes.md).
+     */
+    depositRequiredCny: money("deposit_required_cny"),
     ...timestamps,
     createdBy: uuid("created_by"),
   },
@@ -40,6 +45,7 @@ export const orders = pgTable(
     check("orders_currency_check", inList("currency", CURRENCIES)),
     check("orders_stage_check", sql`stage between 1 and 6`),
     check("orders_dates_check", sql`delivery_date >= order_date`),
+    check("orders_deposit_required_check", sql`deposit_required_cny is null or deposit_required_cny > 0`),
   ],
 );
 

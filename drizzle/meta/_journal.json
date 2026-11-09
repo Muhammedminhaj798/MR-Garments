@@ -64,6 +64,13 @@
       "when": 1794201797441,
       "tag": "0008_deposits",
       "breakpoints": true
+    },
+    {
+      "idx": 9,
+      "version": "7",
+      "when": 1794213475841,
+      "tag": "0009_phase2_fixes",
+      "breakpoints": true
     }
   ]
 }

@@ -4,6 +4,7 @@ import { z } from "zod";
 import type { Database } from "../../db/client";
 import { CURRENCIES, items, orderLines, orders, payments, suppliers } from "../../db/schema";
 import { notFound } from "../../http/errors";
+import { orderClosed } from "../orders/closure";
 import { main, newestFirst, orderColumns, round2, unitSymbol } from "../orders/orders.routes";
 import { orderFilter, supplierMoney, toSupplier } from "./reports";
 
@@ -58,11 +59,13 @@ export async function supplierPaymentDetail(db: Database, supplierId: string, q:
   const inPaymentRange = and(q.paymentFrom ? gte(paymentDay, q.paymentFrom) : undefined, q.paymentTo ? lte(paymentDay, q.paymentTo) : undefined) ?? sql`true`;
   const ofSupplier = and(scope, eq(payments.payeeRole, "supplier"));
 
-  // Per order: the report's money, deposits (a subset of paid) and the stage, grouped by order currency below.
+  // Per order: the report's money, deposits (a subset of paid), the stage and whether it is closed, grouped by order
+  // currency below. The join keeps the closure fragment's columns qualified (closure.ts).
   const perOrder = db
     .select({
       currency: orders.currency,
       stage: orders.stage,
+      closed: orderClosed.as("closed"),
       orderValueCny: supplierMoney.orderValueCny.as("order_value_cny"),
       paidCny: supplierMoney.paidCny.as("paid_cny"),
       paidInr: supplierMoney.paidInr.as("paid_inr"),
@@ -70,6 +73,7 @@ export async function supplierPaymentDetail(db: Database, supplierId: string, q:
         where ${toSupplier} and ${payments.status} = 'paid' and ${payments.kind} = 'Deposit')`.as("deposits_cny"),
     })
     .from(orders)
+    .innerJoin(suppliers, eq(suppliers.id, orders.supplierId))
     .where(scope)
     .as("per_order");
   const quantityIn = (metres: boolean) =>
@@ -81,7 +85,8 @@ export async function supplierPaymentDetail(db: Database, supplierId: string, q:
       .select({
         currency: perOrder.currency,
         orders: count,
-        openOrders: sql<number>`count(*) filter (where ${perOrder.stage} < 6)`.mapWith(Number),
+        // Open = not closed (docs/phase2-contracts.md 1), as Payments per supplier counts them.
+        openOrders: sql<number>`count(*) filter (where not ${perOrder.closed})`.mapWith(Number),
         listed: sql<number>`count(*) filter (where ${q.stage ? sql`${perOrder.stage} = ${q.stage}` : sql`true`})`.mapWith(Number),
         orderValueCny: sumOf(perOrder.orderValueCny),
         paidCny: sumOf(perOrder.paidCny),

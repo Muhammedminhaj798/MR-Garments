@@ -236,7 +236,7 @@ export function stockRoutes({ db }: RouteContext) {
           : hidden(),
         depositsPaidCny: money
           ? sql<number>`(select coalesce(sum(${payments.amountCny}), 0) from ${payments}
-          where ${payments.orderId} = ${orders.id} and ${payments.kind} = 'Deposit' and ${payments.status} = 'paid')`.mapWith(Number)
+          where ${payments.orderId} = ${orders.id} and ${payments.kind} = 'Deposit' and ${payments.status} = 'paid' and ${payments.payeeRole} = 'supplier')`.mapWith(Number)
           : hidden(),
         orderLineId: orderLines.id,
         item: items.name,

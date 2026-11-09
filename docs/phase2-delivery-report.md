@@ -74,16 +74,16 @@ closure or deposit status: both are derived live.
 | --- | --- |
 | Backend `npm run lint` | clean |
 | Backend `npm run typecheck` | clean |
-| Backend `npx vitest run` | 48 files, **939 passed, 2 expected fail** (906 + 2 before the phase; +33: closure 2, order reports 11, deposits 19, suppliers 1) |
+| Backend `npx vitest run` | 48 files, **939 passed, 2 expected fail** (906 + 2 before the phase; +33 passed: closure 2, order reports 11, deposits 21, suppliers 1; two of the new deposits tests replaced older expectations) |
 | Frontend `npm run lint` | 0 errors, 1 pre-existing warning (data-table.tsx) |
 | Frontend `npm run typecheck` | clean (e2e included) |
 | Frontend `npx vitest run` | 106 files, **765 passed** (701 before; +64) |
 | Frontend `next build` | compiled; new routes `/orders/pending`, `/orders/closed`, `/orders/[po]/report`, `/reports/orders`, `/deposits/**` |
 | Playwright, full suite (234 tests, 20 min, integrated build) | **228 passed, 6 failed**: 2 new-spec expectations (renamed label, empty-tab text), 1 pagination assumption in `units-po.spec.ts`, 1 pre-existing `/calendar` phone-width overflow, 2 machine stalls (`page.reload` 7 min, `net::ERR_ABORTED`) |
-| Playwright, re-runs after the spec fixes (fresh database) | the three fixed specs, `users-remove` and the 7-minute journey all **pass**; only the `/calendar` 390x844 check still fails, and it fails identically (576 > 390) on a build of the pre-phase base b55e107, so it is not a phase-2 regression (calendar code last changed in 95b5a3c) |
+| Playwright, re-runs after the spec fixes (fresh database) | logged re-run (e2e-2): `users-remove`, the 7-minute journey, `p2-order-report` and `units-po` pass; `p2-deposits` Scenario 6 then passed in a foreground run (no saved log); the `/calendar` 390x844 check still fails and failed the same way (576 > 390) in a foreground run against a build of the pre-phase base b55e107 (no saved log; the two saved logs show 667 > 390), so it is treated as pre-existing (calendar code last changed in 95b5a3c) |
 
-Desktop and phone widths: covered by the existing 390x844 regression spec and the reviewers' checks; phone header
-buttons shortened to "Excel"/"PDF".
+Desktop and phone widths: the existing 390x844 regression spec covers the legacy pages only (and stops at `/calendar`); the
+new pages were reviewed by reading, not run at phone width. Phone header buttons shortened to "Excel"/"PDF".
 
 ## F. Known limitations, assumptions, risks
 
@@ -104,8 +104,8 @@ buttons shortened to "Excel"/"PDF".
 
 ## G. Git status
 
-- Backend: `feature/phase-2` at **55cd262** in `MR-Garments-Backend-New-wt/units-po` (8 commits over origin/main, which is
-  still ce96c70). Agent branches kept: `phase2/reports` ddc4a65 (`p2-reports`), `phase2/deposits` 10df9bc (`p2-deposits`).
+- Backend: `feature/phase-2` at **c84656d** (code 55cd262 plus this report) in `MR-Garments-Backend-New-wt/units-po` (9 commits
+  over origin/main, which is still ce96c70). Agent branches kept: `phase2/reports` ddc4a65 (`p2-reports`), `phase2/deposits` 10df9bc (`p2-deposits`).
 - Frontend: `feature/phase-2` at **66ffca7** in `MR-Garments-frontend-wt/units-po` (over origin/main a337c7e). Agent
   branches kept: `phase2/orders` 77ff887, `phase2/reports` 2fef6ba, `phase2/deposits` 0c9e450.
 - Untouched: the local backend main checkout `MR-Garments-Backend-New` (owner's five uncommitted changes), every other

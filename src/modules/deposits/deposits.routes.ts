@@ -1,4 +1,4 @@
-import { desc, eq, type SQL, sql } from "drizzle-orm";
+import { desc, eq, isNotNull, type SQL, sql } from "drizzle-orm";
 import { Router } from "express";
 import { z } from "zod";
 
@@ -9,7 +9,7 @@ import { conflict, notFound, validationFailed } from "../../http/errors";
 import { parse } from "../../http/validate";
 import type { RouteContext } from "../context";
 import { money } from "../notifications/notify";
-import { round2 } from "../orders/orders.routes";
+import { depositState, orderMoney, round2 } from "../orders/money";
 import { isUuid, todayInIndia } from "../stages/common";
 
 // Owner: Agent D (docs/phase2-contracts.md section 3). DEP-1 GET /deposits, SD-1 GET /suppliers/:supplierId/deposits,
@@ -135,7 +135,7 @@ export function depositsRoutes({ db }: RouteContext) {
 
   // DEP-1. Order deposits (payments of kind Deposit, PAY-1's order), every supplier deposit, and the suppliers to filter by.
   router.get("/deposits", requirePermission("payments", "View"), async (_req, res) => {
-    const [orderDeposits, supplierRows, active] = await Promise.all([
+    const [orderDeposits, requirementRows, supplierRows, active] = await Promise.all([
       db
         .select({
           id: payments.id,
@@ -163,15 +163,39 @@ export function depositsRoutes({ db }: RouteContext) {
         .where(eq(payments.kind, "Deposit"))
         // PAY-1's order; the id last keeps it stable when payments share a timestamp (one ORD-3 insert).
         .orderBy(desc(sql`coalesce(${payments.paidOn}, ${payments.dueDate})`), desc(payments.createdAt), desc(payments.id)),
+      // Orders with a deposit the supplier asked for (0009), newest first: the obligation the Pending tab tracks.
+      db
+        .select({
+          orderId: orders.id,
+          po: orders.poNumber,
+          supplierId: orders.supplierId,
+          supplier: suppliers.name,
+          currency: orders.currency,
+          required: orders.depositRequiredCny,
+          paid: orderMoney.depositPaidCny,
+          lastPaidOn: sql<string | null>`(select max(${payments.paidOn})::text from ${payments}
+            where ${payments.orderId} = ${orders.id} and ${payments.status} = 'paid' and ${payments.kind} = 'Deposit' and ${payments.payeeRole} = 'supplier')`,
+          payments: sql<number>`(select count(*) from ${payments}
+            where ${payments.orderId} = ${orders.id} and ${payments.status} = 'paid' and ${payments.kind} = 'Deposit' and ${payments.payeeRole} = 'supplier')`.mapWith(Number),
+        })
+        .from(orders)
+        .innerJoin(suppliers, eq(suppliers.id, orders.supplierId))
+        .where(isNotNull(orders.depositRequiredCny))
+        .orderBy(desc(orders.orderDate), desc(orders.poNumber)),
       depositRows(db, sql`true`),
       db.select({ id: suppliers.id, name: suppliers.name }).from(suppliers).where(eq(suppliers.status, "Active")),
     ]);
     const supplierDepositList = supplierRows.map(toRow);
+    const orderObligations = requirementRows.map(({ required, paid, ...row }) => {
+      const state = depositState(required, paid);
+      return { ...row, requiredCny: required!, paidCny: paid, pendingCny: state.depositPendingCny!, status: state.depositStatus };
+    });
     // Active suppliers plus any (inactive) one that still has a deposit of either kind, so every row can be filtered; by name.
     const byId = new Map(active.map((s) => [s.id, s]));
-    for (const row of [...orderDeposits, ...supplierDepositList]) byId.set(row.supplierId, { id: row.supplierId, name: row.supplier });
+    for (const row of [...orderDeposits, ...orderObligations, ...supplierDepositList]) byId.set(row.supplierId, { id: row.supplierId, name: row.supplier });
     res.json({
       orderDeposits,
+      orderObligations,
       supplierDeposits: supplierDepositList,
       suppliers: [...byId.values()].sort((a, b) => a.name.localeCompare(b.name)),
     });

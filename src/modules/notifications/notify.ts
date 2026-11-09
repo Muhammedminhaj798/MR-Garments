@@ -18,6 +18,7 @@ export const KIND_CAPABILITY: Record<NotificationKind, Capability> = {
   "container-loaded": "containers",
   "container-sailed": "containers",
   "container-arrived": "containers",
+  "warehouse-receipt-deleted": "warehouse",
 };
 
 /** The kinds this role and these stage grants may read now. */

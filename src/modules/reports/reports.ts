@@ -18,7 +18,12 @@ import {
   warehouseReceipts,
 } from "../../db/schema";
 import { loadLandedCosts } from "../costs/landed-cost";
+import { orderClosed } from "../orders/closure";
+import { supplierMoney, toSupplier } from "../orders/money";
 import { round2, unitSymbol } from "../orders/orders.routes";
+
+// The supplier-only money fragments live in orders/money.ts (docs/phase2-fixes.md 1); re-exported for the report consumers.
+export { supplierMoney, toSupplier };
 
 // The seven reports behind GET /reports/<name> (docs/wave3-contracts.md sections 7 and 8). Each takes the optional
 // filters and today in India, and returns its JSON body. Shapes are recorded in section 8.
@@ -49,7 +54,7 @@ const inCny = <T extends { currency: Currency }>(rows: T[]) => rows.filter((row)
 export const orderFilter = (f: Filters) =>
   and(f.from ? gte(orders.orderDate, f.from) : undefined, f.to ? lte(orders.orderDate, f.to) : undefined, f.supplierId ? eq(orders.supplierId, f.supplierId) : undefined);
 
-/** Orders at stage 6 with the day their last stocked warehouse receipt was received: the day they reached the warehouse. */
+/** Closed orders (docs/phase2-contracts.md 1) with the day their last stocked warehouse receipt was received. */
 function finishedOrders(db: Database, where?: SQL) {
   return db
     .select({ id: orders.id, orderDate: orders.orderDate, finishedOn: sql<string>`max(${warehouseReceipts.receivedOn})::text`.as("finished_on") })
@@ -58,7 +63,7 @@ function finishedOrders(db: Database, where?: SQL) {
     .innerJoin(containerLines, eq(containerLines.orderLineId, orderLines.id))
     .innerJoin(transports, eq(transports.containerId, containerLines.containerId))
     .innerJoin(warehouseReceipts, and(eq(warehouseReceipts.transportId, transports.id), eq(warehouseReceipts.status, "stocked")))
-    .where(and(eq(orders.stage, 6), where))
+    .where(and(orderClosed, where))
     .groupBy(orders.id);
 }
 
@@ -204,25 +209,8 @@ export async function containersTimeline(db: Database, f: Filters, today: string
   };
 }
 
-// The correlations on `orders.id` are nested `sql`: in a single-table select drizzle drops the table name of a field's
-// own columns, and a bare "id" inside the subquery would be the subquery's table's.
-/** Payments of the order in the row (`orders.id`) to its supplier: agent payments are sea freight (6.2), not its money. */
-export const toSupplier = sql`${payments.orderId} = ${orders.id} and ${payments.payeeRole} = 'supplier'`;
-const linesOfOrder = sql`${orderLines.orderId} = ${orders.id}`;
 /**
- * 13.5's money per order, as correlated subqueries on `orders.id` (also the supplier detail's): order value rounded
- * per order, paid supplier payments, and their INR at each payment's own rate.
- */
-export const supplierMoney = {
-  orderValueCny: sql<number>`(select round(coalesce(sum(${orderLines.quantity} * ${orderLines.rateCny}), 0), 2) from ${orderLines}
-    where ${linesOfOrder})`.mapWith(Number),
-  paidCny: sql<number>`(select coalesce(sum(${payments.amountCny}), 0) from ${payments} where ${toSupplier} and ${payments.status} = 'paid')`.mapWith(Number),
-  paidInr: sql<number>`(select coalesce(sum(round(${payments.amountCny} * ${payments.rateInr}, 2)), 0) from ${payments}
-    where ${toSupplier} and ${payments.status} = 'paid')`.mapWith(Number),
-};
-
-/**
- * 13.5: open orders (stage below 6) per supplier. Paid counts payments to the supplier only (agent payments are sea
+ * 13.5: open orders (not closed, docs/phase2-contracts.md 1) per supplier. Paid counts payments to the supplier only (agent payments are sea
  * freight, section 6.2); INR at each payment's own rate. `dueNext30Cny`: due supplier payments, today to today + 30.
  * One row per supplier and order currency; `totals` and `dueNext30Cny` are CNY only, `...ByCurrency` has every currency.
  */
@@ -242,12 +230,14 @@ export async function paymentsPerSupplier(db: Database, f: Filters, today: strin
       })
       .from(orders)
       .innerJoin(suppliers, eq(suppliers.id, orders.supplierId))
-      .where(and(where, lt(orders.stage, 6)))
+      .where(and(where, sql`not ${orderClosed}`))
       .orderBy(...newestFirst),
     db
       .select({ po: orders.poNumber })
       .from(orders)
-      .where(and(where, eq(orders.stage, 6)))
+      // The join keeps the closure fragment's columns qualified (closure.ts).
+      .innerJoin(suppliers, eq(suppliers.id, orders.supplierId))
+      .where(and(where, orderClosed))
       .orderBy(...newestFirst),
   ]);
   // ponytail: grouped in memory over the open orders; a GROUP BY over pre-aggregated payments when orders reach thousands.

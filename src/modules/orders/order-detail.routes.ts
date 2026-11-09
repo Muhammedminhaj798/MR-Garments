@@ -23,7 +23,8 @@ import { parse } from "../../http/validate";
 import { atLeast, type Capability, effectiveAccess } from "../../permissions/matrix";
 import type { RouteContext } from "../context";
 import { containerOrders } from "../stages/common";
-import { byPo, line, lineList, MESSAGES as M, orderRows, round2, unitSymbol } from "./orders.routes";
+import { depositState } from "./money";
+import { byPo, depositRequired, line, lineList, MESSAGES as M, orderRows, round2, unitSymbol } from "./orders.routes";
 
 // Owner: BE-orders. ORD-4 GET /orders/:po (docs/live-screens-contracts.md, "Five-tab completion"); ORD-5 PATCH and
 // ORD-6 DELETE /orders/:po (docs/contracts.md, "Orders: edit and delete").
@@ -39,6 +40,8 @@ const orderEdit = z.strictObject({
   orderDate: z.iso.date({ error: M.orderDate }).optional(),
   deliveryDate: z.iso.date({ error: M.deliveryDate }).optional(),
   lines: lineList(line.extend({ id: z.uuid({ error: EDIT.lineChanged }).optional() })).optional(),
+  /** The deposit the supplier asked for; null clears it. A money term, so it may change until the warehouse (stage 6), like the delivery date. */
+  depositRequiredCny: depositRequired.nullable().optional(),
 });
 /** "a, b and c". */
 export const joined = (parts: string[]) => (parts.length > 1 ? `${parts.slice(0, -1).join(", ")} and ${parts.at(-1)}` : parts[0]!);
@@ -95,6 +98,8 @@ export function orderDetailRoutes({ db }: RouteContext) {
             mode: payments.mode,
             reference: payments.reference,
             notes: payments.notes,
+            /** INR at the payment's own rate, rounded in SQL as every total is; null while due. */
+            amountInr: sql<number | null>`case when ${payments.status} = 'paid' then round(${payments.amountCny} * ${payments.rateInr}, 2) end`.mapWith(Number),
           })
           .from(payments)
           .where(eq(payments.orderId, orderId))
@@ -204,9 +209,12 @@ export function orderDetailRoutes({ db }: RouteContext) {
       closedOn: row.closedOn,
       orderValueCny: row.orderValueCny,
       paidCny: row.paidCny,
-      supplierPaidCny: row.supplierPaidCny,
       paidInr: row.paidInr,
-      balanceCny: round2(row.orderValueCny - row.paidCny),
+      supplierPaidCny: row.supplierPaidCny,
+      supplierPaidInr: row.supplierPaidInr,
+      // What the supplier is still owed: agent payments are sea freight, not the goods (docs/phase2-fixes.md 1).
+      balanceCny: round2(row.orderValueCny - row.supplierPaidCny),
+      ...depositState(row.depositRequiredCny, row.depositPaidCny),
       lines: lines.map(({ itemId, itemName, ...line }) => ({ ...line, item: { id: itemId, name: itemName } })),
       payments: paymentList,
       receipts: receiptList,
@@ -252,11 +260,12 @@ export function orderDetailRoutes({ db }: RouteContext) {
           : [];
         // ponytail: float total rounded like round2 elsewhere; compare as SQL numeric if a cent-edge case ever matters.
         const total = round2(input.lines.reduce((sum, entry) => sum + entry.quantity * entry.rateCny, 0));
+        // Supplier payments only: an agent's sea freight is not part of the order's value.
         const paid = (
           await tx
             .select({ cny: sql<number>`coalesce(sum(${payments.amountCny}), 0)`.mapWith(Number) })
             .from(payments)
-            .where(and(eq(payments.orderId, row.id), eq(payments.status, "paid")))
+            .where(and(eq(payments.orderId, row.id), eq(payments.status, "paid"), eq(payments.payeeRole, "supplier")))
         )[0]!.cny;
         if (kept.some((id) => !savedItem.has(id)) || new Set(kept).size < kept.length) problems.lines = EDIT.lineChanged;
         else if (active.length < itemIds.length) problems.lines = M.item;
@@ -277,7 +286,7 @@ export function orderDetailRoutes({ db }: RouteContext) {
       }
       const updated = await tx
         .update(orders)
-        .set({ orderDate: input.orderDate, deliveryDate: input.deliveryDate, updatedAt: new Date() })
+        .set({ orderDate: input.orderDate, deliveryDate: input.deliveryDate, depositRequiredCny: input.depositRequiredCny, updatedAt: new Date() })
         .where(eq(orders.id, row.id))
         .returning({ id: orders.id, po: orders.poNumber, stage: orders.stage, orderDate: orders.orderDate, deliveryDate: orders.deliveryDate });
       return updated[0]!;

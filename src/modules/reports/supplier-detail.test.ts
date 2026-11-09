@@ -96,7 +96,8 @@ describe("GET /reports/payments-per-supplier/:supplierId", () => {
     expect(body.filter).toEqual({ from: null, to: null });
     expect(body.summary).toEqual({
       orders: 2,
-      openOrders: 1,
+      // Open = not closed: the stage-6 fixture has no stocked receipt, so it is still open (docs/phase2-contracts.md 1).
+      openOrders: 2,
       payments: 5,
       lineItems: 3,
       products: 2,
@@ -388,7 +389,7 @@ describe("GET /reports/payments-per-supplier/:supplierId on a larger data set", 
     const { summary } = await get(path(yiwu));
     expect(summary).toEqual({
       orders: 12,
-      openOrders: 11,
+      openOrders: 12, // the stage-6 fixture has no stocked receipt, so it is not closed
       payments: 17,
       lineItems: 14,
       products: 6,
@@ -413,14 +414,15 @@ describe("GET /reports/payments-per-supplier/:supplierId on a larger data set", 
     const [h1, h2] = others.hangzhou as [Made, Made];
     const supplierId = expect.any(String);
     expect(report.suppliers).toEqual([
-      { supplierId: yiwu, supplier: "Yiwu Trims Ltd.", currency: "CNY", orders: pos(y[11]!, y[9]!, y[7]!, y[5]!, y[1]!, y[0]!), orderValueCny: 2010, paidCny: 1654, paidInr: 20348, balanceCny: 356 },
+      // y[4] is a stage-6 fixture without a stocked receipt, so it is open, not finished (closure rule, docs/phase2-contracts.md 1).
+      { supplierId: yiwu, supplier: "Yiwu Trims Ltd.", currency: "CNY", orders: pos(y[11]!, y[9]!, y[7]!, y[5]!, y[4]!, y[1]!, y[0]!), orderValueCny: 2090, paidCny: 1734, paidInr: 21308, balanceCny: 356 },
       { supplierId, supplier: "Shenzhen Apparel", currency: "CNY", orders: pos(others.shenzhen), orderValueCny: 500, paidCny: 0, paidInr: 0, balanceCny: 500 },
       { supplierId, supplier: "Hangzhou Knits", currency: "CNY", orders: pos(h1), orderValueCny: 100, paidCny: 40, paidInr: 480, balanceCny: 60 },
       { supplierId: yiwu, supplier: "Yiwu Trims Ltd.", currency: "USD", orders: pos(y[10]!, y[8]!, y[6]!, y[2]!), orderValueCny: 155, paidCny: 23.02, paidInr: 283.14, balanceCny: 131.98 },
       { supplierId, supplier: "Hangzhou Knits", currency: "USD", orders: pos(h2), orderValueCny: 15, paidCny: 5, paidInr: 440, balanceCny: 10 },
       { supplierId: yiwu, supplier: "Yiwu Trims Ltd.", currency: "INR", orders: pos(y[3]!), orderValueCny: 1500, paidCny: 1000, paidInr: 1000, balanceCny: 500 },
     ]);
-    const cny = { orders: 8, orderValueCny: 2610, paidCny: 1694, paidInr: 20828, balanceCny: 916 };
+    const cny = { orders: 9, orderValueCny: 2690, paidCny: 1774, paidInr: 21788, balanceCny: 916 };
     expect(report).toMatchObject({
       totals: cny,
       totalsByCurrency: [
@@ -434,11 +436,11 @@ describe("GET /reports/payments-per-supplier/:supplierId on a larger data set", 
         { currency: "USD", amount: 104.98 },
         { currency: "INR", amount: 0 }, // every open order currency is listed, 0 included (13.5)
       ],
-      finishedPos: [y[4]!.po],
+      finishedPos: [],
     });
 
     // The detail's own rows, open orders only, give the same figures as each of the report's Yiwu rows.
-    const open = (await everyRow<OrderRow>(yiwu, "orders")).filter((row) => row.stage < 6);
+    const open = await everyRow<OrderRow>(yiwu, "orders"); // none is closed: no stocked receipt in this data set
     const paymentRows = await everyRow<PaymentRow>(yiwu, "payments");
     const sum = (values: number[]) => round2(values.reduce((total, value) => total + value, 0));
     const yiwuRows = report.suppliers.filter((row: { supplierId: string }) => row.supplierId === yiwu);

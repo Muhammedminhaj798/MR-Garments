@@ -25,6 +25,7 @@ import {
 import { notFound } from "../../http/errors";
 import { atLeast, type Capability, effectiveAccess } from "../../permissions/matrix";
 import { loadLandedCosts } from "../costs/landed-cost";
+import { depositState } from "../orders/money";
 import { byPo, orderRows, round2, unitSymbol } from "../orders/orders.routes";
 import { supplierMoney, toSupplier } from "./reports";
 
@@ -331,6 +332,10 @@ export async function orderReport(db: Database, po: string, user: CurrentUser) {
           balanceCny: round2(row.orderValueCny - header!.paidCny),
           depositsPaidCny: header!.depositsPaidCny,
           dueCny: header!.dueCny,
+          // The deposit the supplier asked for and what is still pending against it (0009).
+          depositRequiredCny: row.depositRequiredCny,
+          depositPendingCny: depositState(row.depositRequiredCny, row.depositPaidCny).depositPendingCny,
+          depositStatus: depositState(row.depositRequiredCny, row.depositPaidCny).depositStatus,
           list: paymentList,
         }
       : null,

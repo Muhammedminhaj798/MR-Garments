@@ -7,7 +7,8 @@ import { users } from "./core";
 // Migration 0005: in-app notifications (D:\SDEC\MR Garments\docs\notifications-contract.md). Coordinator-owned.
 // Rows are written only inside the business transaction that causes them (src/modules/notifications/notify.ts).
 
-export const NOTIFICATION_KINDS = ["short-receipt", "payment-recorded", "container-loaded", "container-sailed", "container-arrived"] as const;
+// "warehouse-receipt-deleted" (0009): the audit trail of WH-4, the only way a received order reopens.
+export const NOTIFICATION_KINDS = ["short-receipt", "payment-recorded", "container-loaded", "container-sailed", "container-arrived", "warehouse-receipt-deleted"] as const;
 export type NotificationKind = (typeof NOTIFICATION_KINDS)[number];
 
 export const notifications = pgTable(

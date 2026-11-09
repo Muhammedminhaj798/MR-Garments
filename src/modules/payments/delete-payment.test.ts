@@ -63,7 +63,8 @@ describe("PAY-3 DELETE /payments/:id", () => {
     const deposit = await pay(o.id, "Deposit", 300, 12);
     const balance = await pay(o.id, "Balance", 200, 12.5);
     const freight = await pay(o.id, "Balance", 50, 12, sino);
-    expect(await detail(o.po)).toMatchObject({ paidCny: 550, paidInr: 6700, balanceCny: 450 });
+    // Balance is what the supplier is owed: the ¥50 agent payment is sea freight.
+    expect(await detail(o.po)).toMatchObject({ paidCny: 550, paidInr: 6700, supplierPaidCny: 500, balanceCny: 500 });
     const supplierBefore = await supplierRow("Guangzhou Textile Co.");
     expect(await loadLandedCosts(ctx.db, [o.id]).then((m) => m.get(o.id))).toMatchObject({ goodsInr: 6100, seaFreightInr: 600 });
     const options = async () =>
@@ -77,7 +78,7 @@ describe("PAY-3 DELETE /payments/:id", () => {
     expect((await ctx.db.select().from(orders).where(eq(orders.id, o.id))).length).toBe(1);
     // 200 at 12.5 and 50 at 12 remain, each at its own rate.
     const after = await detail(o.po);
-    expect(after).toMatchObject({ paidCny: 250, paidInr: 3100, balanceCny: 750 });
+    expect(after).toMatchObject({ paidCny: 250, paidInr: 3100, supplierPaidCny: 200, balanceCny: 800 });
     expect(after.payments.map((p) => p.id).sort()).toEqual([balance, freight].sort());
     const supplierAfter = await supplierRow("Guangzhou Textile Co.");
     expect(supplierAfter.paidCny).toBeCloseTo(supplierBefore.paidCny - 300, 2);
