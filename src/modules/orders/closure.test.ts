@@ -60,6 +60,46 @@ describe("closed orders", () => {
     expect(await kinds(anita)).not.toContain("warehouse-receipt-deleted");
   });
 
+  it("names only the orders that stepped back when a receipt is deleted: a shared container, one of two containers, a draft", async () => {
+    const detailsOf = async (container: string) =>
+      (await ctx.db.select({ details: notifications.details }).from(notifications).where(eq(notifications.title, `${container} warehouse receipt deleted`)))[0]?.details;
+    const remove = (tripId: string) => http.delete(`/warehouse-receipts/${tripId}`).set("Cookie", suresh);
+
+    // Shared container, both keyed: deleting the receipt steps both orders back, so both are named.
+    const shared = await write.unloaded({ orders: [[{ item: "Denim jeans", quantity: 10, rateCny: 1 }], [{ item: "Track pants", quantity: 5, rateCny: 1 }]] });
+    const [a, b] = shared.orders;
+    expect((await stock(shared.tripId, [{ orderLineId: a!.lineIds[0]!, teamId: m.retail, quantity: 10 }, { orderLineId: b!.lineIds[0]!, teamId: m.retail, quantity: 5 }])).status).toBe(200);
+    expect((await remove(shared.tripId)).status).toBe(204);
+    expect(await detailsOf(shared.number)).toEqual(["Stocked receipt of trip LR-558214", `${[a!.po, b!.po].sort().join(", ")}: back to an earlier stage`]);
+
+    // An order split over two stocked containers keeps stage 6 when one receipt goes (the other container is still
+    // stocked), so it is not named; the order found only in that container is.
+    const first = await write.unloaded({ orders: [[{ item: "Denim jeans", quantity: 100, rateCny: 10 }]] });
+    const split = first.orders[0]!;
+    const second = await makeContainer(ctx, { orders: [[{ item: "Track pants", quantity: 1, rateCny: 1 }]] });
+    const pants = second.orders[0]!;
+    await ctx.db.insert(containerLines).values({ containerId: second.id, orderLineId: split.lineIds[0]!, bundles: 1, quantity: 40 });
+    expect((await stock(first.tripId, [{ orderLineId: split.lineIds[0]!, teamId: m.retail, quantity: 60 }])).status).toBe(200);
+    await write.clear(second.id);
+    const { trip } = (await http.put(`/transports/${second.id}`, tripBody(m.kerala, m.warehouse, { complete: true })).set("Cookie", suresh)).body;
+    expect((await stock(trip.id, [{ orderLineId: split.lineIds[0]!, teamId: m.online, quantity: 40 }, { orderLineId: pants.lineIds[0]!, teamId: m.retail, quantity: 1 }])).status).toBe(200);
+    expect(await listRow(split.po)).toMatchObject({ stage: 6, closed: true });
+    expect((await remove(trip.id)).status).toBe(204);
+    expect(await listRow(split.po)).toMatchObject({ stage: 6, closed: false });
+    expect(await listRow(pants.po)).toMatchObject({ stage: 5, closed: false });
+    expect(await detailsOf(second.number)).toEqual(["Stocked receipt of trip LR-558214", `${pants.po}: back to an earlier stage`]);
+
+    // A draft moves no stage, and its deletion says so.
+    const draft = await write.unloaded({ orders: [[{ item: "Denim jeans", quantity: 10, rateCny: 1 }]] });
+    const saved = await http
+      .put(`/warehouse-receipts/${draft.tripId}`, { locationId: m.warehouse, receivedOn: indiaDay(-4), receivedBy: "Joseph M", bundlesReceived: 1, lines: [], complete: false })
+      .set("Cookie", joseph);
+    expect(saved.status).toBe(200);
+    expect((await remove(draft.tripId)).status).toBe(204);
+    expect(await listRow(draft.orders[0]!.po)).toMatchObject({ stage: 5 });
+    expect(await detailsOf(draft.number)).toEqual(["Draft receipt of trip LR-558214", "No order changed stage"]);
+  });
+
   it("never closes an order on another order's pieces: stage 6 with none of its own stocked stays open (docs/phase2-fixes.md 3)", async () => {
     // Written straight to the database, past WH-3's refusal: a stocked receipt whose lines belong to order A only.
     const trip = await write.unloaded({

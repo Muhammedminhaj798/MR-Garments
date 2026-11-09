@@ -222,7 +222,7 @@ describe("ORD-5 PATCH /orders/:po", () => {
     // A due payment is not paid, so it doesn't count.
     await ctx.db.insert(payments).values({ orderId: order.id, kind: "Balance", payee: "Guangzhou Textile Co.", payeeRole: "supplier", amountCny: 50000, status: "due", dueDate: "2026-12-01" });
     expectFields(await edit(order.po, { lines: [{ id, itemId: ids.jeans, quantity: 9000, rateCny: 12.5 }] }), {
-      lines: "The order total can't be less than the ¥1,23,456.78 already paid.",
+      lines: "The order total can't be less than the ¥1,23,456.78 already paid to the supplier.",
     });
     expect(await linesOf(order.id)).toEqual(order.lines);
     const equal = await edit(order.po, { lines: [{ id, itemId: ids.jeans, quantity: 1, rateCny: 123456.78 }] });

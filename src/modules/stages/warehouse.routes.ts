@@ -445,18 +445,25 @@ export function warehouseRoutes({ db }: RouteContext) {
         trip && (await tx.select({ id: warehouseReceipts.id, status: warehouseReceipts.status }).from(warehouseReceipts).where(eq(warehouseReceipts.transportId, id)).for("update"))[0];
       if (!trip || !receipt) throw notFound("Warehouse receipt");
       const orderIds = await lockContainerOrders(tx, trip.containerId);
+      const stagesOf = () =>
+        orderIds.length ? tx.select({ id: orders.id, po: orders.poNumber, stage: orders.stage }).from(orders).where(inArray(orders.id, orderIds)).orderBy(asc(orders.poNumber)) : [];
+      const before = new Map((await stagesOf()).map((row) => [row.id, row.stage]));
       await tx.delete(warehouseReceipts).where(eq(warehouseReceipts.id, receipt.id));
       await settleStages(tx, orderIds);
       // The audit trail (docs/phase2-fixes.md 4): everyone with warehouse access learns which orders stepped back, and
-      // the row outlives the server log. A stocked receipt's deletion is the only way a received order reopens.
+      // the row outlives the server log. Only the orders whose stage fell are named: a draft moves nothing, and an
+      // order whose other container is still stocked stays received (settleStages).
+      const stepped = (await stagesOf()).filter((row) => row.stage < before.get(row.id)!).map((row) => row.po);
       const container = (await tx.select({ number: containers.number }).from(containers).where(eq(containers.id, trip.containerId)))[0]!;
-      const pos = (await containerOrders(tx, [trip.containerId])).get(trip.containerId)?.orders ?? [];
       await notify(tx, {
         kind: "warehouse-receipt-deleted",
         actorId: req.user!.id,
         sourceId: receipt.id,
         title: `${container.number} warehouse receipt deleted`,
-        details: [`${receipt.status === "stocked" ? "Stocked" : "Draft"} receipt of trip ${trip.lr}`, `${pos.join(", ")}: back to an earlier stage`],
+        details: [
+          `${receipt.status === "stocked" ? "Stocked" : "Draft"} receipt of trip ${trip.lr}`,
+          stepped.length ? `${stepped.join(", ")}: back to an earlier stage` : "No order changed stage",
+        ],
         href: () => "/warehouse",
       });
       return { lr: trip.lr, status: receipt.status };

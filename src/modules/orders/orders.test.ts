@@ -360,6 +360,7 @@ describe("PAY-1 GET /payments", () => {
       mode: null,
       reference: "",
       notes: "",
+      amountInr: null, // due: no rate yet
     });
     expect(res.body.payments).toContainEqual(expect.objectContaining({ kind: "Deposit", status: "paid", amountCny: 1234.56, rateInr: 11.8765, paidOn: "2026-10-21", dueDate: null, mode: "Bank transfer" }));
   });

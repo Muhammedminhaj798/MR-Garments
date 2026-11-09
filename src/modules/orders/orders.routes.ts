@@ -364,6 +364,8 @@ export function ordersRoutes({ db }: RouteContext) {
           mode: payments.mode,
           reference: payments.reference,
           notes: payments.notes,
+          /** INR at the payment's own rate, rounded in SQL as every total is (the same paisa as ORD-4); null while due. */
+          amountInr: sql<number | null>`case when ${payments.status} = 'paid' then round(${payments.amountCny} * ${payments.rateInr}, 2) end`.mapWith(Number),
         })
         .from(payments)
         .innerJoin(orders, eq(orders.id, payments.orderId))

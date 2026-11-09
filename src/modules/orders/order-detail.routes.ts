@@ -5,6 +5,7 @@ import { z } from "zod";
 import { requirePermission } from "../../auth/current-user";
 import {
   containerLines,
+  type Currency,
   containers,
   items,
   locations,
@@ -23,6 +24,7 @@ import { parse } from "../../http/validate";
 import { atLeast, type Capability, effectiveAccess } from "../../permissions/matrix";
 import type { RouteContext } from "../context";
 import { containerOrders } from "../stages/common";
+import { money } from "../notifications/notify";
 import { depositState } from "./money";
 import { byPo, depositRequired, line, lineList, MESSAGES as M, orderRows, round2, unitSymbol } from "./orders.routes";
 
@@ -33,8 +35,8 @@ const EDIT = {
   warehouse: "This order has reached the warehouse, so it can't be changed.",
   received: "Goods have been received for this order, so only the delivery date can change.",
   lineChanged: "A line on this order changed. Reload the order and try again.",
-  belowPaid: (paid: number) =>
-    `The order total can't be less than the ¥${paid.toLocaleString("en-IN", { minimumFractionDigits: 2, maximumFractionDigits: 2 })} already paid.`,
+  /** In the order's currency (phase 2 final fixes, 5): the figure is what the supplier was paid. */
+  belowPaid: (paid: number, currency: Currency) => `The order total can't be less than the ${money(paid, currency)} already paid to the supplier.`,
 };
 const orderEdit = z.strictObject({
   orderDate: z.iso.date({ error: M.orderDate }).optional(),
@@ -269,7 +271,7 @@ export function orderDetailRoutes({ db }: RouteContext) {
         )[0]!.cny;
         if (kept.some((id) => !savedItem.has(id)) || new Set(kept).size < kept.length) problems.lines = EDIT.lineChanged;
         else if (active.length < itemIds.length) problems.lines = M.item;
-        else if (total < paid) problems.lines = EDIT.belowPaid(paid);
+        else if (total < paid) problems.lines = EDIT.belowPaid(paid, row.currency);
       }
       if (Object.keys(problems).length > 0) throw validationFailed(problems);
 

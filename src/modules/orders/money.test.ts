@@ -101,6 +101,20 @@ describe("one supplier balance on every screen", () => {
   });
 });
 
+describe("INR per payment comes from SQL on every list", () => {
+  it("rounds half away from zero like the totals, where JavaScript floats round the other way: ORD-4 and PAY-1 agree to the paisa", async () => {
+    const order = await place();
+    const paid = await pay(order.id, "Balance", 100.02, 11.75); // 1,175.235 exactly; the float product lands just below the half
+    expect(paid.status).toBe(201);
+    expect(Math.round(100.02 * 11.75 * 100) / 100).toBe(1175.23); // what a browser recompute would show
+    const fromDetail = (await ord4(order.po)).payments.find((p) => p.id === paid.body.payment.id)!;
+    const fromList = ((await get("/payments")).body.payments as Figures[]).find((p) => p.id === paid.body.payment.id)!;
+    expect(fromDetail.amountInr).toBe(1175.24);
+    expect(fromList.amountInr).toBe(1175.24);
+    expect(await ord1(order.po)).toMatchObject({ paidInr: 1175.24, supplierPaidInr: 1175.24 });
+  });
+});
+
 describe("the deposit the supplier asked for (ORD-3, ORD-5, PAY-2, DEP-1)", () => {
   it("is none when not given, due once given, partly with a first deposit, paid at the requirement, and never negative beyond it", async () => {
     const plain = await place();
