@@ -204,6 +204,7 @@ export function orderDetailRoutes({ db }: RouteContext) {
       closedOn: row.closedOn,
       orderValueCny: row.orderValueCny,
       paidCny: row.paidCny,
+      supplierPaidCny: row.supplierPaidCny,
       paidInr: row.paidInr,
       balanceCny: round2(row.orderValueCny - row.paidCny),
       lines: lines.map(({ itemId, itemName, ...line }) => ({ ...line, item: { id: itemId, name: itemName } })),

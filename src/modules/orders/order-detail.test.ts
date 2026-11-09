@@ -103,6 +103,7 @@ describe("ORD-4 GET /orders/:po", () => {
       closedOn: null,
       orderValueCny: 14975, // 1000 * 12.5 + 300 * 8.25
       paidCny: 2234.56,
+      supplierPaidCny: 1234.56,
       paidInr: 26562.25, // 1234.56 * 11.8765 = 14662.25 (rounded) + 1000 * 11.9
       balanceCny: 12740.44,
       lines: [

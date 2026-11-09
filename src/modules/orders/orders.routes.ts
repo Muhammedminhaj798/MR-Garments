@@ -146,6 +146,8 @@ async function checkRules(db: Database, input: NewOrder) {
 // The main line (position 0) gives the item, quantity and received figures the lists show.
 export const main = alias(orderLines, "main_line");
 const paid = sql`${payments.orderId} = ${orders.id} and ${payments.status} = 'paid'`;
+/** Paid payments to the order's supplier only: agent payments are sea freight (docs/wave3-contracts.md 6.2), not the supplier's money. */
+const paidToSupplier = sql`${paid} and ${payments.payeeRole} = 'supplier'`;
 export const orderColumns = {
   id: orders.id,
   po: orders.poNumber,
@@ -167,6 +169,8 @@ export const orderColumns = {
   closedOn: orderClosedOn,
   orderValueCny: sql<number>`(select round(coalesce(sum(${orderLines.quantity} * ${orderLines.rateCny}), 0), 2) from ${orderLines} where ${orderLines.orderId} = ${orders.id})`.mapWith(Number),
   paidCny: sql<number>`(select coalesce(sum(${payments.amountCny}), 0) from ${payments} where ${paid})`.mapWith(Number),
+  /** What the supplier has been paid (phase 2 1.1): the lists' payment status and balance to the supplier read this, not paidCny. */
+  supplierPaidCny: sql<number>`(select coalesce(sum(${payments.amountCny}), 0) from ${payments} where ${paidToSupplier})`.mapWith(Number),
   // INR is amountCny * rateInr rounded to 2 decimals per payment, then summed.
   paidInr: sql<number>`(select coalesce(sum(round(${payments.amountCny} * ${payments.rateInr}, 2)), 0) from ${payments} where ${paid})`.mapWith(Number),
   nextDue: sql<string | null>`(select min(${payments.dueDate})::text from ${payments} where ${payments.orderId} = ${orders.id} and ${payments.status} = 'due')`,
@@ -210,6 +214,7 @@ export function ordersRoutes({ db }: RouteContext) {
         closedOn: row.closedOn,
         orderValueCny: row.orderValueCny,
         paidCny: row.paidCny,
+        supplierPaidCny: row.supplierPaidCny,
         paidInr: row.paidInr,
       })),
     );

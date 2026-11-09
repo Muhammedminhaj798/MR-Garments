@@ -32,5 +32,5 @@ export const orderClosedOn = sql<string | null>`case when ${orderClosed} then (s
   join ${orderLines} on ${orderLines.id} = ${containerLines.orderLineId}
   where ${warehouseReceipts.status} = 'stocked' and ${orderLines.orderId} = ${orders.id}) else null end`;
 
-/** Filter for the lists: a pending order has not entered receiving (REC-3 moves 1 -> 2 on the first receipt). */
-export const orderPending = sql`${orders.stage} = 1`;
+// Pending (the lists' other state) is simply `stage = 1`: the order has not entered receiving (REC-3 moves 1 -> 2 on the
+// first receipt). Callers compare the stage; no fragment is needed.

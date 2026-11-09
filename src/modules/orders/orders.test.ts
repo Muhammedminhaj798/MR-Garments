@@ -137,6 +137,7 @@ describe("ORD-3 POST /orders and ORD-1 GET /orders", () => {
       closedOn: null,
       orderValueCny: 14975, // 1000 * 12.5 + 300 * 8.25
       paidCny: 2234.56,
+      supplierPaidCny: 1234.56, // the ¥1,000 agent deposit is sea freight
       paidInr: 26562.25, // 1234.56 * 11.8765 = 14662.25 (rounded) + 1000 * 11.9
     });
     expect(list.body[0]).toMatchObject({ item: "Cotton fabric", quantity: 50, unit: "m", orderValueCny: 150, paidCny: 0, paidInr: 0 });

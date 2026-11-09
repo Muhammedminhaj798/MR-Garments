@@ -41,7 +41,11 @@ allowed at any stage, as before).
 stocked: number          // main line's quantity on stocked warehouse receipts
 closed: boolean
 closedOn: string | null  // latest received_on of the stocked receipts holding the order's goods; null while open
+supplierPaidCny: number  // paid payments to the supplier only (agent payments are sea freight, 6.2); paidCny keeps every payee
 ```
+
+The Pending tab's payment status and the Closed tab's "Paid to supplier" / "Balance to supplier" read `supplierPaidCny`, the
+figure the per-order report and `/reports/orders` use (13.5). The All tab's "Paid so far (INR)" and PAY-1 keep every payee, as before.
 
 Frontend: `OrderListItem` and `OrderDetail` carry them (`lib/api/types.ts`). Lists: **All** = every order (as today),
 **Pending** = `stage === 1`, **Closed** = `closed`. Status label for a closed order: "Closed" (tone success); a stage-6
@@ -95,7 +99,7 @@ All amounts in the deposit's currency; `amountInr` only where a rate exists.
 | DEP-1 | `GET /deposits` | `payments` View | Everything the Deposits page shows; filtering is on the client (as Orders). |
 | SD-1 | `GET /suppliers/:supplierId/deposits` | `payments` View | One supplier's statement. 404 for an unknown or malformed id. |
 | SD-2 | `POST /suppliers/:supplierId/deposits` | `payments` Enter | Opens a supplier deposit. 201 `{ deposit }`. |
-| SD-3 | `POST /supplier-deposits/:id/transactions` | `payments` Enter | Records a payment (give) or receipt (receive). 201 `{ transaction }`. 422 on `amount` when it exceeds pending: "Only <pending> left to settle." |
+| SD-3 | `POST /supplier-deposits/:id/transactions` | `payments` Enter | Records a payment (give) or receipt (receive). 201 `{ transaction, deposit }` (the refreshed row). 422 on `amount` when it exceeds pending: "Only <pending> left to settle." |
 | SD-4 | `DELETE /supplier-deposit-transactions/:id` | `payments` Full | 204. Log line as PAY-3. |
 | SD-5 | `DELETE /supplier-deposits/:id` | `payments` Full | 204 when it has no transactions; 409 `in_use` "This deposit has N transactions, so it can't be deleted." otherwise. |
 

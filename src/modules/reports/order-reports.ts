@@ -97,7 +97,7 @@ export async function orderReports(db: Database, q: Query) {
       paymentStatus: paymentStateOf(row),
       /** null until the order has any cost (as the Landed Cost list hides costless orders). */
       landedCostInr: cost.totalInr > 0 ? cost.totalInr : null,
-      perPieceInr: cost.perPieceInr,
+      perPieceInr: cost.totalInr > 0 ? cost.perPieceInr : null,
     };
   });
   return {
