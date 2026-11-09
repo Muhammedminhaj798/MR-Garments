@@ -1,7 +1,7 @@
 import { eq } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
-import { orders, suppliers, users } from "../../db/schema";
+import { orders, supplierDeposits, suppliers, users } from "../../db/schema";
 import { api, createTestContext, resetData, SEEDED, signInAs } from "../../test/harness";
 import { idOf, makeOrder } from "../stock/fixtures";
 
@@ -286,5 +286,31 @@ describe("open orders", () => {
     });
     expect((await list("?search=yiwu")).body[0].openOrders).toBe(3);
     expect((await edit(await idOf(ctx, suppliers, "Yiwu Trims Ltd."), { notes: "Trims" })).body.supplier.openOrders).toBe(3);
+  });
+});
+
+describe("DELETE /suppliers/:id with supplier deposits (docs/phase2-contracts.md 3.2)", () => {
+  it("refuses a supplier with a deposit as in use, naming it with any orders; one without goes", async () => {
+    const added = await add({ name: "Dalian Deposits" });
+    const id = added.body.supplier.id as string;
+    const deposit = (
+      await ctx.db
+        .insert(supplierDeposits)
+        .values({ supplierId: id, direction: "give", amount: 1000, currency: "CNY", openedOn: "2026-10-20" })
+        .returning({ id: supplierDeposits.id })
+    )[0]!;
+    const refused = await http.delete(`/suppliers/${id}`).set("Cookie", management);
+    expect(refused.status).toBe(409);
+    expect(refused.body).toEqual({ error: { code: "in_use", message: "This supplier is used by 1 deposit, so it can't be deleted. Deactivate it instead." } });
+    const order = await makeOrder(ctx, { supplier: "Dalian Deposits", lines: [{ item: "Denim jeans", quantity: 10, rateCny: 5 }] });
+    expect((await http.delete(`/suppliers/${id}`).set("Cookie", management)).body.error.message).toBe(
+      "This supplier is used by 1 order and 1 deposit, so it can't be deleted. Deactivate it instead.",
+    );
+    expect((await ctx.db.select().from(suppliers).where(eq(suppliers.id, id))).length).toBe(1);
+
+    await ctx.db.delete(orders).where(eq(orders.id, order.id));
+    await ctx.db.delete(supplierDeposits).where(eq(supplierDeposits.id, deposit.id));
+    expect((await http.delete(`/suppliers/${id}`).set("Cookie", management)).status).toBe(204);
+    expect((await ctx.db.select().from(suppliers).where(eq(suppliers.id, id))).length).toBe(0);
   });
 });

@@ -15,6 +15,7 @@ import { unitsRoutes } from "./master-data/units.routes";
 import { notificationsRoutes } from "./notifications/notifications.routes";
 import { orderDetailRoutes } from "./orders/order-detail.routes";
 import { ordersRoutes } from "./orders/orders.routes";
+import { depositsRoutes } from "./deposits/deposits.routes";
 import { paymentsRoutes } from "./payments/payments.routes";
 import { profileRoutes } from "./profile/profile.routes";
 import { reportsRoutes } from "./reports/reports.routes";
@@ -42,6 +43,7 @@ export function apiRoutes(ctx: RouteContext) {
   router.use(ordersRoutes(ctx));
   router.use(orderDetailRoutes(ctx)); // after ORD-2, so /orders/options isn't read as a PO
   router.use(paymentsRoutes(ctx));
+  router.use(depositsRoutes(ctx));
   router.use(stockRoutes(ctx));
   router.use(containerDetailRoutes(ctx)); // after CON-2, so /containers/options isn't read as an id
   router.use(stagesRoutes(ctx));

@@ -3,7 +3,7 @@ import { Router } from "express";
 import { z } from "zod";
 
 import { requirePermission } from "../../auth/current-user";
-import { CURRENCIES, orders, STATUSES, suppliers } from "../../db/schema";
+import { CURRENCIES, orders, STATUSES, supplierDeposits, suppliers } from "../../db/schema";
 import { conflict, GENERIC_MESSAGE, HttpError, notFound } from "../../http/errors";
 import { parse } from "../../http/validate";
 import type { RouteContext } from "../context";
@@ -89,7 +89,11 @@ export function suppliersRoutes({ db }: RouteContext) {
     res.json({ supplier: (await load(id))[0] });
   });
 
-  deleteRoute(router, db, "/suppliers", suppliers, "Supplier", [{ what: "order", table: orders, of: (id) => eq(orders.supplierId, id) }]);
+  // A supplier with orders or supplier deposits (docs/phase2-contracts.md 3.2) is deactivated instead of deleted.
+  deleteRoute(router, db, "/suppliers", suppliers, "Supplier", [
+    { what: "order", table: orders, of: (id) => eq(orders.supplierId, id) },
+    { what: "deposit", table: supplierDeposits, of: (id) => eq(supplierDeposits.supplierId, id) },
+  ]);
 
   return router;
 }
