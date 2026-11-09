@@ -20,6 +20,7 @@ Changed figures:
 | PAY-1 `GET /payments` orders | `balanceCny` | every payee | supplier only; `supplierPaidCny`, `supplierPaidInr` added |
 | ORD-1, ORD-4, PAY-1 | `supplierPaidInr` | - | added |
 | ORD-4 payments rows | `amountInr` | computed in the browser | from SQL, `round(amount * rate, 2)`, null while due |
+| PAY-1 payments rows | `amountInr` | computed in the browser | from SQL, the same expression (section 7, fix 2) |
 | ORD-5 | "total can't be less than already paid" guard | every payee | supplier only (an agent's freight is not order value) |
 | REC-2 `/receipts/options` | `depositsPaidCny` | every payee | supplier only, as the order report's "Of which deposits" |
 
@@ -118,3 +119,59 @@ freight ₹1,200 — on ORD-1, ORD-4, PAY-1, RPT-O1, RPT-O2, Payments per suppli
 
 Not done, by decision: a separate "reopen order" endpoint (the audited WH-4 deletion with its new notification is the
 reversal); a per-order deposit due date; the "Pending to pay" card still says "due order deposits and deposits to give".
+
+## 7. Final review fixes (2026-11-09)
+
+The second independent review (code-level, of sections 1-6) found one High and five Medium issues. Branches
+`fix/phase2-final` in both repositories, on top of `fix/phase2-audit` (backend d7da4ff, frontend 7375135), close them.
+Nothing was pushed, merged, deployed or migrated.
+
+1. **Backward compatibility (High).** A frontend running against a backend from before this phase (no `supplierPaid*`,
+   `deposit*`, `orderObligations`, no per-payment `amountInr`) no longer crashes or shows every payee's figures under
+   the supplier labels. The rule, in `src/features/payments/money.tsx` (`moneyOrDash`): a figure the API did not send
+   is "–", never another figure under the new label. Payments page (columns, summary card, delete confirmation), the
+   order's Payments tab (KPIs, INR working, rows), the Money card (falls back to the label "Paid (all payees)" with the
+   figure it has), the order report (no deposit rows), the Deposits page (`toRows` takes missing `orderObligations` as
+   none) and the Edit order dialog ("Paid to supplier –", empty requirement). `DepositStatusPill` renders nothing for a
+   status it does not know. The deploy order (migrate, backend, frontend) still applies; the dashes are the honest
+   display for the window in between, not a feature flag.
+2. **PAY-1 INR consistency.** PAY-1 `payments[]` now carries `amountInr` from SQL (`round(amount_cny * rate_inr, 2)`,
+   null while due), the expression ORD-4 and every total use (`orders.routes.ts`). The browser recomputes INR nowhere:
+   `payment-detail.tsx` (`inrOf` removed) and `delete-payment.tsx` read `amountInr`. Regression test (`money.test.ts`,
+   "INR per payment comes from SQL on every list"): ¥100.02 at 11.75 is ₹1,175.235 exactly; a float recompute shows
+   ₹1,175.23, SQL (ORD-1, ORD-4, PAY-1) ₹1,175.24.
+3. **WH-4 notification accuracy.** `warehouse.routes.ts` snapshots the stage of every order in the container before
+   deleting the receipt, settles, and names only the POs whose stage went down ("PO-1, PO-2: back to an earlier stage"),
+   or says "No order changed stage" (a draft, or orders still stocked by another receipt). The details name the receipt
+   status ("Stocked receipt of trip LR-…" / "Draft receipt…"). Tests (`closure.test.ts`): shared container (both POs),
+   a split order where only one PO steps back, a draft deletion (none).
+4. **Deposits page agent payments.** A deposit paid to a shipping agent for an order that has a requirement is listed
+   again as its own row (`deposits-logic.ts`: kept when `payeeRole !== "supplier"`), marked "to shipping agent" under
+   its kind in the table and "Order deposit (to shipping agent)" in CSV/XLSX/PDF. It was never inside the supplier's
+   obligation (the backend counts supplier deposits only), so nothing is counted twice; the cards add it once as paid.
+5. **Edit order deposit currency.** The dialog takes the order's `currency` (from `order-detail-frame.tsx`):
+   "Deposit required (¥ / $)", "Rate (…)", "Amount (…)", the total, "Paid to supplier" and the "can't be less than …
+   already paid" message use `formatMoney(…, currency)`; the prefilled requirement is the saved number unchanged.
+   ORD-5's own `belowPaid` message (`order-detail.routes.ts`) names the order's currency too.
+
+Tests added for the review's missing scenarios: pre-migration response shapes on the Payments page (`queries.test.ts`,
+`payment-detail.test.tsx`, `delete-payment.test.tsx`), the order's Payments tab and Money card
+(`order-detail/payments/payments-screen.test.tsx`, `overview-screen.test.tsx`), the order report
+(`order-report-file.test.ts`), the Deposits page (`deposits-logic.test.ts`, `deposits-screen.test.tsx`,
+`deposit-files.test.ts`) and the Edit dialog (`edit-order-dialog.test.tsx`, USD order and a response without
+`supplierPaidCny`); the API's INR shown as given (`payment-detail.test.tsx`); an unknown deposit status; WH-4's three
+notification cases; the one-paisa SQL/JS rounding difference.
+
+| Check | Result |
+| --- | --- |
+| Backend lint, typecheck | clean |
+| Backend `npx vitest run` | 49 files, 946 passed, 2 expected fail (944 before: money.test.ts +1, closure.test.ts +1) |
+| Frontend lint, typecheck | 0 errors (1 pre-existing warning), clean |
+| Frontend `npx vitest run` | 108 files, 798 passed (786 before: +12 compatibility, INR, agent-deposit and currency tests) |
+| Frontend `next build` | compiled |
+| Playwright, 17 specs (payments, orders, order detail, deposits, reports, warehouse, notifications, units/PO, USD) | 74 passed, 0 failed (3.6 min, freshly seeded backend) |
+
+Commits: backend 8b3f84d (fixes 2, 3 and 5's message, tests) plus this document; frontend 81c3c6d.
+
+Known limits: the full Playwright suite was not re-run (17 of the specs were); an older API's Payments page shows "–"
+for the supplier's paid and balance columns rather than its all-payee balance; nothing here changes the deploy order.
