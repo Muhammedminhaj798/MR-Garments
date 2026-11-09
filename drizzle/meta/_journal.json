@@ -57,6 +57,13 @@
       "when": 1794045362461,
       "tag": "0007_units_po",
       "breakpoints": true
+    },
+    {
+      "idx": 8,
+      "version": "7",
+      "when": 1794201797441,
+      "tag": "0008_deposits",
+      "breakpoints": true
     }
   ]
 }

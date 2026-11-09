@@ -28,6 +28,8 @@ export const MESSAGES = {
   rateInr: "Enter an INR rate above 0.",
   mode: "Enter the payment mode.",
   modeTooLong: "Use 100 characters or fewer for the mode.",
+  referenceTooLong: "Use 100 characters or fewer for the reference.",
+  notesTooLong: "Use 1,000 characters or fewer for the notes.",
 };
 const M = MESSAGES;
 
@@ -44,6 +46,9 @@ const newPayment = z.strictObject({
   paidOn: z.iso.date({ error: M.paidOn }).refine((day) => day <= todayInIndia(), M.paidOnFuture),
   rateInr: z.number({ error: M.rateInr }).min(0.0001, M.rateInr).max(99_999_999, M.rateInr).optional(),
   mode: z.string({ error: M.mode }).trim().min(1, M.mode).max(100, M.modeTooLong),
+  // Transaction or receipt number and notes (0008); left out by an older frontend, both are "".
+  reference: z.string({ error: M.referenceTooLong }).trim().max(100, M.referenceTooLong).default(""),
+  notes: z.string({ error: M.notesTooLong }).trim().max(1000, M.notesTooLong).default(""),
 });
 type NewPayment = z.infer<typeof newPayment>;
 
@@ -101,6 +106,8 @@ export function paymentsRoutes({ db }: RouteContext) {
             paidOn: input.paidOn,
             rateInr: input.rateInr ?? 1,
             mode: input.mode,
+            reference: input.reference,
+            notes: input.notes,
             createdBy: req.user!.id,
           })
           .returning({ id: payments.id })

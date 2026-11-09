@@ -62,7 +62,7 @@ describe("ORD-4 GET /orders/:po", () => {
       ],
       deposits: [
         { payee: "Sino Freight", payeeRole: "agent", amountCny: 1000, paidOn: indiaDay(-20), rateInr: 11.9, mode: "Cash" },
-        { payee: "Guangzhou Textile Co.", payeeRole: "supplier", amountCny: 1234.56, paidOn: indiaDay(-25), rateInr: 11.8765, mode: "Bank transfer" },
+        { payee: "Guangzhou Textile Co.", payeeRole: "supplier", amountCny: 1234.56, paidOn: indiaDay(-25), rateInr: 11.8765, mode: "Bank transfer", reference: " TXN-778 ", notes: "First 10%" },
       ],
     });
     po = created.order.po;
@@ -98,6 +98,9 @@ describe("ORD-4 GET /orders/:po", () => {
       quantity: 1000,
       unit: "pcs",
       received: 900,
+      stocked: 0,
+      closed: false,
+      closedOn: null,
       orderValueCny: 14975, // 1000 * 12.5 + 300 * 8.25
       paidCny: 2234.56,
       paidInr: 26562.25, // 1234.56 * 11.8765 = 14662.25 (rounded) + 1000 * 11.9
@@ -118,6 +121,8 @@ describe("ORD-4 GET /orders/:po", () => {
           dueDate: null,
           rateInr: 11.8765,
           mode: "Bank transfer",
+          reference: "TXN-778", // trimmed
+          notes: "First 10%",
         },
         expect.objectContaining({ payee: "Sino Freight", payeeRole: "agent", amountCny: 1000, paidOn: indiaDay(-20), rateInr: 11.9, mode: "Cash" }),
       ],

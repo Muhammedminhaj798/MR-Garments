@@ -8,17 +8,19 @@ import { hashPassword, passwordProblems } from "../../auth/passwords";
 import { signOutEverywhere } from "../../auth/session";
 import type { Database } from "../../db/client";
 import {
+  payments,
   clearings,
   containers,
   locations,
   orders,
-  payments,
-  receipts,
-  ROLES,
-  type Role,
-  STATUSES,
-  suppliers,
   transports,
+  receipts,
+  type Role,
+  ROLES,
+  STATUSES,
+  supplierDeposits,
+  supplierDepositTransactions,
+  suppliers,
   users,
   userStageGrants,
   warehouseReceipts,
@@ -69,6 +71,8 @@ export const REFERENCES: { what: string; table: PgTable; columns: PgColumn[] }[]
   { what: "clearing", table: clearings, columns: [clearings.createdBy, clearings.updatedBy] },
   { what: "trip", table: transports, columns: [transports.createdBy, transports.updatedBy] },
   { what: "warehouse receipt", table: warehouseReceipts, columns: [warehouseReceipts.createdBy, warehouseReceipts.updatedBy] },
+  { what: "supplier deposit", table: supplierDeposits, columns: [supplierDeposits.createdBy] },
+  { what: "supplier deposit transaction", table: supplierDepositTransactions, columns: [supplierDepositTransactions.createdBy] },
 ];
 
 const joined = (parts: string[]) => (parts.length > 1 ? `${parts.slice(0, -1).join(", ")} and ${parts.at(-1)}` : parts[0]!);

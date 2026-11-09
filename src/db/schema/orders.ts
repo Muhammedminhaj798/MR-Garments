@@ -82,6 +82,9 @@ export const payments = pgTable(
     dueDate: date("due_date"),
     rateInr: rate("rate_inr"),
     mode: text("mode"),
+    /** Transaction or receipt number as the bank or supplier gave it (0008); "" when none. */
+    reference: text("reference").notNull().default(""),
+    notes: text("notes").notNull().default(""),
     ...timestamps,
     createdBy: uuid("created_by"),
   },

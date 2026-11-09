@@ -4,3 +4,4 @@ export * from "./master";
 export * from "./orders";
 export * from "./stages";
 export * from "./notifications";
+export * from "./deposits";

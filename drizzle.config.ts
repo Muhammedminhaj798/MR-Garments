@@ -5,7 +5,7 @@ import { defineConfig } from "drizzle-kit";
 // Only the coordinator adds migrations, and a merged migration is never edited.
 export default defineConfig({
   dialect: "postgresql",
-  schema: ["./src/db/schema/core.ts", "./src/db/schema/master.ts", "./src/db/schema/orders.ts", "./src/db/schema/stages.ts", "./src/db/schema/notifications.ts"],
+  schema: ["./src/db/schema/core.ts", "./src/db/schema/master.ts", "./src/db/schema/orders.ts", "./src/db/schema/stages.ts", "./src/db/schema/notifications.ts", "./src/db/schema/deposits.ts"],
   out: "./drizzle",
   strict: true,
 });

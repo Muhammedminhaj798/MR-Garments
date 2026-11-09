@@ -5,13 +5,29 @@ import { z } from "zod";
 
 import { requirePermission } from "../../auth/current-user";
 import type { Database } from "../../db/client";
-import { type Currency, CURRENCIES, items, orderLines, orders, PAYEE_ROLES, payments, receiptLines, shippingAgents, suppliers, units } from "../../db/schema";
+import {
+  type Currency,
+  CURRENCIES,
+  items,
+  orderLines,
+  orders,
+  PAYEE_ROLES,
+  payments,
+  receiptLines,
+  shippingAgents,
+  suppliers,
+  units,
+  warehouseReceiptLines,
+  warehouseReceipts,
+} from "../../db/schema";
 import { validationFailed } from "../../http/errors";
 import { parse } from "../../http/validate";
 import type { RouteContext } from "../context";
+import { orderClosed, orderClosedOn } from "./closure";
 
 // Owner: BE-orders. ORD-1 GET /orders, ORD-2 GET /orders/options, ORD-3 POST /orders, CAL-1 GET /deliveries,
 // PAY-1 GET /payments (docs/live-screens-contracts.md). Payments are records only: nothing here moves money.
+// `stocked`, `closed` and `closedOn` (docs/phase2-contracts.md section 1) come from ./closure.ts.
 // Money is in the order's `currency` (the *Cny names stay for compatibility); `rateInr` is INR per 1 of it.
 
 export const MESSAGES = {
@@ -35,6 +51,8 @@ export const MESSAGES = {
   po: "Enter the PO number.",
   poTooLong: "Use 50 characters or fewer.",
   poTaken: "This PO number is already used by another order.",
+  referenceTooLong: "Use 100 characters or fewer for the reference.",
+  notesTooLong: "Use 1,000 characters or fewer for the notes.",
 };
 const M = MESSAGES;
 /** The PO number column is text; this keeps a typed one readable in lists and URLs. */
@@ -55,6 +73,9 @@ const deposit = z.strictObject({
   paidOn: z.iso.date({ error: M.paidOn }),
   rateInr: z.number({ error: M.rateInr }).min(0.0001, M.rateInr).max(99_999_999, M.rateInr).optional(),
   mode: z.string({ error: M.mode }).trim().min(1, M.mode),
+  // Transaction or receipt number and notes (0008); left out by an older frontend, both are "".
+  reference: z.string({ error: M.referenceTooLong }).trim().max(100, M.referenceTooLong).default(""),
+  notes: z.string({ error: M.notesTooLong }).trim().max(1000, M.notesTooLong).default(""),
 });
 const newOrder = z.strictObject({
   // The form's PO number (the offered next one, or what the user changed it to) in any format (VM-11340, MR/2026/001),
@@ -138,6 +159,12 @@ export const orderColumns = {
   unit: unitSymbol,
   quantity: main.quantity,
   received: sql<number>`(select coalesce(sum(${receiptLines.quantity}), 0) from ${receiptLines} where ${receiptLines.orderLineId} = ${main.id})`.mapWith(Number),
+  /** The main line's quantity on stocked warehouse receipts. */
+  stocked: sql<number>`(select coalesce(sum(${warehouseReceiptLines.quantity}), 0) from ${warehouseReceiptLines}
+    join ${warehouseReceipts} on ${warehouseReceipts.id} = ${warehouseReceiptLines.receiptId} and ${warehouseReceipts.status} = 'stocked'
+    where ${warehouseReceiptLines.orderLineId} = ${main.id})`.mapWith(Number),
+  closed: orderClosed,
+  closedOn: orderClosedOn,
   orderValueCny: sql<number>`(select round(coalesce(sum(${orderLines.quantity} * ${orderLines.rateCny}), 0), 2) from ${orderLines} where ${orderLines.orderId} = ${orders.id})`.mapWith(Number),
   paidCny: sql<number>`(select coalesce(sum(${payments.amountCny}), 0) from ${payments} where ${paid})`.mapWith(Number),
   // INR is amountCny * rateInr rounded to 2 decimals per payment, then summed.
@@ -178,6 +205,9 @@ export function ordersRoutes({ db }: RouteContext) {
         quantity: row.quantity,
         unit: row.unit,
         received: row.received,
+        stocked: row.stocked,
+        closed: row.closed,
+        closedOn: row.closedOn,
         orderValueCny: row.orderValueCny,
         paidCny: row.paidCny,
         paidInr: row.paidInr,
@@ -319,6 +349,8 @@ export function ordersRoutes({ db }: RouteContext) {
           dueDate: payments.dueDate,
           rateInr: payments.rateInr,
           mode: payments.mode,
+          reference: payments.reference,
+          notes: payments.notes,
         })
         .from(payments)
         .innerJoin(orders, eq(orders.id, payments.orderId))

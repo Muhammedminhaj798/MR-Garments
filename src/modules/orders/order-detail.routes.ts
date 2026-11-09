@@ -93,6 +93,8 @@ export function orderDetailRoutes({ db }: RouteContext) {
             dueDate: payments.dueDate,
             rateInr: payments.rateInr,
             mode: payments.mode,
+            reference: payments.reference,
+            notes: payments.notes,
           })
           .from(payments)
           .where(eq(payments.orderId, orderId))
@@ -197,6 +199,9 @@ export function orderDetailRoutes({ db }: RouteContext) {
       quantity: row.quantity,
       unit: row.unit,
       received: row.received,
+      stocked: row.stocked,
+      closed: row.closed,
+      closedOn: row.closedOn,
       orderValueCny: row.orderValueCny,
       paidCny: row.paidCny,
       paidInr: row.paidInr,

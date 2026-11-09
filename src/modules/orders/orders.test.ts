@@ -132,6 +132,9 @@ describe("ORD-3 POST /orders and ORD-1 GET /orders", () => {
       quantity: 1000,
       unit: "pcs",
       received: 0,
+      stocked: 0,
+      closed: false,
+      closedOn: null,
       orderValueCny: 14975, // 1000 * 12.5 + 300 * 8.25
       paidCny: 2234.56,
       paidInr: 26562.25, // 1234.56 * 11.8765 = 14662.25 (rounded) + 1000 * 11.9
@@ -327,6 +330,8 @@ describe("PAY-1 GET /payments", () => {
       dueDate: "2026-12-20",
       rateInr: null,
       mode: null,
+      reference: "",
+      notes: "",
     });
     expect(res.body.payments).toContainEqual(expect.objectContaining({ kind: "Deposit", status: "paid", amountCny: 1234.56, rateInr: 11.8765, paidOn: "2026-10-21", dueDate: null, mode: "Bank transfer" }));
   });
