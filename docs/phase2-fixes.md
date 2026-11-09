@@ -89,3 +89,32 @@ the old schema: ORD-1/ORD-4/PAY-1/ORD-3/DEP-1 500 on the missing column, so **ap
 deploying**, in one `db:migrate` run (one transaction). Rollback before the backend deploys: drop the column and its
 check, restore the previous `notifications_kind_check`; after the backend is in use, roll back code only (the column
 holds user-entered requirements).
+
+## 6. Delivery (2026-11-09)
+
+Branches `fix/phase2-audit`, local only, on top of `feature/phase-2` (backend c84656d, frontend 66ffca7). Nothing was
+pushed, merged, deployed or migrated outside the local test databases.
+
+| Repo | Commits | Files |
+| --- | --- | --- |
+| Backend (`MR-Garments-Backend-New-wt/p2-fix`) | bcd7e05 fixes, aa2128d cross-tab test, plus this document's commit | 25 files, +3,520 / -86 (2,936 of the additions are the generated drizzle snapshot) |
+| Frontend (`MR-Garments-frontend-wt/p2-fix`) | 6de2750 fixes, 7375135 e2e spec updates | 52 files, +1,000 / -212 |
+
+Checks run on the remediation branches:
+
+| Check | Result |
+| --- | --- |
+| Backend lint, typecheck | clean |
+| Backend `npx vitest run` | 49 files, 944 passed, 2 expected fail (939 before; new: money.test.ts 4, closure.test.ts +1; 2 cross-tab assertions moved to supplier-only) |
+| Frontend lint, typecheck | 0 errors (1 pre-existing warning) |
+| Frontend `npx vitest run` | 108 files, 786 passed (765 before) |
+| Frontend `next build` | compiled |
+| Playwright, 17 specs covering payments, orders, order detail, deposits, reports, warehouse, notifications, units/PO | 74 tests: 66 passed on the first run, the 8 failures were legacy specs asserting the old labels and all-payee figures; after updating them those 5 specs pass 30 of 30. The full 234-test suite was not re-run in this phase. |
+
+Reconciliation of one sample order (money.test.ts): order ¥1,000, supplier deposit ¥300 at 12, agent deposit ¥100 at
+12, supplier balance ¥200 at 12.5, deposit required ¥1,000. Every endpoint agrees: paid to supplier ¥500 / ₹6,100,
+every payee ¥600 / ₹7,300, balance to supplier ¥500, deposit pending ¥700 (partly), landed cost goods ₹6,100 and sea
+freight ₹1,200 — on ORD-1, ORD-4, PAY-1, RPT-O1, RPT-O2, Payments per supplier and REC-2.
+
+Not done, by decision: a separate "reopen order" endpoint (the audited WH-4 deletion with its new notification is the
+reversal); a per-order deposit due date; the "Pending to pay" card still says "due order deposits and deposits to give".
