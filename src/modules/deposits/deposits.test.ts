@@ -1,7 +1,7 @@
 import { eq } from "drizzle-orm";
 import { afterAll, beforeEach, describe, expect, it } from "vitest";
 
-import { payments, supplierDeposits, supplierDepositTransactions, suppliers, users } from "../../db/schema";
+import { payments, shippingAgents, supplierDeposits, supplierDepositTransactions, suppliers, users } from "../../db/schema";
 import { api, createTestContext, resetData, SEEDED, signInAs } from "../../test/harness";
 import { UNKNOWN } from "../stages/fixtures";
 import { idOf, indiaDay, makeOrder } from "../stock/fixtures";
@@ -124,6 +124,16 @@ describe("SD-2 POST /suppliers/:supplierId/deposits", () => {
     expect(res.body.deposit).toMatchObject({ supplier: "Hangzhou Knits", direction: "receive", currency: "USD", amount: 250.5, pending: 250.5, openedOn: indiaDay(0), reference: "INV-77", notes: "Returned mould" });
   });
 
+  it("takes a deposit for an inactive supplier (a deposit to get back is still a record); SD-1 shows the supplier Inactive", async () => {
+    await ctx.db.update(suppliers).set({ status: "Inactive" }).where(eq(suppliers.id, hangzhou));
+    const res = await open(hangzhou, { direction: "receive", amount: 300, openedOn: "2026-10-20" });
+    expect(res.status).toBe(201);
+    expect(res.body.deposit).toMatchObject({ supplier: "Hangzhou Knits", direction: "receive", currency: "CNY", pending: 300 });
+    const statement = await get(`/suppliers/${hangzhou}/deposits`);
+    expect(statement.body.supplier).toMatchObject({ name: "Hangzhou Knits", status: "Inactive" });
+    expect(statement.body.deposits).toHaveLength(1);
+  });
+
   it("refuses broken rules with 422 under the field (every problem at once) and stores nothing", async () => {
     const cases: [object, Record<string, string>][] = [
       [{ direction: "lend" }, { direction: MESSAGES.direction }],
@@ -192,6 +202,16 @@ describe("SD-3 POST /supplier-deposits/:id/transactions", () => {
     const res = await settled(deposit.id, settlement({ amount: 120 }));
     expect(res.deposit).toMatchObject({ direction: "receive", currency: "USD", settled: 120, pending: 380, status: "partly settled" });
     expect((await settle(deposit.id, settlement({ amount: 380.01 }))).body.error.fields).toEqual({ amount: "Only $380 left to settle." });
+  });
+
+  it("two settlements at once can't both fit: the deposit row is locked, so exactly one of two ¥600 on ¥1,000 is recorded", async () => {
+    const deposit = await opened(guangzhou);
+    const [a, b] = await Promise.all([settle(deposit.id, settlement({ amount: 600 })), settle(deposit.id, settlement({ amount: 600, mode: "Cash" }))]);
+    expect([a.status, b.status].sort()).toEqual([201, 422]);
+    const refused = a.status === 422 ? a : b;
+    expect(refused.body.error.fields).toEqual({ amount: "Only ¥400 left to settle." });
+    expect(await ctx.db.select().from(supplierDepositTransactions)).toHaveLength(1);
+    expect((await get(`/suppliers/${guangzhou}/deposits`)).body.deposits[0]).toMatchObject({ settled: 600, pending: 400, status: "partly settled" });
   });
 
   it("refuses broken rules with 422 under the field, unknown keys with 400, and an unknown deposit with 404", async () => {
@@ -303,6 +323,8 @@ describe("DEP-1 GET /deposits", () => {
         po: order.po,
         supplierId: guangzhou,
         supplier: "Guangzhou Textile Co.",
+        payee: "Guangzhou Textile Co.",
+        payeeRole: "supplier",
         currency: "CNY",
         amountCny: 200,
         status: "due",
@@ -320,6 +342,8 @@ describe("DEP-1 GET /deposits", () => {
         po: order.po,
         supplierId: guangzhou,
         supplier: "Guangzhou Textile Co.",
+        payee: "Guangzhou Textile Co.",
+        payeeRole: "supplier",
         currency: "CNY",
         amountCny: 123.45,
         status: "paid",
@@ -350,6 +374,22 @@ describe("DEP-1 GET /deposits", () => {
       { id: hangzhou, name: "Hangzhou Knits" },
       { id: expect.any(String), name: "Shenzhen Apparel" },
     ]);
+  });
+
+  it("names who was paid: an agent-paid order deposit keeps the order's supplier and carries the agent as payee; that supplier is offered even when inactive", async () => {
+    const order = await makeOrder(ctx, { supplier: "Hangzhou Knits", lines: [{ item: "Denim jeans", quantity: 100, rateCny: 10 }] });
+    const sino = await idOf(ctx, shippingAgents, "Sino Freight");
+    const paid = await http
+      .post("/payments", { orderId: order.id, kind: "Deposit", payeeRole: "agent", agentId: sino, amountCny: 50, paidOn: "2026-10-21", rateInr: 12, mode: "Cash" })
+      .set("Cookie", accounts);
+    expect(paid.status).toBe(201);
+    await ctx.db.update(suppliers).set({ status: "Inactive" }).where(eq(suppliers.id, hangzhou));
+
+    const res = await get("/deposits");
+    expect(res.body.orderDeposits).toEqual([
+      expect.objectContaining({ id: paid.body.payment.id, supplierId: hangzhou, supplier: "Hangzhou Knits", payee: "Sino Freight", payeeRole: "agent", amountInr: 600 }),
+    ]);
+    expect(res.body.suppliers).toContainEqual({ id: hangzhou, name: "Hangzhou Knits" });
   });
 
   it("leaves the order figures alone: PAY-1 paid and balance ignore supplier deposits and their settlements", async () => {

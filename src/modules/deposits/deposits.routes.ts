@@ -64,11 +64,15 @@ const newTransaction = z.strictObject({
 });
 
 const t = supplierDepositTransactions;
+// Nested, so the columns keep their table names whatever select they end up in (drizzle drops them from a
+// single-table select's top-level columns; orders/closure.ts).
+const settledOf = sql`select coalesce(sum(${t.amount}), 0) from ${t} where ${t.depositId} = ${supplierDeposits.id}`;
+const countOf = sql`select count(*) from ${t} where ${t.depositId} = ${supplierDeposits.id}`;
 /** Settled so far: the deposit's transactions added up. */
-const settled = sql<number>`(select coalesce(sum(${t.amount}), 0) from ${t} where ${t.depositId} = ${supplierDeposits.id})`.mapWith(Number);
-const transactionCount = sql<number>`(select count(*) from ${t} where ${t.depositId} = ${supplierDeposits.id})`.mapWith(Number);
+const settled = sql<number>`(${settledOf})`.mapWith(Number);
+const transactionCount = sql<number>`(${countOf})`.mapWith(Number);
 
-/** The SupplierDepositRow figures before `settled` and `pending` are derived. Joined to suppliers, so the columns keep their table names. */
+/** The SupplierDepositRow figures before `settled` and `pending` are derived, newest first. */
 function depositRows(db: Pick<Database, "select">, where: SQL) {
   return db
     .select({
@@ -139,6 +143,9 @@ export function depositsRoutes({ db }: RouteContext) {
           po: orders.poNumber,
           supplierId: orders.supplierId,
           supplier: suppliers.name,
+          /** Who was paid: the order's supplier, or a shipping agent (ORD-3 `payeeRole: "agent"`). */
+          payee: payments.payee,
+          payeeRole: payments.payeeRole,
           currency: orders.currency,
           amountCny: payments.amountCny,
           status: payments.status,
@@ -154,14 +161,15 @@ export function depositsRoutes({ db }: RouteContext) {
         .innerJoin(orders, eq(orders.id, payments.orderId))
         .innerJoin(suppliers, eq(suppliers.id, orders.supplierId))
         .where(eq(payments.kind, "Deposit"))
-        .orderBy(desc(sql`coalesce(${payments.paidOn}, ${payments.dueDate})`), desc(payments.createdAt)),
+        // PAY-1's order; the id last keeps it stable when payments share a timestamp (one ORD-3 insert).
+        .orderBy(desc(sql`coalesce(${payments.paidOn}, ${payments.dueDate})`), desc(payments.createdAt), desc(payments.id)),
       depositRows(db, sql`true`),
       db.select({ id: suppliers.id, name: suppliers.name }).from(suppliers).where(eq(suppliers.status, "Active")),
     ]);
     const supplierDepositList = supplierRows.map(toRow);
-    // Active suppliers plus any (inactive) one that still has deposits, so every row can be filtered; by name.
+    // Active suppliers plus any (inactive) one that still has a deposit of either kind, so every row can be filtered; by name.
     const byId = new Map(active.map((s) => [s.id, s]));
-    for (const row of supplierDepositList) byId.set(row.supplierId, { id: row.supplierId, name: row.supplier });
+    for (const row of [...orderDeposits, ...supplierDepositList]) byId.set(row.supplierId, { id: row.supplierId, name: row.supplier });
     res.json({
       orderDeposits,
       supplierDeposits: supplierDepositList,
@@ -211,15 +219,20 @@ export function depositsRoutes({ db }: RouteContext) {
     const supplierId = String(req.params.supplierId);
     if (!isUuid(supplierId)) throw notFound("Supplier");
     const input = parse(newDeposit, req.body);
-    const [supplier] = await db.select({ currency: suppliers.currency }).from(suppliers).where(eq(suppliers.id, supplierId));
-    if (!supplier) throw notFound("Supplier");
-    const created = (
-      await db
-        .insert(supplierDeposits)
-        .values({ ...input, supplierId, currency: input.currency ?? supplier.currency, createdBy: req.user!.id })
-        .returning({ id: supplierDeposits.id })
-    )[0]!;
-    res.status(201).json({ deposit: toRow((await depositRows(db, eq(supplierDeposits.id, created.id)))[0]!) });
+    const deposit = await db.transaction(async (tx) => {
+      // The supplier's row share-locked (as PAY-2 locks the agent): a delete of the supplier waits for this deposit and
+      // then counts it, instead of the insert failing on the foreign key.
+      const [supplier] = await tx.select({ currency: suppliers.currency }).from(suppliers).where(eq(suppliers.id, supplierId)).for("share");
+      if (!supplier) throw notFound("Supplier");
+      const created = (
+        await tx
+          .insert(supplierDeposits)
+          .values({ ...input, supplierId, currency: input.currency ?? supplier.currency, createdBy: req.user!.id })
+          .returning({ id: supplierDeposits.id })
+      )[0]!;
+      return toRow((await depositRows(tx, eq(supplierDeposits.id, created.id)))[0]!);
+    });
+    res.status(201).json({ deposit });
   });
 
   // SD-3. A payment (give) or receipt (receive) against the deposit, in its currency. One transaction with the deposit

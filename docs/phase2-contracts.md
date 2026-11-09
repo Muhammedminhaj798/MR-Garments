@@ -221,9 +221,10 @@ A need to change a frozen file is reported to the coordinator in the agent's fin
 Final shapes are as section 3.2 gives them, with these details:
 
 - **DEP-1** `GET /deposits` -> `{ orderDeposits, supplierDeposits, suppliers }`. `orderDeposits`: `payments` rows of kind
-  Deposit, latest `coalesce(paidOn, dueDate)` first, each with `supplierId`, `amountInr = round(amountCny * rateInr, 2)`
-  when paid, else null. `supplierDeposits`: newest first (`openedOn`, then creation). `suppliers`: active ones plus any
-  inactive one with a deposit, by name.
+  Deposit, latest `coalesce(paidOn, dueDate)` first (then creation, then id), each with `supplierId` and `supplier` (the
+  order's supplier), `payee` and `payeeRole` (`"supplier" | "agent"`: who was actually paid, as ORD-3 records it), and
+  `amountInr = round(amountCny * rateInr, 2)` when paid, else null. `supplierDeposits`: newest first (`openedOn`, then
+  creation). `suppliers`: active ones plus any inactive one with an order deposit or a supplier deposit, by name.
 - **`SupplierDepositRow`**: `settled` = sum of the deposit's transactions (SQL `coalesce(sum(amount), 0)`), `pending` =
   `round2(amount - settled)`, `status` = `open` when settled is 0, `settled` when pending is 0, else `partly settled`;
   `transactions` is the count. Amounts are in the deposit's `currency`; nothing is converted to INR (no rate exists).
@@ -235,7 +236,8 @@ Final shapes are as section 3.2 gives them, with these details:
 - **SD-2** `POST /suppliers/:supplierId/deposits`: body `{ direction, amount, currency?, openedOn, reference?, notes? }`,
   201 `{ deposit: SupplierDepositRow }`. Any known supplier, active or not (a deposit to get back from a supplier no longer
   used is still a record); unknown or malformed supplier: 404 "Supplier not found." (a path id, as PATCH /suppliers/:id).
-  `currency` left out: the supplier's.
+  `currency` left out: the supplier's. Runs in one transaction with the supplier row share-locked, so a concurrent
+  supplier delete waits and then counts the deposit.
 - **SD-3** `POST /supplier-deposits/:id/transactions`: body `{ paidOn, amount, mode, reference?, notes? }`, 201
   `{ transaction: { id, paidOn, amount, mode, reference, notes }, deposit: SupplierDepositRow }` (the refreshed figures).
   The deposit row is locked `for update` for the check and the insert. 404 "Deposit not found."
