@@ -70,13 +70,11 @@ describe("seeded rows in seed order, with exactly the contract fields", () => {
     );
   });
 
-  it("MD-19 GET /items sets exactly one of perBundle and bundleLabel", async () => {
+  it("MD-19 GET /items lists the seeded items, none with a price yet", async () => {
     const res = await asManagement("/items");
     expect(res.body).toStrictEqual(SEED_ITEMS.map((row) => ({ id, ...row, usedInOrders: [], status: "Active" })));
-    for (const row of res.body as { perBundle: number | null; bundleLabel: string | null }[]) {
-      expect((row.perBundle === null) !== (row.bundleLabel === null)).toBe(true);
-    }
-    expect(res.body.at(-1)).toMatchObject({ name: "Cotton fabric", countedIn: "Metres", perBundle: null, bundleLabel: "Roll" });
+    for (const row of res.body as { price: number | null }[]) expect(row.price).toBeNull();
+    expect(res.body.at(-1)).toMatchObject({ name: "Cotton fabric", countedIn: "Metres", price: null });
   });
 });
 

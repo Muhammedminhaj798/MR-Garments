@@ -41,7 +41,7 @@ const TABS = {
   transportCompany: { path: "/transport-companies", noun: "Transport company", body: {} },
   location: { path: "/locations", noun: "Office or warehouse", body: { type: "Warehouse" } },
   team: { path: "/teams", noun: "Team", body: {} },
-  item: { path: "/items", noun: "Item", body: { countedIn: "Pieces", perBundle: 10 } },
+  item: { path: "/items", noun: "Item", body: { countedIn: "Pieces", price: 10 } },
 } as const;
 type Tab = keyof typeof TABS;
 const UNKNOWN = "00000000-0000-4000-8000-000000000000";

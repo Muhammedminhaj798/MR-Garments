@@ -155,7 +155,7 @@ describe("DELETE /units/:id", () => {
 
 describe("items counted in a unit", () => {
   it("a new unit is usable on an item at once (any letter case); an inactive or unknown one is not", async () => {
-    const yarn = await addItem({ name: "Yarn", countedIn: "kilograms", bundleLabel: "Bag" });
+    const yarn = await addItem({ name: "Yarn", countedIn: "kilograms" });
     expect(yarn.status).toBe(201);
     expect(yarn.body.item.countedIn).toBe("Kilograms");
     expect((await list()).find((row) => row.name === "Kilograms")?.usedByItems).toEqual(["Yarn"]);
@@ -165,7 +165,7 @@ describe("items counted in a unit", () => {
 
     await edit(await unitId("Kilograms"), { status: "Inactive" });
     for (const countedIn of ["Kilograms", "Boxes"]) {
-      const refused = await addItem({ name: "Wool", countedIn, bundleLabel: "Bag" });
+      const refused = await addItem({ name: "Wool", countedIn });
       expect(refused.status, countedIn).toBe(422);
       expect(refused.body.error.fields).toEqual({ countedIn: UNIT_MISSING });
     }

@@ -20,9 +20,7 @@ export const MESSAGES = {
   nameTooLong: "Use 200 characters or fewer.",
   nameTaken: "An item with this name already exists.",
   countedIn: "Choose a unit from the list.",
-  bundle: "Enter the pieces per bundle or a bundle label.", // contract
-  perBundle: "Enter a whole number of pieces from 1 to 100000.",
-  bundleLabelTooLong: "Use 200 characters or fewer.",
+  price: "Enter a price of 0 or more with at most 2 decimals.",
   inUse: "This item is on an order, so its unit can't change.", // contract
 };
 const M = MESSAGES;
@@ -30,29 +28,21 @@ const M = MESSAGES;
 const fields = {
   name: z.string({ error: M.name }).trim().min(1, M.name).max(200, M.nameTooLong),
   countedIn: z.string({ error: M.countedIn }).trim().min(1, M.countedIn).max(50, M.countedIn),
-  perBundle: z.number({ error: M.perBundle }).int(M.perBundle).min(1, M.perBundle).max(100_000, M.perBundle).nullable(),
-  // A blank label is no label.
-  bundleLabel: z
-    .string({ error: M.bundle })
-    .trim()
-    .max(200, M.bundleLabelTooLong)
-    .transform((label) => label || null)
+  /** The default rate per unit on a new order: 0 or more, to 2 decimals, within what ORD-3 takes as a rate; null clears it. */
+  price: z
+    .number({ error: M.price })
+    .min(0, M.price)
+    .max(99_999_999.99, M.price)
+    .refine((value) => Math.round(value * 100) / 100 === value, M.price)
     .nullable(),
   status: z.enum(STATUSES),
 };
 const newItem = z.strictObject({
   name: fields.name,
   countedIn: fields.countedIn,
-  perBundle: fields.perBundle.default(null),
-  bundleLabel: fields.bundleLabel.default(null),
+  price: fields.price.default(null),
 });
 const itemUpdate = z.strictObject(fields).partial();
-
-/** Exactly one of perBundle and bundleLabel is set (the database's items_bundle_check). */
-function bundle(perBundle: number | null, bundleLabel: string | null) {
-  if ((perBundle === null) === (bundleLabel === null)) throw validationFailed({ perBundle: M.bundle });
-  return { perBundle, bundleLabel };
-}
 
 const isUuid = (value: string) => z.uuid().safeParse(value).success;
 
@@ -89,8 +79,7 @@ function itemRows(db: Database, id?: string) {
       id: items.id,
       name: items.name,
       countedIn: items.countedIn,
-      perBundle: items.perBundle,
-      bundleLabel: items.bundleLabel,
+      price: items.price,
       usedInOrders,
       status: items.status,
     })
@@ -106,12 +95,12 @@ export function itemsRoutes({ db }: RouteContext) {
   listRoute(router, "/items", () => itemRows(db), (row) => [row.name, ...row.usedInOrders]);
 
   router.post("/items", admin, async (req, res) => {
-    const { perBundle, bundleLabel, ...input } = parse(newItem, req.body);
+    const input = parse(newItem, req.body);
     const countedIn = await activeUnit(db, input.countedIn);
     // The unique index on lower(name) decides duplicates, so two simultaneous adds can't both succeed.
     const created = await db
       .insert(items)
-      .values({ ...input, countedIn, ...bundle(perBundle, bundleLabel) })
+      .values({ ...input, countedIn })
       .onConflictDoNothing()
       .returning({ id: items.id })
       .catch(nameTakenAsConflict);
@@ -119,14 +108,13 @@ export function itemsRoutes({ db }: RouteContext) {
     res.status(201).json({ item: (await itemRows(db, created[0].id))[0] });
   });
 
-  // Only the keys sent change. A bundle key sent replaces the bundle: the other one becomes null unless also sent.
+  // Only the keys sent change; `price: null` clears the price.
   router.patch("/items/:id", admin, async (req, res) => {
     const id = String(req.params.id);
     if (!isUuid(id)) throw notFound("Item");
     const parsed = parse(itemUpdate, req.body);
     if (Object.keys(parsed).length === 0) throw new HttpError(400, "bad_request", GENERIC_MESSAGE);
-    const { perBundle, bundleLabel, countedIn, ...input } = parsed;
-    const values = perBundle === undefined && bundleLabel === undefined ? input : { ...input, ...bundle(perBundle ?? null, bundleLabel ?? null) };
+    const { countedIn, ...values } = parsed;
 
     await db
       .transaction(async (tx) => {

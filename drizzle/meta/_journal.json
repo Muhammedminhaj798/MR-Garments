@@ -71,6 +71,13 @@
       "when": 1794213475841,
       "tag": "0009_phase2_fixes",
       "breakpoints": true
+    },
+    {
+      "idx": 10,
+      "version": "7",
+      "when": 1794235772778,
+      "tag": "0010_item_price",
+      "breakpoints": true
     }
   ]
 }

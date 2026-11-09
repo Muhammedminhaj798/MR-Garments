@@ -40,15 +40,15 @@ export const SEED_UNITS = [
   { name: "Metres", symbol: "m" },
 ];
 
-export const SEED_ITEMS: { name: string; countedIn: string; perBundle: number | null; bundleLabel: string | null }[] = [
-  { name: "Denim jeans", countedIn: "Pieces", perBundle: 50, bundleLabel: null },
-  { name: "Track pants", countedIn: "Pieces", perBundle: 50, bundleLabel: null },
-  { name: "Kids t-shirts", countedIn: "Pieces", perBundle: 50, bundleLabel: null },
-  { name: "Ladies kurtis", countedIn: "Pieces", perBundle: 50, bundleLabel: null },
-  { name: "Polo shirts", countedIn: "Pieces", perBundle: 50, bundleLabel: null },
-  { name: "Men's shorts", countedIn: "Pieces", perBundle: 50, bundleLabel: null },
-  { name: "Men's jackets", countedIn: "Pieces", perBundle: 50, bundleLabel: null },
-  { name: "Cotton fabric", countedIn: "Metres", perBundle: null, bundleLabel: "Roll" },
+export const SEED_ITEMS: { name: string; countedIn: string; price: number | null }[] = [
+  { name: "Denim jeans", countedIn: "Pieces", price: null },
+  { name: "Track pants", countedIn: "Pieces", price: null },
+  { name: "Kids t-shirts", countedIn: "Pieces", price: null },
+  { name: "Ladies kurtis", countedIn: "Pieces", price: null },
+  { name: "Polo shirts", countedIn: "Pieces", price: null },
+  { name: "Men's shorts", countedIn: "Pieces", price: null },
+  { name: "Men's jackets", countedIn: "Pieces", price: null },
+  { name: "Cotton fabric", countedIn: "Metres", price: null },
 ];
 
 /** `office` is a location name, or null for the Head office users (deferred, U28). `stages` follows decision B7. */

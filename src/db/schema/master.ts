@@ -1,5 +1,5 @@
 import { sql } from "drizzle-orm";
-import { check, integer, pgTable, text, uniqueIndex, uuid } from "drizzle-orm/pg-core";
+import { check, integer, numeric, pgTable, text, uniqueIndex, uuid } from "drizzle-orm/pg-core";
 
 import { inList, status, STATUSES, timestamps } from "./columns";
 
@@ -85,6 +85,10 @@ export const items = pgTable(
     countedIn: text("counted_in")
       .notNull()
       .references(() => units.name, { onUpdate: "cascade" }),
+    /** Default rate per unit on a new order, in the order's currency (0010); null when none is set, never negative. */
+    price: numeric("price", { precision: 12, scale: 2, mode: "number" }),
+    // Retired by the item-price change (docs/item-price.md): no longer read or written, kept so existing rows lose
+    // nothing. A later migration drops them once the release is verified.
     perBundle: integer("per_bundle"),
     bundleLabel: text("bundle_label"),
     status,
@@ -92,7 +96,7 @@ export const items = pgTable(
   },
   (t) => [
     uniqueIndex("items_name_unique").on(sql`lower(${t.name})`),
-    check("items_bundle_check", sql`(per_bundle is not null and per_bundle > 0 and bundle_label is null) or (per_bundle is null and bundle_label is not null)`),
+    check("items_price_check", sql`price is null or price >= 0`),
     check("items_status_check", inList("status", STATUSES)),
   ],
 );

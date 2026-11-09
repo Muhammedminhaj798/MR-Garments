@@ -101,7 +101,7 @@ are not part of Batch 1 and fall through to 404.
 | MD-10 | `/transport-companies` | `{ id, name, contactPerson, phone, tripsSoFar, status }` (`tripsSoFar` 0) |
 | MD-13 | `/locations` | `{ id, name, type, country, address, staff: string[], status }`; `staff` is the names of the **active** users at that location, in list order (B6) |
 | MD-16 | `/teams` | `{ id, name, piecesInStock, landedCostOfStockInr, averagePerPieceInr, status }`; 0, 0 and `null` in Batch 1 (shown as "–", 5.6) |
-| MD-19 | `/items` | `{ id, name, countedIn, perBundle, bundleLabel, usedInOrders: string[], status }`; exactly one of `perBundle` (whole number) and `bundleLabel` is set, the other is `null`; `usedInOrders` is `[]` |
+| MD-19 | `/items` | `{ id, name, countedIn, price, usedInOrders: string[], status }`; `price` is the default rate per unit on a new order (0 or more, 2 decimals) or `null`; `usedInOrders` is `[]` |
 
 Optional filters on MD-1 and these lists: `status` is `Active` or `Inactive` (omitted: all); `search` keeps rows where
 one of the tab's searchable columns contains it, ignoring case and spaces, as the frontend's `filterRecords` does.

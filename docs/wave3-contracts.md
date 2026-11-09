@@ -90,15 +90,14 @@ Same rules for all seven tabs:
 | 4 Transport companies (A2) | `/transport-companies`, `transportCompany` | name, contactPerson, phone | `tripsSoFar`: this company's trips (any status) |
 | 5 Offices & warehouses (A3) | `/locations`, `location` | POST: name, type, address; PATCH: name, address, status | `staff` as today |
 | 6 Teams (A3) | `/teams`, `team` | name | stock from stocked warehouse receipts, see 6.3 |
-| 7 Item list (A4) | `/items`, `item` | name, countedIn, perBundle / bundleLabel | `usedInOrders`: distinct PO numbers with a line of this item, PO order |
+| 7 Item list (A4) | `/items`, `item` | name, countedIn, price | `usedInOrders`: distinct PO numbers with a line of this item, PO order |
 
 - Locations: `type` is `China office` | `India office` | `Warehouse`; the server sets `country` (China office ->
   China, otherwise India). **(default)** The type can't change after creation (PATCH doesn't accept it), because
   receipts, users and trips rely on it.
-- Items: `countedIn` is `Pieces` | `Metres`; exactly one of `perBundle` (whole number 1-100000) and `bundleLabel`
-  (text) is set, the other `null` (422 `fields.perBundle` "Enter the pieces per bundle or a bundle label."). **(default)**
-  `countedIn` can't change once the item is on an order: 409 `item_in_use` "This item is on an order, so its unit
-  can't change.".
+- Items: `countedIn` is a unit's name (Settings, Units); `price` is the default rate per unit on a new order, 0 or
+  more with at most 2 decimals, or `null` (422 `fields.price` "Enter a price of 0 or more with at most 2 decimals.").
+  The former `perBundle` / `bundleLabel` were retired by docs/item-price.md.
 - Frontend (foundation): build each tab's dialogs on `features/settings/settings-dialog.tsx`: `useSettingsDialog(path)`
   (`open` "add" | "edit" | null, `id`, `close`, `saved(message)`), `SettingsDialog`, `SettingsDialogFooter`,
   `setApiErrors(error, setError)` and `ConfirmDialog` (deactivation). The add action links to `addHref(path)`

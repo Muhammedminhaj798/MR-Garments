@@ -243,7 +243,8 @@ export function ordersRoutes({ db }: RouteContext) {
         .where(eq(suppliers.status, "Active"))
         .orderBy(asc(suppliers.createdAt), asc(suppliers.name)),
       db
-        .select({ id: items.id, name: items.name, unit: unitSymbol })
+        // `price`: the item's default rate per unit, which the form offers for the line (null when none is set).
+        .select({ id: items.id, name: items.name, unit: unitSymbol, price: items.price })
         .from(items)
         .where(eq(items.status, "Active"))
         .orderBy(asc(items.createdAt), asc(items.name)),

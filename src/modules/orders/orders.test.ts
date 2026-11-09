@@ -89,8 +89,8 @@ describe("ORD-2 GET /orders/options", () => {
     expect(res.body.suppliers.map((row: { name: string }) => row.name)).toEqual(["Guangzhou Textile Co.", "Shenzhen Apparel", "Yiwu Trims Ltd.", "Hangzhou Knits"]);
     expect(res.body.suppliers[0]).toEqual({ id: ids.supplier, name: "Guangzhou Textile Co.", contactPerson: "Mr. Zhao Lin", phone: "+86 138 0013 2244", city: "Guangzhou", currency: "CNY" });
     expect(res.body.items).toHaveLength(8);
-    expect(res.body.items).toContainEqual({ id: ids.jeans, name: "Denim jeans", unit: "pcs" });
-    expect(res.body.items).toContainEqual({ id: ids.fabric, name: "Cotton fabric", unit: "m" });
+    expect(res.body.items).toContainEqual({ id: ids.jeans, name: "Denim jeans", unit: "pcs", price: null });
+    expect(res.body.items).toContainEqual({ id: ids.fabric, name: "Cotton fabric", unit: "m", price: null });
     expect(res.body.agents).toEqual([{ id: expect.any(String), name: "Sino Freight" }]);
   });
 });
