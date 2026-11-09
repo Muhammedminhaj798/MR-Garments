@@ -215,3 +215,64 @@ A need to change a frozen file is reported to the coordinator in the agent's fin
 ## 8. Response shapes recorded by the owners
 
 (Agents append the final shapes and messages of their endpoints here.)
+
+### 8.R Per-order report and order reports (Agent R)
+
+Backend `src/modules/reports/order-report.ts` (RPT-O1), `order-reports.ts` (RPT-O2), routes in `reports.routes.ts`;
+frontend types `src/lib/api/reports-types.ts` (`OrderReport`, `OrderReportsResponse`). Dates `YYYY-MM-DD`; money with 2
+decimals; `...Cny` amounts are in the order's `currency`; INR per payment at its own `rateInr`. Errors: 401; 403
+`forbidden`; 404 `not_found` "Order not found." (RPT-O1); 400 `bad_request` "Something went wrong." for a malformed
+RPT-O2 query (unknown or repeated key, bad date or id, `from` after `to`, unknown `status`/`paymentStatus`, `po` over
+50 characters). No new messages.
+
+**RPT-O1** `GET /orders/:po/report` (`ordersView` >= View; the PO in any letter case, percent-encoded when it has a
+slash). A section is `null` when the user's effective access to its capability is below View and its queries never
+run; the nested `clearing`/`transport` of a container are `null` below `clearing`/`transport` View (and when the
+container has none). Decisions: `payments` paid/balance/deposits/due count **supplier** payments only (13.5's
+`supplierMoney`; agent payments are sea freight) while `list` holds every payment of the order (as ORD-4); `dueCny` is
+the due supplier payments; the timeline's trip-loaded step is named `dispatched` so it never shares a name with the
+container's `loaded` step; the `received` steps need `receiving` >= View (as ORD-4's receipts).
+
+```ts
+{
+  order: { id, po, supplier: { id, name, contactPerson, phone, city }, orderDate, deliveryDate, stage, closed, closedOn,
+           currency, orderValueCny, totals: { unit, ordered, received, stocked }[] };   // one total per unit, never added
+  lines: { id, position, item, unit, ordered, received, excess, short, loaded, stocked, rateCny, valueCny }[];   // position order
+  payments: { paidCny, paidInr, balanceCny, depositsPaidCny, dueCny,
+              list: { id, kind, payee, payeeRole, amountCny, amountInr | null, status, paidOn, dueDate, rateInr, mode, reference, notes }[] } | null;
+  logistics: { id, number, status, terms, agent, portOfLoading, portOfArrival, loadedOn, sailedOn, eta,
+               lines: { orderLineId, item, unit, bundles, quantity }[],                       // this order's lines only
+               clearing: { id, agent, arrivedOn, handedOn, billOfEntry, dutyPaidOn, clearedOn, status,
+                           customsDutyInr, otherDutiesInr, agentChargesInr, portChargesInr, totalInr } | null,   // the container's totals
+               transport: { id, company, lrNumber, vehicleNumber, driverName, destination, loadedOn, unloadedOn,
+                            bundlesLoaded, bundlesReceived, status, freightInr, handlingInr, totalInr } | null }[] | null;   // loading order
+  warehouse: { receiptId, transportId, container, warehouse, receivedOn, receivedBy, status, bundlesReceived,
+               lines: { item, unit, team, quantity }[] }[] | null;   // every receipt (draft or stocked) of a trip carrying the order
+  landedCost: OrderLandedCost | null;   // loadLandedCosts, unchanged
+  timeline: { step, on, detail }[];     // date order; step: created | deposit | payment | received | loaded | sailed | arrived
+                                        // | cleared | dispatched | unloaded | stocked | closed; only steps of visible sections
+}
+```
+
+`detail` is plain text: "Ordered from <supplier>", "2,000.00 CNY to <payee>", "<office> · 120 pcs · 30 m",
+"<container> · <agent>", "<container> · <vehicle> · LR <number>", "<container> · <warehouse>", "Every container stocked".
+
+**RPT-O2** `GET /reports/orders?po&supplierId&from&to&status&warehouseId&paymentStatus` (`reports` >= View). `po`: a
+case-insensitive part of the PO number (`%`, `_` match themselves; empty = no filter); `from`/`to`: order date;
+`status`: `pending` (stage 1) | `closed` (section 1) | `active` (the rest); `warehouseId`: orders with some of their
+own goods on a stocked receipt at that location; `paymentStatus`: `unpaid` (nothing paid to the supplier) | `partly` |
+`paid` (supplier payments >= order value, overpayments included). Decision: `paidCny`/`paidInr`/`balanceCny` on every
+row count supplier payments only (not ORD-1's all-payee `paidCny`), so value - paid = balance and `paymentStatus`
+follows the same figures.
+
+```ts
+{
+  rows: { id, po, orderDate, deliveryDate, stage, supplier: { id, name }, currency, item, unit, quantity, received, stocked,
+          closed, closedOn, orderValueCny, paidCny, paidInr, balanceCny, paymentStatus,
+          landedCostInr | null,     // loadLandedCosts totalInr; null while the order has no cost at all
+          perPieceInr | null }[];   // ORD-1 order: order date, then PO, newest first
+  summary: { orders, byCurrency: { currency, orderValueCny, paidCny, balanceCny }[], paidInr, landedCostInr };
+  filter: { po, supplier, from, to, status, warehouse, paymentStatus };   // names for ids; null when not filtered
+  options: { suppliers: { id, name }[], warehouses: { id, name }[] };     // active ones, creation order
+}
+```
