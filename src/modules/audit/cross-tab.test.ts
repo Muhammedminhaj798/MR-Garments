@@ -50,7 +50,7 @@ beforeAll(async () => {
   ids.office = await idOf(ctx, locations, "Guangzhou office");
 });
 
-type Expected = { stage: number; received: [number, number]; loaded: [number, number]; payments: { amountCny: number; rateInr: number; kind: string }[] };
+type Expected = { stage: number; received: [number, number]; loaded: [number, number]; payments: { amountCny: number; rateInr: number; kind: string; payeeRole: "supplier" | "agent" }[] };
 
 /** Reads every endpoint for the order and checks they tell one story. */
 async function expectConsistent(want: Expected) {
@@ -71,16 +71,22 @@ async function expectConsistent(want: Expected) {
   const pay = p1.body.orders.find((row: { orderId: string }) => row.orderId === order.id);
   const paidCny = round2(want.payments.reduce((sum, p) => sum + p.amountCny, 0));
   const paidInr = round2(want.payments.reduce((sum, p) => sum + inr(p.amountCny, p.rateInr), 0));
+  const toSupplier = want.payments.filter((p) => p.payeeRole === "supplier");
+  const supplierPaidCny = round2(toSupplier.reduce((sum, p) => sum + p.amountCny, 0));
+  const supplierPaidInr = round2(toSupplier.reduce((sum, p) => sum + inr(p.amountCny, p.rateInr), 0));
 
-  // Stage and the three money figures: identical in ORD-1, ORD-4 and PAY-1.
+  // Stage and the money figures: identical in ORD-1, ORD-4 and PAY-1; the balance is what the supplier is owed
+  // (agent payments are sea freight, docs/phase2-fixes.md 1).
   expect(ord1.stage).toBe(want.stage);
   expect(detail.stage).toBe(want.stage);
   for (const view of [ord1, detail, pay]) {
     expect(view.orderValueCny).toBe(VALUE);
     expect(view.paidCny).toBeCloseTo(paidCny, 2);
     expect(view.paidInr).toBeCloseTo(paidInr, 2);
+    expect(view.supplierPaidCny).toBeCloseTo(supplierPaidCny, 2);
+    expect(view.supplierPaidInr).toBeCloseTo(supplierPaidInr, 2);
   }
-  expect(detail.balanceCny).toBeCloseTo(round2(VALUE - paidCny), 2);
+  expect(detail.balanceCny).toBeCloseTo(round2(VALUE - supplierPaidCny), 2);
   expect(pay.balanceCny).toBe(detail.balanceCny);
   expect(detail.lines.reduce((sum: number, l: { valueCny: number }) => sum + l.valueCny, 0)).toBeCloseTo(VALUE, 2);
 
@@ -132,7 +138,8 @@ async function expectConsistent(want: Expected) {
   if (want.stage <= 2 && left.some((n) => n > 0)) {
     expect(opt).toBeDefined();
     expect(opt.orderValueCny).toBe(VALUE);
-    const deposits = round2(want.payments.filter((p) => p.kind === "Deposit").reduce((sum, p) => sum + p.amountCny, 0));
+    // REC-2 shows the deposits paid to the supplier (an agent deposit is freight), as the order report does.
+    const deposits = round2(want.payments.filter((p) => p.kind === "Deposit" && p.payeeRole === "supplier").reduce((sum, p) => sum + p.amountCny, 0));
     expect(opt.depositsPaidCny).toBeCloseTo(deposits, 2);
     expect(opt.lines.map((l: { orderLineId: string }) => l.orderLineId)).toEqual(order.lines.filter((_, i) => left[i]! > 0));
     for (const l of opt.lines as { orderLineId: string; receivedEarlier: number; ordered: number }[]) {
@@ -203,7 +210,7 @@ describe("one order across all five tabs", () => {
     expect(order.po).toBe("PO-2050");
     const detail = await get(`/orders/${order.po}`);
     order.lines = detail.body.lines.map((l: { id: string }) => l.id);
-    state.payments = DEPOSITS.map((d) => ({ amountCny: d.amountCny, rateInr: d.rateInr, kind: "Deposit" }));
+    state.payments = DEPOSITS.map((d) => ({ amountCny: d.amountCny, rateInr: d.rateInr, kind: "Deposit", payeeRole: d.payeeRole as "supplier" | "agent" }));
     await expectConsistent(state);
   });
 
@@ -213,13 +220,13 @@ describe("one order across all five tabs", () => {
     expect(bad.body.error.fields.agentId).toBeDefined();
     const res = await post("/payments", { orderId: order.id, kind: "Balance", payeeRole: "agent", agentId: ids.sino, amountCny: 20.2, paidOn: indiaDay(-1), rateInr: 11.5, mode: " UPI " }, accounts);
     expect(res.status).toBe(201);
-    state.payments.push({ amountCny: 20.2, rateInr: 11.5, kind: "Balance" });
+    state.payments.push({ amountCny: 20.2, rateInr: 11.5, kind: "Balance", payeeRole: "agent" });
     const { detail } = await expectConsistent(state);
     const added = detail.payments.find((p: { id: string }) => p.id === res.body.payment.id);
     expect(added).toMatchObject({ kind: "Balance", payee: "Sino Freight", payeeRole: "agent", mode: "UPI", status: "paid", dueDate: null, rateInr: 11.5 });
     const supplierPay = await post("/payments", { orderId: order.id, kind: "Balance", payeeRole: "supplier", agentId: null, amountCny: 0.01, paidOn: indiaDay(0), rateInr: 0.0001, mode: "x" }, accounts);
     expect(supplierPay.status).toBe(201);
-    state.payments.push({ amountCny: 0.01, rateInr: 0.0001, kind: "Balance" });
+    state.payments.push({ amountCny: 0.01, rateInr: 0.0001, kind: "Balance", payeeRole: "supplier" });
     const { detail: d2 } = await expectConsistent(state);
     expect(d2.payments.find((p: { id: string }) => p.id === supplierPay.body.payment.id).payee).toBe("Guangzhou Textile Co.");
   });
