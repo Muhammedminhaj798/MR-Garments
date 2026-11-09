@@ -280,3 +280,50 @@ follows the same figures.
   options: { suppliers: { id, name }[], warehouses: { id, name }[] };     // active ones, creation order
 }
 ```
+
+### 8.D Deposits (Agent D, `src/modules/deposits/deposits.routes.ts`)
+
+Final shapes are as section 3.2 gives them, with these details:
+
+- **DEP-1** `GET /deposits` -> `{ orderDeposits, supplierDeposits, suppliers }`. `orderDeposits`: `payments` rows of kind
+  Deposit, latest `coalesce(paidOn, dueDate)` first (then creation, then id), each with `supplierId` and `supplier` (the
+  order's supplier), `payee` and `payeeRole` (`"supplier" | "agent"`: who was actually paid, as ORD-3 records it), and
+  `amountInr = round(amountCny * rateInr, 2)` when paid, else null. `supplierDeposits`: newest first (`openedOn`, then
+  creation). `suppliers`: active ones plus any inactive one with an order deposit or a supplier deposit, by name.
+- **`SupplierDepositRow`**: `settled` = sum of the deposit's transactions (SQL `coalesce(sum(amount), 0)`), `pending` =
+  `round2(amount - settled)`, `status` = `open` when settled is 0, `settled` when pending is 0, else `partly settled`;
+  `transactions` is the count. Amounts are in the deposit's `currency`; nothing is converted to INR (no rate exists).
+- **SD-1** `GET /suppliers/:supplierId/deposits` -> `{ supplier, summary, deposits }`. `summary`: one line per
+  (currency, direction) that has a deposit, CNY/USD/INR then give/receive, each `{ currency, direction, amount, settled,
+  pending }`; give and receive are never netted (a supplier with both gets two lines). `deposits[].transactions`: newest
+  first (`paidOn`, then creation), each `{ id, paidOn, amount, mode, reference, notes }`. 404 `not_found` "Supplier not
+  found." for an unknown or malformed id.
+- **SD-2** `POST /suppliers/:supplierId/deposits`: body `{ direction, amount, currency?, openedOn, reference?, notes? }`,
+  201 `{ deposit: SupplierDepositRow }`. Any known supplier, active or not (a deposit to get back from a supplier no longer
+  used is still a record); unknown or malformed supplier: 404 "Supplier not found." (a path id, as PATCH /suppliers/:id).
+  `currency` left out: the supplier's. Runs in one transaction with the supplier row share-locked, so a concurrent
+  supplier delete waits and then counts the deposit.
+- **SD-3** `POST /supplier-deposits/:id/transactions`: body `{ paidOn, amount, mode, reference?, notes? }`, 201
+  `{ transaction: { id, paidOn, amount, mode, reference, notes }, deposit: SupplierDepositRow }` (the refreshed figures).
+  The deposit row is locked `for update` for the check and the insert. 404 "Deposit not found."
+- **SD-4** `DELETE /supplier-deposit-transactions/:id`: 204; 404 "Transaction not found." The deposit row is locked first,
+  so a settlement and a delete on the same deposit serialise. Log line as PAY-3's.
+- **SD-5** `DELETE /supplier-deposits/:id`: 204 when it has no transactions; 409 `in_use` "This deposit has N
+  transaction(s), so it can't be deleted."; 404 "Deposit not found."
+- Supplier delete: `{ what: "deposit", table: supplierDeposits }` added to the `deleteRoute` uses, so "This supplier is
+  used by 1 order and 1 deposit, so it can't be deleted. Deactivate it instead."
+
+Messages (`MESSAGES` in deposits.routes.ts; 422 `validation_failed` under the field, every problem at once):
+
+| Field | Message |
+| --- | --- |
+| direction | Choose Give or Receive. |
+| amount (0.01 .. 999,999,999,999, 2 decimals) | Enter an amount above 0. |
+| amount (SD-3, more than pending) | Only ¥1,234.50 left to settle. (pending in the deposit's currency: ¥, $ or ₹, Indian grouping, 2 decimals unless whole) |
+| currency | Choose CNY, USD or INR. |
+| openedOn (missing or malformed) | Enter the date the deposit was agreed. |
+| paidOn (missing or malformed) | Enter the date of the payment or receipt. |
+| openedOn / paidOn after today in India | The date can't be in the future. |
+| mode | Enter the payment mode. / Use 100 characters or fewer for the mode. |
+| reference (<= 100) | Use 100 characters or fewer for the reference. |
+| notes (<= 1,000) | Use 1,000 characters or fewer for the notes. |
