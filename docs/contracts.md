@@ -84,11 +84,16 @@ invite, reset or password links and no emails.
 increasing creation times in `master.ts` order, which is the order the references show; new rows come last.
 
 **MD-1 `GET /suppliers?search=&status=`** (A4): array of
-`{ id, name, contactPerson, phone, city, address, notes, currency, openOrders, status }`; `openOrders` is 0 in
-Batch 1. **MD-2 `POST /suppliers`** (A4): `{ name*, city, contactPerson, phone, currency?, address, notes }` (`currency`: `"CNY"`
-(default), `"USD"` or `"INR"` since migration 0006, else 422 "Choose CNY, USD or INR."; PATCH takes it too and it
-only changes the default for the supplier's new orders),
+`{ id, code, name, contactPerson, phone, email, country, city, state, postalCode, address, paymentTerms, taxNumber,
+notes, currency, openOrders, ytdValue, balance, status }` (the profile fields, `ytdValue` and `balance` since
+migration 0011: docs/suppliers.md); `openOrders` is 0 in Batch 1. **MD-2 `POST /suppliers`** (A4):
+`{ name*, code?, country, city, state, postalCode, contactPerson, phone, email, address, paymentTerms, taxNumber, notes,
+currency? }` (`currency`: `"CNY"` (default), `"USD"` or `"INR"` since migration 0006, else 422 "Choose CNY, USD or
+INR."; PATCH takes it too and it only changes the default for the supplier's new orders; `code` is assigned as
+`SUP-nnn` when left out, else kept upper-case, unique: 409 `code_exists` with `fields.code`),
 201 `{ supplier }` (Active, 0 open orders); 409 `name_exists` with `fields.name` (M22); 422 for a missing name (M21).
+**SUP-1 `GET /suppliers/summary`** and **SUP-2 `GET /suppliers/insights`**: the Suppliers page's cards and
+dashboards (docs/suppliers.md).
 
 **Read-only master data** (A3 builds them; A4's Settings tabs read them). All are `GET` only, need
 `requirePermission("admin", "Full")` (Management only, B6), and return an array. `POST` and `PATCH` on these paths

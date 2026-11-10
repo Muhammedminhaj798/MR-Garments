@@ -16,6 +16,9 @@ afterAll(() => ctx.pool.end());
 
 const M21 = "Enter the supplier name.";
 const M22 = "A supplier with this name already exists.";
+const CODE_SHAPE = "Use up to 20 letters, digits or dashes.";
+const CODE_TAKEN = "A supplier with this code already exists.";
+const EMAIL = "Enter a valid email address.";
 const SEEDED_NAMES = ["Guangzhou Textile Co.", "Shenzhen Apparel", "Foshan Fabrics", "Yiwu Trims Ltd.", "Hangzhou Knits"];
 const NINGBO = {
   name: "Ningbo Denim Works",
@@ -25,7 +28,11 @@ const NINGBO = {
   currency: "USD", // any of CNY, USD and INR (0006)
   address: "88 Zhongshan Road, Ningbo",
   notes: "Denim only",
+  country: "China",
+  email: "xu.feng@ningbo-denim.cn",
 };
+// The profile fields a row has when they were never set, and the money lists of a supplier without orders.
+const EXTRAS = { state: "", postalCode: "", paymentTerms: "", taxNumber: "", openPos: 0, ytdValue: [], balance: [] };
 
 const UNKNOWN = "00000000-0000-4000-8000-000000000000";
 const list = (query = "") => http.get(`/suppliers${query}`).set("Cookie", management);
@@ -63,17 +70,21 @@ describe("MD-1 GET /suppliers", () => {
     expect(names(res.body)).toEqual(SEEDED_NAMES);
     expect(res.body[0]).toEqual({
       id: expect.any(String),
+      code: "SUP-001",
       name: "Guangzhou Textile Co.",
       contactPerson: "Mr. Zhao Lin",
       phone: "+86 138 0013 2244",
+      email: "",
+      country: "China",
       city: "Guangzhou",
       address: "",
       notes: "",
       currency: "CNY",
       openOrders: 0,
       status: "Active",
+      ...EXTRAS,
     });
-    for (const row of res.body) expect(row).toMatchObject({ openOrders: 0, status: "Active", currency: "CNY" });
+    for (const [index, row] of res.body.entries()) expect(row).toMatchObject({ code: `SUP-00${index + 1}`, openOrders: 0, status: "Active", currency: "CNY" });
   });
 
   it("AT-S2: searches name, contact and phone ignoring case and spaces", async () => {
@@ -81,6 +92,9 @@ describe("MD-1 GET /suppliers", () => {
     expect(names((await list("?search=liu%20yan")).body)).toEqual(["Shenzhen Apparel"]);
     expect(names((await list("?search=%2B861372288")).body)).toEqual(["Foshan Fabrics"]);
     expect(names((await list("?search=%2B86%20137")).body)).toEqual(["Foshan Fabrics"]);
+    // The code and the country too (the Suppliers page searches name, code and country).
+    expect(names((await list("?search=sup-003")).body)).toEqual(["Foshan Fabrics"]);
+    expect(names((await list("?search=CHINA")).body)).toEqual(SEEDED_NAMES);
     expect((await list("?search=ningbo")).body).toEqual([]);
     expect(names((await list("?search=")).body)).toEqual(SEEDED_NAMES);
   });
@@ -137,7 +151,7 @@ describe("MD-2 POST /suppliers", () => {
   it("AT-S4: adds the supplier as Active with 0 open orders, stores address, notes and the creator", async () => {
     const res = await add({ ...NINGBO, name: "  Ningbo Denim Works " });
     expect(res.status).toBe(201);
-    expect(res.body).toEqual({ supplier: { ...NINGBO, id: expect.any(String), openOrders: 0, status: "Active" } });
+    expect(res.body).toEqual({ supplier: { ...NINGBO, ...EXTRAS, id: expect.any(String), code: "SUP-006", openOrders: 0, status: "Active" } });
 
     const listed = (await list()).body;
     expect(names(listed)).toEqual([...SEEDED_NAMES, "Ningbo Denim Works"]);
@@ -161,7 +175,51 @@ describe("MD-2 POST /suppliers", () => {
   it("accepts only the name, defaulting the other fields", async () => {
     const res = await add({ name: "Wenzhou Buttons" });
     expect(res.status).toBe(201);
-    expect(res.body.supplier).toMatchObject({ name: "Wenzhou Buttons", city: "", contactPerson: "", phone: "", currency: "CNY", address: "", notes: "" });
+    expect(res.body.supplier).toMatchObject({ name: "Wenzhou Buttons", code: "SUP-007", city: "", contactPerson: "", phone: "", currency: "CNY", address: "", notes: "", country: "", email: "" });
+  });
+
+  it("assigns the next SUP-nnn code, or keeps a typed code in upper case; a code in use, in any case, is 409 under code", async () => {
+    // Ningbo took SUP-006 and Wenzhou SUP-007 above; a typed code never moves the sequence.
+    const typed = await add({ name: "Dongguan Zips", code: " dz-01 " });
+    expect(typed.status).toBe(201);
+    expect(typed.body.supplier.code).toBe("DZ-01");
+    const next = await add({ name: "Jiangmen Labels" });
+    expect(next.body.supplier.code).toBe("SUP-008");
+    for (const code of ["dz-01", "SUP-008", "sup-001"]) {
+      const res = await add({ name: `Taken ${code}`, code });
+      expect(res.status, code).toBe(409);
+      expect(res.body.error).toEqual({ code: "code_exists", message: CODE_TAKEN, fields: { code: CODE_TAKEN } });
+    }
+    for (const code of ["", "SUP 009", "-SUP", "S".repeat(21), "sup_009"]) {
+      const res = await add({ name: `Shape ${code}`, code });
+      expect(res.status, code).toBe(422);
+      expect(res.body.error.fields).toEqual({ code: CODE_SHAPE });
+    }
+    for (const name of ["Dongguan Zips", "Jiangmen Labels"]) await ctx.db.delete(suppliers).where(eq(suppliers.name, name));
+  });
+
+  it("refuses a phone without five digits with 422 under phone; letters around the digits are fine", async () => {
+    for (const phone of ["call me", "1234", "+86 13"]) {
+      const res = await add({ name: "Phone Check", phone });
+      expect(res.status, phone).toBe(422);
+      expect(res.body.error.fields).toEqual({ phone: "Enter a valid phone number." });
+    }
+    const ok = await add({ name: "Phone Check", phone: "WeChat 13800132244" });
+    expect(ok.status).toBe(201);
+    expect(ok.body.supplier.phone).toBe("WeChat 13800132244");
+    await ctx.db.delete(suppliers).where(eq(suppliers.name, "Phone Check"));
+  });
+
+  it("refuses a malformed email with 422 under email; an empty one is fine", async () => {
+    for (const email of ["nope", "a@b", "a b@c.com"]) {
+      const res = await add({ name: "Mail Check", email });
+      expect(res.status, email).toBe(422);
+      expect(res.body.error.fields).toEqual({ email: EMAIL });
+    }
+    const ok = await add({ name: "Mail Check", email: "" });
+    expect(ok.status).toBe(201);
+    expect(ok.body.supplier.email).toBe("");
+    await ctx.db.delete(suppliers).where(eq(suppliers.name, "Mail Check"));
   });
 
   it("refuses a name or text over the length limits with 422", async () => {
@@ -184,7 +242,7 @@ describe("PATCH /suppliers/:id", () => {
     };
     const res = await edit(id, { ...changed, name: "  Shenzhen Apparel Group ", city: " Dongguan " });
     expect(res.status).toBe(200);
-    expect(res.body).toEqual({ supplier: { ...changed, id, currency: "CNY", openOrders: 0, status: "Active" } });
+    expect(res.body).toEqual({ supplier: { ...changed, ...EXTRAS, id, code: "SUP-002", country: "China", email: "", currency: "CNY", openOrders: 0, status: "Active" } });
     expect((await list()).body[1]).toEqual(res.body.supplier);
   });
 
@@ -193,6 +251,18 @@ describe("PATCH /suppliers/:id", () => {
     const res = await edit(before.id, { phone: "+86 137 0000 2222" });
     expect(res.status).toBe(200);
     expect(res.body.supplier).toEqual({ ...before, phone: "+86 137 0000 2222" });
+  });
+
+  it("edits the profile fields and the code; a code another supplier has is 409, a blank or malformed one 422", async () => {
+    const id = await idOf(ctx, suppliers, "Foshan Fabrics");
+    const profile = { country: "Vietnam", email: "sales@foshan.example", state: "Guangdong", postalCode: "528000", paymentTerms: "30% deposit, balance before shipment", taxNumber: "91440600MA" };
+    const res = await edit(id, { ...profile, code: "fsh-1" });
+    expect(res.status).toBe(200);
+    expect(res.body.supplier).toMatchObject({ ...profile, code: "FSH-1" });
+    expect((await edit(id, { code: "sup-001" })).body.error).toEqual({ code: "code_exists", message: CODE_TAKEN, fields: { code: CODE_TAKEN } });
+    for (const code of ["", "no spaces"]) expect((await edit(id, { code })).body.error.fields, code).toEqual({ code: CODE_SHAPE });
+    expect((await edit(id, { email: "bad" })).body.error.fields).toEqual({ email: EMAIL });
+    expect((await edit(id, { code: "SUP-003", country: "China", email: "", state: "", postalCode: "", paymentTerms: "", taxNumber: "" })).status).toBe(200);
   });
 
   it("deactivates and reactivates; an inactive supplier is listed under Inactive", async () => {
@@ -285,6 +355,8 @@ describe("open orders", () => {
       "Wenzhou Buttons": 0,
     });
     expect((await list("?search=yiwu")).body[0].openOrders).toBe(3);
+    // Active POs on the Suppliers page: not closed (phase 2 §1), so the two stage-6 orders without stocked goods count too.
+    expect((await list("?search=yiwu")).body[0].openPos).toBe(5);
     expect((await edit(await idOf(ctx, suppliers, "Yiwu Trims Ltd."), { notes: "Trims" })).body.supplier.openOrders).toBe(3);
   });
 });

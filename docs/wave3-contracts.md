@@ -84,7 +84,7 @@ Same rules for all seven tabs:
 
 | Tab | Path, key | Editable fields | Real counts |
 | --- | --- | --- | --- |
-| 1 Suppliers (A1) | `/suppliers`, `supplier` | name, city, contactPerson, phone, address, notes, currency (CNY, USD or INR; 0006) | `openOrders`: this supplier's orders with `stage < 6` |
+| 1 Suppliers (A1) | `/suppliers`, `supplier` | name, code, country, city, state, postalCode, contactPerson, email, phone, address, paymentTerms, taxNumber, notes, currency (CNY, USD or INR; 0006); the profile fields since 0011 (backend docs/suppliers.md) | `openOrders`: this supplier's orders with `stage < 6`; `ytdValue`, `balance`: money per currency (docs/suppliers.md) |
 | 2 Shipping agents (A1) | `/shipping-agents`, `shippingAgent` | name, contactPerson, phone, officeCity | `activeContainers`: this agent's containers with status `loading` or `sea` |
 | 3 Clearing agents (A2) | `/clearing-agents`, `clearingAgent` | name, contactPerson, phone, port | `containersCleared`: this agent's clearings with status `cleared` |
 | 4 Transport companies (A2) | `/transport-companies`, `transportCompany` | name, contactPerson, phone | `tripsSoFar`: this company's trips (any status) |

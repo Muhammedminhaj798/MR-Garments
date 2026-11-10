@@ -91,10 +91,21 @@ export const suppliers = pgTable(
   {
     id: uuid("id").primaryKey().defaultRandom(),
     name: text("name").notNull(),
+    /**
+     * The supplier's code (0011): SUP-001 style when the API assigns it, else what was typed (upper-case letters,
+     * digits and dashes). Unique in any letter case; "" only for rows written outside the API (docs/suppliers.md).
+     */
+    code: text("code").notNull().default(""),
     contactPerson: text("contact_person").notNull().default(""),
     phone: text("phone").notNull().default(""),
+    email: text("email").notNull().default(""),
+    country: text("country").notNull().default(""),
     city: text("city").notNull().default(""),
+    state: text("state").notNull().default(""),
+    postalCode: text("postal_code").notNull().default(""),
     address: text("address").notNull().default(""),
+    paymentTerms: text("payment_terms").notNull().default(""),
+    taxNumber: text("tax_number").notNull().default(""),
     notes: text("notes").notNull().default(""),
     currency: text("currency").$type<Currency>().notNull().default("CNY"),
     status,
@@ -103,6 +114,9 @@ export const suppliers = pgTable(
   },
   (t) => [
     uniqueIndex("suppliers_name_unique").on(sql`lower(${t.name})`),
+    uniqueIndex("suppliers_code_unique")
+      .on(sql`upper(${t.code})`)
+      .where(sql`code <> ''`),
     check("suppliers_currency_check", inList("currency", CURRENCIES)),
     check("suppliers_status_check", inList("status", STATUSES)),
   ],

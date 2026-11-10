@@ -40,11 +40,19 @@ export async function supplierPaymentDetail(db: Database, supplierId: string, q:
   const [supplier] = await db
     .select({
       id: suppliers.id,
+      code: suppliers.code,
       name: suppliers.name,
       contactPerson: suppliers.contactPerson,
       phone: suppliers.phone,
+      email: suppliers.email,
+      country: suppliers.country,
       city: suppliers.city,
+      state: suppliers.state,
+      postalCode: suppliers.postalCode,
       address: suppliers.address,
+      paymentTerms: suppliers.paymentTerms,
+      taxNumber: suppliers.taxNumber,
+      notes: suppliers.notes,
       currency: suppliers.currency,
       status: suppliers.status,
     })

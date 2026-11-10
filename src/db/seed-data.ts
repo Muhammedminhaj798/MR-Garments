@@ -10,11 +10,11 @@ export const SEED_LOCATIONS: { name: string; type: LocationType; country: "China
 ];
 
 export const SEED_SUPPLIERS = [
-  { name: "Guangzhou Textile Co.", contactPerson: "Mr. Zhao Lin", phone: "+86 138 0013 2244", city: "Guangzhou" },
-  { name: "Shenzhen Apparel", contactPerson: "Ms. Liu Yan", phone: "+86 139 2266 8810", city: "Shenzhen" },
-  { name: "Foshan Fabrics", contactPerson: "Mr. Chen Hao", phone: "+86 137 2288 5501", city: "Foshan" },
-  { name: "Yiwu Trims Ltd.", contactPerson: "Ms. Wu Mei", phone: "+86 135 5799 3120", city: "Yiwu" },
-  { name: "Hangzhou Knits", contactPerson: "Mr. Sun Jie", phone: "+86 136 5711 4092", city: "Hangzhou" },
+  { code: "SUP-001", name: "Guangzhou Textile Co.", contactPerson: "Mr. Zhao Lin", phone: "+86 138 0013 2244", city: "Guangzhou", country: "China" },
+  { code: "SUP-002", name: "Shenzhen Apparel", contactPerson: "Ms. Liu Yan", phone: "+86 139 2266 8810", city: "Shenzhen", country: "China" },
+  { code: "SUP-003", name: "Foshan Fabrics", contactPerson: "Mr. Chen Hao", phone: "+86 137 2288 5501", city: "Foshan", country: "China" },
+  { code: "SUP-004", name: "Yiwu Trims Ltd.", contactPerson: "Ms. Wu Mei", phone: "+86 135 5799 3120", city: "Yiwu", country: "China" },
+  { code: "SUP-005", name: "Hangzhou Knits", contactPerson: "Mr. Sun Jie", phone: "+86 136 5711 4092", city: "Hangzhou", country: "China" },
 ];
 
 export const SEED_SHIPPING_AGENTS = [

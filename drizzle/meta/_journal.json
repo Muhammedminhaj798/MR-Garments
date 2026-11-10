@@ -78,6 +78,13 @@
       "when": 1794235772778,
       "tag": "0010_item_price",
       "breakpoints": true
+    },
+    {
+      "idx": 11,
+      "version": "7",
+      "when": 1794294751588,
+      "tag": "0011_suppliers_profile",
+      "breakpoints": true
     }
   ]
 }
