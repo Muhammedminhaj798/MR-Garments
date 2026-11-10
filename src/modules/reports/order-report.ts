@@ -1,4 +1,5 @@
 import { asc, eq, inArray, sql } from "drizzle-orm";
+import { alias } from "drizzle-orm/pg-core";
 
 import type { CurrentUser } from "../../auth/current-user";
 import type { Database } from "../../db/client";
@@ -15,26 +16,35 @@ import {
   receiptLines,
   receipts,
   shippingAgents,
+  supplierDeposits,
+  supplierDepositTransactions,
   suppliers,
   teams,
   transportCompanies,
   transports,
+  users,
   warehouseReceiptLines,
   warehouseReceipts,
 } from "../../db/schema";
 import { notFound } from "../../http/errors";
 import { atLeast, type Capability, effectiveAccess } from "../../permissions/matrix";
 import { loadLandedCosts } from "../costs/landed-cost";
+import { depositRows, summarise, toRow } from "../deposits/deposits.routes";
+import { byCurrency } from "../master-data/supplier-insights";
+import { orderClosed } from "../orders/closure";
 import { depositState } from "../orders/money";
 import { byPo, orderRows, round2, unitSymbol } from "../orders/orders.routes";
 import { supplierMoney, toSupplier } from "./reports";
 
-// Owner: Agent R. RPT-O1 GET /orders/:po/report (docs/phase2-contracts.md section 4.1; shape in 8.R): everything the
-// per-order report page and its Excel/PDF show. A section the user can't view (effective access below View, as
-// ORD-4 nulls its sections) is null and its queries never run. Money rules are the existing ones: paid and balance
-// count supplier payments only (13.5 `supplierMoney`); the allocated cost share is `loadLandedCosts`, unchanged;
-// clearing and trip costs on a container are that container's totals. Nothing here is stored or invented: the
-// timeline has only dates the records hold.
+// Owner: Agent R. RPT-O1 GET /orders/:po/report (docs/phase2-contracts.md section 4.1; shape in 8.R; the
+// comprehensive report's additions in docs/order-report.md): everything the per-order report page and its Excel, PDF
+// and CSV show. A section the user can't view (effective access below View, as ORD-4 nulls its sections) is null and
+// its queries never run. Money rules are the existing ones: paid and balance count supplier payments only (13.5
+// `supplierMoney`); agent payments are sea freight, listed apart; the allocated cost share is `loadLandedCosts`,
+// unchanged; clearing and trip costs on a container are that container's totals. Supplier deposits (migration 0008)
+// are account-level money with no link to any order, so they are reported beside the order, never as its payments.
+// Nothing here is stored or invented: the timeline has only dates the records hold, with the moment each record was
+// written and the user who wrote it where the record keeps them.
 
 // Per order line, correlated on `orderLines.id` (inside a select with a join, so the columns keep their table).
 const received = sql<number>`(select coalesce(sum(${receiptLines.quantity}), 0) from ${receiptLines} where ${receiptLines.orderLineId} = ${orderLines.id})`.mapWith(Number);
@@ -47,11 +57,17 @@ export type TimelineStep = {
   step: "created" | "deposit" | "payment" | "received" | "loaded" | "sailed" | "arrived" | "cleared" | "dispatched" | "unloaded" | "stocked" | "closed";
   on: string;
   detail: string;
+  /** When the record behind the step was written (ISO timestamp): its creation, or its last change for a status step; null when derived (closed). */
+  at: string | null;
+  /** The user who wrote it, or null when the record keeps no author. */
+  by: string | null;
 };
 
 /** "2,000.00 CNY": files and the timeline use the code, never a symbol. */
 const money = (amount: number, currency: string) => `${amount.toLocaleString("en-IN", { minimumFractionDigits: 2, maximumFractionDigits: 2 })} ${currency}`;
 const sum = <T>(rows: T[], pick: (row: T) => number) => rows.reduce((total, row) => total + pick(row), 0);
+const iso = (value: Date | string | null | undefined) => (value == null ? null : value instanceof Date ? value.toISOString() : new Date(value).toISOString());
+const orNull = (name: string | null | undefined) => (name?.trim() ? name : null);
 /** Rows grouped by `key`, with the key left out of each row. */
 function groupBy<K extends string, T extends Record<K, string>>(rows: T[], key: K) {
   const groups = new Map<string, Omit<T, K>[]>();
@@ -59,7 +75,13 @@ function groupBy<K extends string, T extends Record<K, string>>(rows: T[], key: 
   return groups;
 }
 
-/** One order's report, or 404. About fifteen queries whatever the order's size, none per row. */
+const author = alias(users, "author");
+const editor = alias(users, "editor");
+const authorName = sql<string>`coalesce(${author.name}, '')`;
+const editorName = sql<string>`coalesce(${editor.name}, '')`;
+const paidToAgent = sql`${payments.orderId} = ${orders.id} and ${payments.payeeRole} = 'agent' and ${payments.status} = 'paid'`;
+
+/** One order's report, or 404. About twenty queries whatever the order's size, none per row. */
 export async function orderReport(db: Database, po: string, user: CurrentUser) {
   const row = (await orderRows(db, [], byPo(po)))[0];
   if (!row) throw notFound("Order");
@@ -76,26 +98,45 @@ export async function orderReport(db: Database, po: string, user: CurrentUser) {
     .where(eq(orderLines.orderId, orderId));
   const logistics = can("containers");
 
-  const [[header], lineRows, paymentList, receiptRows, containerList, containerLineRows, clearingRows, tripRows, receiptList, receiptLineRows, costs] =
+  const [[header], lineRows, paymentList, receiptRows, containerList, containerLineRows, clearingRows, tripRows, receiptList, receiptLineRows, costs, account] =
     await Promise.all([
       db
         .select({
+          code: suppliers.code,
           contactPerson: suppliers.contactPerson,
           phone: suppliers.phone,
+          email: suppliers.email,
+          country: suppliers.country,
           city: suppliers.city,
+          state: suppliers.state,
+          postalCode: suppliers.postalCode,
+          address: suppliers.address,
+          paymentTerms: suppliers.paymentTerms,
+          taxNumber: suppliers.taxNumber,
+          supplierNotes: suppliers.notes,
+          supplierCurrency: suppliers.currency,
+          supplierStatus: suppliers.status,
+          createdAt: orders.createdAt,
+          updatedAt: orders.updatedAt,
+          createdBy: authorName,
           paidCny: supplierMoney.paidCny,
           paidInr: supplierMoney.paidInr,
           depositsPaidCny: sql<number>`(select coalesce(sum(${payments.amountCny}), 0) from ${payments}
             where ${toSupplier} and ${payments.status} = 'paid' and ${payments.kind} = 'Deposit')`.mapWith(Number),
           dueCny: sql<number>`(select coalesce(sum(${payments.amountCny}), 0) from ${payments} where ${toSupplier} and ${payments.status} = 'due')`.mapWith(Number),
+          /** Paid to shipping agents: sea freight (landed cost), never part of the supplier's paid or balance. */
+          agentPaidCny: sql<number>`(select coalesce(sum(${payments.amountCny}), 0) from ${payments} where ${paidToAgent})`.mapWith(Number),
+          agentPaidInr: sql<number>`(select coalesce(sum(round(${payments.amountCny} * ${payments.rateInr}, 2)), 0) from ${payments} where ${paidToAgent})`.mapWith(Number),
         })
         .from(orders)
         .innerJoin(suppliers, eq(suppliers.id, orders.supplierId))
+        .leftJoin(author, eq(author.id, orders.createdBy))
         .where(eq(orders.id, orderId)),
       db
         .select({
           id: orderLines.id,
           position: orderLines.position,
+          itemId: items.id,
           item: items.name,
           unit: unitSymbol,
           ordered: orderLines.quantity,
@@ -125,23 +166,33 @@ export async function orderReport(db: Database, po: string, user: CurrentUser) {
             mode: payments.mode,
             reference: payments.reference,
             notes: payments.notes,
+            recordedAt: payments.createdAt,
+            recordedBy: authorName,
           })
           .from(payments)
+          .leftJoin(author, eq(author.id, payments.createdBy))
           .where(eq(payments.orderId, orderId))
           .orderBy(asc(sql`coalesce(${payments.paidOn}, ${payments.dueDate})`), asc(payments.createdAt)),
       ),
-      // China receipts feed the timeline only (the Items section carries the received figures).
+      // China receipts: the China processing section and the timeline (the Items section carries the received figures).
       when(can("receiving"), () =>
         db
           .select({
             id: receipts.id,
             receivedOn: receipts.receivedOn,
             office: locations.name,
+            receivedBy: authorName,
+            bundles: receipts.bundles,
+            deliveryNote: receipts.deliveryNote,
+            shortRemark: receipts.shortRemark,
+            recordedAt: receipts.createdAt,
+            item: items.name,
             unit: unitSymbol,
             quantity: receiptLines.quantity,
           })
           .from(receipts)
           .innerJoin(locations, eq(locations.id, receipts.locationId))
+          .leftJoin(author, eq(author.id, receipts.receivedBy))
           .leftJoin(receiptLines, eq(receiptLines.receiptId, receipts.id))
           .leftJoin(orderLines, eq(orderLines.id, receiptLines.orderLineId))
           .leftJoin(items, eq(items.id, orderLines.itemId))
@@ -161,9 +212,13 @@ export async function orderReport(db: Database, po: string, user: CurrentUser) {
             loadedOn: containers.loadedOn,
             sailedOn: containers.sailedOn,
             eta: containers.eta,
+            etaEstimated: containers.etaEstimated,
+            recordedAt: containers.createdAt,
+            recordedBy: authorName,
           })
           .from(containers)
           .innerJoin(shippingAgents, eq(shippingAgents.id, containers.shippingAgentId))
+          .leftJoin(author, eq(author.id, containers.createdBy))
           .where(inArray(containers.id, carriers))
           .orderBy(asc(containers.loadedOn), asc(containers.createdAt)),
       ),
@@ -189,13 +244,21 @@ export async function orderReport(db: Database, po: string, user: CurrentUser) {
             dutyPaidOn: clearings.dutyPaidOn,
             clearedOn: clearings.clearedOn,
             status: clearings.status,
+            /** Information only: not part of the clearing cost. */
+            goodsValueInr: clearings.goodsValueInr,
             customsDutyInr: clearings.customsDutyInr,
             otherDutiesInr: clearings.otherDutiesInr,
             agentChargesInr: clearings.agentChargesInr,
             portChargesInr: clearings.portChargesInr,
+            recordedAt: clearings.createdAt,
+            recordedBy: authorName,
+            updatedAt: clearings.updatedAt,
+            updatedBy: editorName,
           })
           .from(clearings)
           .innerJoin(clearingAgents, eq(clearingAgents.id, clearings.clearingAgentId))
+          .leftJoin(author, eq(author.id, clearings.createdBy))
+          .leftJoin(editor, eq(editor.id, clearings.updatedBy))
           .where(inArray(clearings.containerId, carriers)),
       ),
       when(logistics && can("transport"), () =>
@@ -207,18 +270,29 @@ export async function orderReport(db: Database, po: string, user: CurrentUser) {
             lrNumber: transports.lrNumber,
             vehicleNumber: transports.vehicleNumber,
             driverName: transports.driverName,
+            driverPhone: transports.driverPhone,
             destination: locations.name,
             loadedOn: transports.loadedOn,
+            loadedFrom: transports.loadedFrom,
+            loadedBy: transports.loadedBy,
             unloadedOn: transports.unloadedOn,
             bundlesLoaded: transports.bundlesLoaded,
             bundlesReceived: transports.bundlesReceived,
+            receivedBy: transports.receivedBy,
+            shortRemark: transports.shortRemark,
             status: transports.status,
             freightInr: transports.freightInr,
             handlingInr: transports.handlingInr,
+            recordedAt: transports.createdAt,
+            recordedBy: authorName,
+            updatedAt: transports.updatedAt,
+            updatedBy: editorName,
           })
           .from(transports)
           .innerJoin(transportCompanies, eq(transportCompanies.id, transports.transportCompanyId))
           .innerJoin(locations, eq(locations.id, transports.destinationId))
+          .leftJoin(author, eq(author.id, transports.createdBy))
+          .leftJoin(editor, eq(editor.id, transports.updatedBy))
           .where(inArray(transports.containerId, carriers)),
       ),
       // Every receipt (draft or stocked) of a trip carrying the order's goods: a draft may hold none of its lines yet.
@@ -233,11 +307,17 @@ export async function orderReport(db: Database, po: string, user: CurrentUser) {
             receivedBy: warehouseReceipts.receivedBy,
             status: warehouseReceipts.status,
             bundlesReceived: warehouseReceipts.bundlesReceived,
+            recordedAt: warehouseReceipts.createdAt,
+            recordedBy: authorName,
+            updatedAt: warehouseReceipts.updatedAt,
+            updatedBy: editorName,
           })
           .from(warehouseReceipts)
           .innerJoin(transports, eq(transports.id, warehouseReceipts.transportId))
           .innerJoin(containers, eq(containers.id, transports.containerId))
           .innerJoin(locations, eq(locations.id, warehouseReceipts.locationId))
+          .leftJoin(author, eq(author.id, warehouseReceipts.createdBy))
+          .leftJoin(editor, eq(editor.id, warehouseReceipts.updatedBy))
           .where(inArray(transports.containerId, carriers))
           .orderBy(asc(warehouseReceipts.receivedOn), asc(warehouseReceipts.createdAt)),
       ),
@@ -252,93 +332,186 @@ export async function orderReport(db: Database, po: string, user: CurrentUser) {
           .orderBy(asc(orderLines.position), asc(teams.createdAt), asc(teams.name)),
       ),
       section("landedCost", () => loadLandedCosts(db, [orderId])),
+      // The supplier's account beside this order (payments View, as the money is): every order's value, paid and
+      // balance per currency, and the supplier-level deposits with their transactions, which no order payment counts.
+      section("payments", async () => {
+        const [perOrder, deposits] = await Promise.all([
+          db
+            .select({ id: orders.id, currency: orders.currency, closed: orderClosed, orderValueCny: supplierMoney.orderValueCny, paidCny: supplierMoney.paidCny })
+            .from(orders)
+            .innerJoin(suppliers, eq(suppliers.id, orders.supplierId))
+            .where(eq(orders.supplierId, row.supplierId)),
+          depositRows(db, eq(supplierDeposits.supplierId, row.supplierId)).then((rows) => rows.map(toRow)),
+        ]);
+        const t = supplierDepositTransactions;
+        const transactions = deposits.length
+          ? await db
+              .select({ depositId: t.depositId, id: t.id, paidOn: t.paidOn, amount: t.amount, mode: t.mode, reference: t.reference, notes: t.notes })
+              .from(t)
+              .where(
+                inArray(
+                  t.depositId,
+                  deposits.map((deposit) => deposit.id),
+                ),
+              )
+              .orderBy(asc(t.paidOn), asc(t.createdAt))
+          : [];
+        const byDeposit = groupBy(transactions, "depositId");
+        return {
+          orders: perOrder.length,
+          openOrders: perOrder.filter((order) => !order.closed).length,
+          purchaseValue: byCurrency(perOrder, (order) => order.orderValueCny),
+          paid: byCurrency(perOrder, (order) => order.paidCny),
+          balance: byCurrency(perOrder, (order) => order.orderValueCny - order.paidCny),
+          deposits: {
+            summary: summarise(deposits),
+            list: deposits.map(({ supplierId: _supplierId, supplier: _supplier, transactions: _count, ...deposit }) => ({ ...deposit, transactions: byDeposit.get(deposit.id) ?? [] })),
+          },
+        };
+      }),
     ]);
 
-  const lines = lineRows.map((line) => ({ ...line, excess: Math.max(0, line.received - line.ordered), short: Math.max(0, line.ordered - line.received) }));
+  const lines = lineRows.map((line) => ({ ...line, excess: Math.max(0, line.received - line.ordered), short: Math.max(0, line.ordered - line.received), pending: Math.max(0, line.ordered - line.received) }));
   // Units differ per line (pieces, metres): one total per unit, never added together.
   const totals = [...new Set(lines.map((line) => line.unit))].map((unit) => {
     const inUnit = lines.filter((line) => line.unit === unit);
-    return { unit, ordered: sum(inUnit, (line) => line.ordered), received: sum(inUnit, (line) => line.received), stocked: sum(inUnit, (line) => line.stocked) };
+    const ordered = sum(inUnit, (line) => line.ordered);
+    const receivedInUnit = sum(inUnit, (line) => line.received);
+    return { unit, ordered, received: receivedInUnit, pending: Math.max(0, ordered - receivedInUnit), stocked: sum(inUnit, (line) => line.stocked) };
   });
+  // One receipt per id, its lines in order-line order.
+  const receiptsList = can("receiving")
+    ? [...new Set(receiptRows.map((line) => line.id))].map((id) => {
+        const inReceipt = receiptRows.filter((line) => line.id === id);
+        const first = inReceipt[0]!;
+        return {
+          id,
+          receivedOn: first.receivedOn,
+          office: first.office,
+          receivedBy: first.receivedBy,
+          bundles: first.bundles,
+          deliveryNote: first.deliveryNote,
+          shortRemark: first.shortRemark,
+          recordedAt: iso(first.recordedAt),
+          lines: inReceipt.flatMap((line) => (line.item && line.unit ? [{ item: line.item, unit: line.unit, quantity: line.quantity ?? 0 }] : [])),
+        };
+      })
+    : null;
   const linesIn = groupBy(containerLineRows, "containerId");
+  // The record's author and last editor as names, null when the row keeps none (older rows, direct inserts).
+  const authored = <T extends { recordedAt: Date; recordedBy: string; updatedAt: Date; updatedBy: string }>({ recordedAt, recordedBy, updatedAt, updatedBy, ...rest }: T) => ({
+    ...rest,
+    recordedAt: iso(recordedAt),
+    recordedBy: orNull(recordedBy),
+    updatedAt: iso(updatedAt),
+    updatedBy: orNull(updatedBy),
+  });
   const clearingOf = new Map(
     clearingRows.map(({ containerId, ...clearing }) => [
       containerId,
-      { ...clearing, totalInr: round2(clearing.customsDutyInr + clearing.otherDutiesInr + clearing.agentChargesInr + clearing.portChargesInr) },
+      { ...authored(clearing), totalInr: round2(clearing.customsDutyInr + clearing.otherDutiesInr + clearing.agentChargesInr + clearing.portChargesInr) },
     ]),
   );
-  const tripOf = new Map(tripRows.map(({ containerId, ...trip }) => [containerId, { ...trip, totalInr: round2(trip.freightInr + trip.handlingInr) }]));
+  const tripOf = new Map(tripRows.map(({ containerId, ...trip }) => [containerId, { ...authored(trip), totalInr: round2(trip.freightInr + trip.handlingInr) }]));
   const logisticsList = !logistics
     ? null
-    : containerList.map((container) => ({
-      ...container,
-      lines: linesIn.get(container.id) ?? [],
-      clearing: clearingOf.get(container.id) ?? null,
-      transport: tripOf.get(container.id) ?? null,
-    }));
+    : containerList.map(({ recordedAt, recordedBy, ...container }) => ({
+        ...container,
+        recordedAt: iso(recordedAt),
+        recordedBy: orNull(recordedBy),
+        lines: linesIn.get(container.id) ?? [],
+        clearing: clearingOf.get(container.id) ?? null,
+        transport: tripOf.get(container.id) ?? null,
+      }));
   const stockedLines = groupBy(receiptLineRows, "receiptId");
-  const warehouse = receiptList && receiptList.map((receipt) => ({ ...receipt, lines: stockedLines.get(receipt.receiptId) ?? [] }));
+  const warehouse = receiptList && receiptList.map((receipt) => ({ ...authored(receipt), lines: stockedLines.get(receipt.receiptId) ?? [] }));
 
   // Dated steps only, in date order (a tie keeps the workflow order below); each from a section the user may see.
-  const steps: TimelineStep[] = [{ step: "created", on: row.orderDate, detail: `Ordered from ${row.supplierName}` }];
+  const steps: TimelineStep[] = [{ step: "created", on: row.orderDate, detail: `Ordered from ${row.supplierName}`, at: iso(header!.createdAt), by: orNull(header!.createdBy) }];
   for (const payment of paymentList ?? []) {
-    if (payment.paidOn) steps.push({ step: payment.kind === "Deposit" ? "deposit" : "payment", on: payment.paidOn, detail: `${money(payment.amountCny, row.currency)} to ${payment.payee}` });
+    if (payment.paidOn) {
+      steps.push({ step: payment.kind === "Deposit" ? "deposit" : "payment", on: payment.paidOn, detail: `${money(payment.amountCny, row.currency)} to ${payment.payee}`, at: iso(payment.recordedAt), by: orNull(payment.recordedBy) });
+    }
   }
-  for (const id of new Set(receiptRows.map((line) => line.id))) {
-    const inReceipt = receiptRows.filter((line) => line.id === id);
-    const quantities = [...new Set(inReceipt.flatMap((line) => (line.unit ? [line.unit] : [])))].map(
-      (unit) => `${sum(inReceipt, (line) => (line.unit === unit ? (line.quantity ?? 0) : 0))} ${unit}`,
-    );
-    steps.push({ step: "received", on: inReceipt[0]!.receivedOn, detail: [inReceipt[0]!.office, ...quantities].join(" · ") });
+  for (const receipt of receiptsList ?? []) {
+    const quantities = [...new Set(receipt.lines.map((line) => line.unit))].map((unit) => `${sum(receipt.lines, (line) => (line.unit === unit ? line.quantity : 0))} ${unit}`);
+    steps.push({ step: "received", on: receipt.receivedOn, detail: [receipt.office, ...quantities].join(" · "), at: receipt.recordedAt, by: orNull(receipt.receivedBy) });
   }
   for (const container of logisticsList ?? []) {
-    if (container.loadedOn) steps.push({ step: "loaded", on: container.loadedOn, detail: `${container.number} · ${container.agent}` });
-    if (container.sailedOn) steps.push({ step: "sailed", on: container.sailedOn, detail: container.number });
+    if (container.loadedOn) steps.push({ step: "loaded", on: container.loadedOn, detail: `${container.number} · ${container.agent}`, at: container.recordedAt, by: orNull(container.recordedBy) });
+    if (container.sailedOn) steps.push({ step: "sailed", on: container.sailedOn, detail: container.number, at: null, by: null });
     if (container.clearing) {
-      steps.push({ step: "arrived", on: container.clearing.arrivedOn, detail: `${container.number} · ${container.clearing.agent}` });
-      if (container.clearing.clearedOn) steps.push({ step: "cleared", on: container.clearing.clearedOn, detail: container.number });
+      const { clearing } = container;
+      steps.push({ step: "arrived", on: clearing.arrivedOn, detail: `${container.number} · ${clearing.agent}`, at: clearing.recordedAt, by: orNull(clearing.recordedBy) });
+      if (clearing.clearedOn) steps.push({ step: "cleared", on: clearing.clearedOn, detail: container.number, at: clearing.updatedAt, by: orNull(clearing.updatedBy) });
     }
     if (container.transport) {
       const trip = container.transport;
-      steps.push({ step: "dispatched", on: trip.loadedOn, detail: `${container.number} · ${trip.vehicleNumber} · LR ${trip.lrNumber}` });
-      if (trip.unloadedOn) steps.push({ step: "unloaded", on: trip.unloadedOn, detail: `${container.number} · ${trip.destination}` });
+      steps.push({ step: "dispatched", on: trip.loadedOn, detail: `${container.number} · ${trip.vehicleNumber} · LR ${trip.lrNumber}`, at: trip.recordedAt, by: orNull(trip.recordedBy) });
+      if (trip.unloadedOn) steps.push({ step: "unloaded", on: trip.unloadedOn, detail: `${container.number} · ${trip.destination}`, at: trip.updatedAt, by: orNull(trip.updatedBy) });
     }
   }
   for (const receipt of warehouse ?? []) {
-    if (receipt.status === "stocked") steps.push({ step: "stocked", on: receipt.receivedOn, detail: `${receipt.container} · ${receipt.warehouse}` });
+    if (receipt.status === "stocked") steps.push({ step: "stocked", on: receipt.receivedOn, detail: `${receipt.container} · ${receipt.warehouse}`, at: receipt.updatedAt, by: orNull(receipt.updatedBy) });
   }
-  if (row.closedOn) steps.push({ step: "closed", on: row.closedOn, detail: "Every container stocked" });
+  if (row.closedOn) steps.push({ step: "closed", on: row.closedOn, detail: "Every container stocked", at: null, by: null });
   steps.sort((a, b) => a.on.localeCompare(b.on));
 
+  const paymentRows = paymentList?.map(({ recordedAt, recordedBy, ...payment }) => ({ ...payment, recordedAt: iso(recordedAt), recordedBy: orNull(recordedBy) }));
   return {
     order: {
       id: row.id,
       po: row.po,
-      supplier: { id: row.supplierId, name: row.supplierName, contactPerson: header!.contactPerson, phone: header!.phone, city: header!.city },
+      supplier: {
+        id: row.supplierId,
+        name: row.supplierName,
+        code: header!.code,
+        contactPerson: header!.contactPerson,
+        phone: header!.phone,
+        email: header!.email,
+        country: header!.country,
+        city: header!.city,
+        state: header!.state,
+        postalCode: header!.postalCode,
+        address: header!.address,
+        paymentTerms: header!.paymentTerms,
+        taxNumber: header!.taxNumber,
+        notes: header!.supplierNotes,
+        currency: header!.supplierCurrency,
+        status: header!.supplierStatus,
+      },
       orderDate: row.orderDate,
       deliveryDate: row.deliveryDate,
+      createdAt: iso(header!.createdAt),
+      updatedAt: iso(header!.updatedAt),
+      createdBy: orNull(header!.createdBy),
       stage: row.stage,
       closed: row.closed,
       closedOn: row.closedOn,
       currency: row.currency,
       orderValueCny: row.orderValueCny,
+      products: lines.length,
       totals,
     },
     lines,
-    payments: paymentList
+    payments: paymentRows
       ? {
           paidCny: header!.paidCny,
           paidInr: header!.paidInr,
           balanceCny: round2(row.orderValueCny - header!.paidCny),
           depositsPaidCny: header!.depositsPaidCny,
           dueCny: header!.dueCny,
+          agentPaidCny: header!.agentPaidCny,
+          agentPaidInr: header!.agentPaidInr,
           // The deposit the supplier asked for and what is still pending against it (0009).
           depositRequiredCny: row.depositRequiredCny,
           depositPendingCny: depositState(row.depositRequiredCny, row.depositPaidCny).depositPendingCny,
           depositStatus: depositState(row.depositRequiredCny, row.depositPaidCny).depositStatus,
-          list: paymentList,
+          list: paymentRows,
         }
       : null,
+    supplierAccount: account,
+    receipts: receiptsList,
     logistics: logisticsList,
     warehouse,
     landedCost: costs ? costs.get(orderId)! : null,

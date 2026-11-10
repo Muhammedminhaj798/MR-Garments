@@ -72,8 +72,8 @@ const countOf = sql`select count(*) from ${t} where ${t.depositId} = ${supplierD
 const settled = sql<number>`(${settledOf})`.mapWith(Number);
 const transactionCount = sql<number>`(${countOf})`.mapWith(Number);
 
-/** The SupplierDepositRow figures before `settled` and `pending` are derived, newest first. */
-function depositRows(db: Pick<Database, "select">, where: SQL) {
+/** The SupplierDepositRow figures before `settled` and `pending` are derived, newest first (the order report reads it too). */
+export function depositRows(db: Pick<Database, "select">, where: SQL) {
   return db
     .select({
       id: supplierDeposits.id,

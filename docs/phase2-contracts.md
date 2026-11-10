@@ -261,6 +261,14 @@ container's `loaded` step; the `received` steps need `receiving` >= View (as ORD
 `detail` is plain text: "Ordered from <supplier>", "2,000.00 CNY to <payee>", "<office> · 120 pcs · 30 m",
 "<container> · <agent>", "<container> · <vehicle> · LR <number>", "<container> · <warehouse>", "Every container stocked".
 
+**2026-11-10, the comprehensive report (docs/order-report.md), additive:** `order.supplier` is the whole profile,
+`order` gains `createdAt`, `updatedAt`, `createdBy`, `products` and `totals[].pending`; `lines[]` gain `itemId` and
+`pending`; `payments` gains `agentPaidCny`, `agentPaidInr` and per payment `recordedAt`, `recordedBy`; new sections
+`supplierAccount` (`payments` View: the supplier's every-order money per currency and account-level deposits with
+transactions) and `receipts` (`receiving` View: each China receipt with its lines); `logistics[]`, `clearing`,
+`transport` and `warehouse[]` carry `recordedAt/By` (and `updatedAt/By`) and the remaining record fields; `timeline[]`
+steps carry `at` and `by`.
+
 **RPT-O2** `GET /reports/orders?po&supplierId&from&to&status&warehouseId&paymentStatus` (`reports` >= View). `po`: a
 case-insensitive part of the PO number (`%`, `_` match themselves; empty = no filter); `from`/`to`: order date;
 `status`: `pending` (stage 1) | `closed` (section 1) | `active` (the rest); `warehouseId`: orders with some of their
@@ -280,6 +288,10 @@ follows the same figures.
   options: { suppliers: { id, name }[], warehouses: { id, name }[] };     // active ones, creation order
 }
 ```
+
+**2026-11-10 (docs/order-report.md), additive:** query `supplier` (a part of the name), `stage` (1-6) and `currency`;
+rows gain `supplier.code`, `lineCount` and `quantities: { unit, quantity }[]`; the filter echo gains `supplierName`,
+`stage` and `currency`.
 
 ### 8.D Deposits (Agent D, `src/modules/deposits/deposits.routes.ts`)
 
