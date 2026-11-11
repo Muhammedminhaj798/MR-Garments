@@ -7,6 +7,6 @@ ALTER TABLE "orders" ADD COLUMN "exchange_rate" numeric(12, 4);--> statement-bre
 ALTER TABLE "supplier_deposits" ADD COLUMN "exchange_rate" numeric(12, 4);--> statement-breakpoint
 UPDATE "suppliers" SET "exchange_rate" = 1 WHERE "currency" = 'INR' AND "exchange_rate" IS NULL;--> statement-breakpoint
 ALTER TABLE "suppliers" ADD CONSTRAINT "suppliers_exchange_rate_check" CHECK (exchange_rate is null or exchange_rate > 0);--> statement-breakpoint
-ALTER TABLE "suppliers" ADD CONSTRAINT "suppliers_inr_rate_check" CHECK (currency <> 'INR' or exchange_rate = 1);--> statement-breakpoint
+ALTER TABLE "suppliers" ADD CONSTRAINT "suppliers_inr_rate_check" CHECK (currency <> 'INR' or coalesce(exchange_rate, 0) = 1);--> statement-breakpoint
 ALTER TABLE "orders" ADD CONSTRAINT "orders_exchange_rate_check" CHECK (exchange_rate is null or exchange_rate > 0);--> statement-breakpoint
 ALTER TABLE "supplier_deposits" ADD CONSTRAINT "supplier_deposits_exchange_rate_check" CHECK (exchange_rate is null or exchange_rate > 0);

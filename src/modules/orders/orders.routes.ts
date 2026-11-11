@@ -156,8 +156,8 @@ async function checkRules(db: Database, input: NewOrder) {
   const rate = input.deposits.map((entry) => rateProblem(currency, entry.rateInr, M.rateInr)).find(Boolean);
   if (rate) problems.deposits = rate;
   if (Object.keys(problems).length > 0) throw validationFailed(problems);
-  /** The order's money: its currency and the supplier's rate now (1 for INR; null while the supplier has none), kept on the order for good. */
-  return { currency, exchangeRate: currency === "INR" ? 1 : (supplier!.exchangeRate ?? null) };
+  /** The order's currency (the deposits' rate rule was checked for it); the rate is read again, locked, when the order is written. */
+  return { currency };
 }
 
 // The main line (position 0) gives the item, quantity and received figures the lists show; the money comes from
@@ -171,6 +171,8 @@ export const orderColumns = {
   currency: orders.currency,
   /** INR per 1 of `currency` when the order was placed (0012); null for older orders or a supplier without a rate then. */
   exchangeRate: orders.exchangeRate,
+  /** orderValueCny at the order's own rate, rounded in SQL as the payments' INR is; null without a rate. */
+  orderValueInr: sql<number | null>`round(${orderMoney.orderValueCny} * ${orders.exchangeRate}, 2)`.mapWith((value) => (value === null ? null : Number(value))),
   /** The supplier's rate now (null while not set): a new payment's default rate, never the order's. */
   supplierRate: suppliers.exchangeRate,
   stage: orders.stage,
@@ -286,6 +288,10 @@ export function ordersRoutes({ db }: RouteContext) {
         const order = await db.transaction(async (tx) => {
           // One order at a time takes a PO number, so a burst of creates can't all pick the same one (audit M1).
           await tx.execute(sql`select pg_advisory_xact_lock(hashtext('orders.po_number'))`);
+          // The supplier's row share-locked (as SD-2 reads it): a rate or currency edit waits for this order, so the
+          // snapshot is the rate the supplier has when the order is written, never one already superseded.
+          const [supplier] = await tx.select({ currency: suppliers.currency, exchangeRate: suppliers.exchangeRate }).from(suppliers).where(eq(suppliers.id, input.supplierId)).for("share");
+          if (!supplier || supplier.currency !== money.currency) throw validationFailed({ currency: M.supplierCurrency(supplier?.currency ?? money.currency) });
           const created = await tx
             .insert(orders)
             .values({
@@ -293,8 +299,8 @@ export function ordersRoutes({ db }: RouteContext) {
               supplierId: input.supplierId,
               orderDate: input.orderDate,
               deliveryDate: input.deliveryDate,
-              currency: money.currency,
-              exchangeRate: money.exchangeRate,
+              currency: supplier.currency,
+              exchangeRate: supplier.currency === "INR" ? 1 : supplier.exchangeRate,
               depositRequiredCny: input.depositRequiredCny ?? null,
               createdBy: userId,
             })

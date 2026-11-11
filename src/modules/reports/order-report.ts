@@ -497,7 +497,7 @@ export async function orderReport(db: Database, po: string, user: CurrentUser) {
       orderValueCny: row.orderValueCny,
       /** The rate saved when the order was placed (null for older orders), and the PO value at that rate, never a later one. */
       exchangeRate: row.exchangeRate,
-      orderValueInr: row.exchangeRate === null ? null : round2(row.orderValueCny * row.exchangeRate),
+      orderValueInr: row.orderValueInr,
       products: lines.length,
       totals,
     },

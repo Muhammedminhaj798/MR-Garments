@@ -126,7 +126,7 @@ export const suppliers = pgTable(
       .where(sql`code <> ''`),
     check("suppliers_currency_check", inList("currency", CURRENCIES)),
     check("suppliers_exchange_rate_check", sql`exchange_rate is null or exchange_rate > 0`),
-    check("suppliers_inr_rate_check", sql`currency <> 'INR' or exchange_rate = 1`),
+    check("suppliers_inr_rate_check", sql`currency <> 'INR' or coalesce(exchange_rate, 0) = 1`),
     check("suppliers_status_check", inList("status", STATUSES)),
   ],
 );

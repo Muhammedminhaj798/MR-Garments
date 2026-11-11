@@ -427,7 +427,7 @@
         },
         "suppliers_inr_rate_check": {
           "name": "suppliers_inr_rate_check",
-          "value": "currency <> 'INR' or exchange_rate = 1"
+          "value": "currency <> 'INR' or coalesce(exchange_rate, 0) = 1"
         },
         "suppliers_status_check": {
           "name": "suppliers_status_check",

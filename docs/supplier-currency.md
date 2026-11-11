@@ -20,7 +20,7 @@ touched by the migration.
 | `GET /orders`, `GET /orders/:po`, reports | `exchangeRate`: the order's snapshot, never the supplier's current rate. `GET /orders/options` suppliers and `GET /payments` orders (`supplierRate`) carry the supplier's rate **now**, the default for a new payment. |
 | `POST /suppliers/:id/deposits` (SD-2) | The deposit is in the supplier's currency (another is 422 `currency`); `supplier_deposits.exchange_rate` snapshots the supplier's rate now. Rows give `exchangeRate`. |
 | `POST /payments` (PAY-2) | Unchanged: the amount is in the order's currency and `rateInr` is the rate of that payment (typed; the frontend offers the supplier's rate now as the default). INR orders take no rate. |
-| RPT-O1 `GET /orders/:po/report` | `order.exchangeRate` and `order.orderValueInr` = round2(orderValueCny × exchangeRate) at the **PO's** rate (null without one); `order.supplier.exchangeRate` / `rateUpdatedAt` are the supplier's now. `supplierAccount.deposits.list[].exchangeRate` is each deposit's snapshot. |
+| RPT-O1 `GET /orders/:po/report` | `order.exchangeRate` and `order.orderValueInr` = orderValueCny × exchangeRate rounded to 2 decimals in SQL (as every INR figure is) at the **PO's** rate (null without one); `order.supplier.exchangeRate` / `rateUpdatedAt` are the supplier's now. `supplierAccount.deposits.list[].exchangeRate` is each deposit's snapshot. |
 | RPT-O2 `GET /reports/orders` | Rows carry `exchangeRate` and `orderValueInr` the same way. `paidInr` stays the sum of each payment at its own rate. |
 | RPT-5D supplier detail | `supplier.exchangeRate`, `supplier.rateUpdatedAt`. |
 

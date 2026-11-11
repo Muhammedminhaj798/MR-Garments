@@ -71,7 +71,7 @@ const fields = {
   exchangeRate: z
     .number({ error: RATE_MESSAGES.rate })
     .min(0.0001, RATE_MESSAGES.rate)
-    .max(99_999_999, RATE_MESSAGES.rate)
+    .max(99_999_999.9999, RATE_MESSAGES.rate)
     .refine((value) => Number(value.toFixed(4)) === value, RATE_MESSAGES.rate),
 };
 const newSupplier = z.strictObject({ ...fields, code: fields.code.optional(), exchangeRate: fields.exchangeRate.optional() });
