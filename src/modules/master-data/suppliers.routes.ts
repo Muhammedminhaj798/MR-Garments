@@ -3,8 +3,8 @@ import { Router } from "express";
 import { z } from "zod";
 
 import { requirePermission } from "../../auth/current-user";
-import { CURRENCIES, orders, STATUSES, supplierDeposits, suppliers } from "../../db/schema";
-import { conflict, GENERIC_MESSAGE, HttpError, notFound } from "../../http/errors";
+import { CURRENCIES, type Currency, orders, STATUSES, supplierDeposits, suppliers } from "../../db/schema";
+import { conflict, GENERIC_MESSAGE, HttpError, notFound, validationFailed } from "../../http/errors";
 import { parse } from "../../http/validate";
 import type { RouteContext } from "../context";
 import { orderClosed } from "../orders/closure";
@@ -24,6 +24,11 @@ const CODE_TAKEN = "A supplier with this code already exists.";
 const EMAIL = "Enter a valid email address."; // M14
 const PHONE = "Enter a valid phone number.";
 const CURRENCY = "Choose CNY, USD or INR.";
+export const RATE_MESSAGES = {
+  rate: "Enter the exchange rate: INR per 1 unit, above 0, with at most 4 decimals.",
+  rateForInr: "An INR supplier's rate is always 1.",
+  rateForCurrency: (currency: Currency) => `Enter the exchange rate for ${currency} (1 ${currency} = ? INR).`,
+};
 const tooLong = (max: number) => `Use ${max} characters or fewer.`;
 
 const isUuid = (value: string) => z.uuid().safeParse(value).success;
@@ -59,11 +64,37 @@ const fields = {
   paymentTerms: text(),
   taxNumber: text(),
   notes: text(1000),
-  // The default for the supplier's new orders; changing it leaves existing orders in their own currency.
+  // The supplier's one currency (docs/supplier-currency.md): its new orders and deposits are in it; a change leaves
+  // existing ones in their own currency. Left out on create: CNY.
   currency: z.enum(CURRENCIES, { error: CURRENCY }).optional(),
+  /** INR per 1 unit of `currency`: above 0, at most 4 decimals; an INR supplier's is 1. Left out on create: not set. */
+  exchangeRate: z
+    .number({ error: RATE_MESSAGES.rate })
+    .min(0.0001, RATE_MESSAGES.rate)
+    .max(99_999_999, RATE_MESSAGES.rate)
+    .refine((value) => Number(value.toFixed(4)) === value, RATE_MESSAGES.rate),
 };
-const newSupplier = z.strictObject({ ...fields, code: fields.code.optional() });
+const newSupplier = z.strictObject({ ...fields, code: fields.code.optional(), exchangeRate: fields.exchangeRate.optional() });
 const changes = z.strictObject({ ...fields, status: z.enum(STATUSES) }).partial();
+
+type Money = { currency: Currency; exchangeRate: number | null };
+/**
+ * The currency and rate the row ends up with, or 422 (E1). An INR supplier's rate is 1: set when left out, refused when
+ * anything else. Another currency keeps the rate given; left out, a create stores null ("not set yet": the rate is
+ * typed later, never guessed) and an edit keeps the saved rate unless the currency changes, when a rate for the new
+ * currency is required (the old one means nothing for it). Saved orders and deposits keep their own snapshots.
+ */
+function moneyOf(input: { currency?: Currency; exchangeRate?: number }, current?: Money): Money {
+  const currency = input.currency ?? current?.currency ?? "CNY";
+  if (currency === "INR") {
+    if (input.exchangeRate !== undefined && input.exchangeRate !== 1) throw validationFailed({ exchangeRate: RATE_MESSAGES.rateForInr });
+    return { currency, exchangeRate: 1 };
+  }
+  if (input.exchangeRate !== undefined) return { currency, exchangeRate: input.exchangeRate };
+  if (!current) return { currency, exchangeRate: null };
+  if (current.currency !== currency) throw validationFailed({ exchangeRate: RATE_MESSAGES.rateForCurrency(currency) });
+  return { currency, exchangeRate: current.exchangeRate };
+}
 
 /** The unique indexes on lower(name) and upper(code) decide duplicates, so two simultaneous saves can't both succeed. */
 function takenAsConflict(error: unknown): never {
@@ -108,6 +139,10 @@ export function suppliersRoutes({ db }: RouteContext) {
           taxNumber: suppliers.taxNumber,
           notes: suppliers.notes,
           currency: suppliers.currency,
+          exchangeRate: suppliers.exchangeRate,
+          rateUpdatedAt: suppliers.rateUpdatedAt,
+          /** Any order or supplier deposit: a change of currency or rate then applies to new transactions only. */
+          hasTransactions: sql<boolean>`count(${orders.id}) > 0 or exists (select 1 from ${supplierDeposits} where ${supplierDeposits.supplierId} = ${suppliers.id})`,
           openOrders: sql<number>`count(${orders.id}) filter (where ${orders.stage} < 6)`.mapWith(Number),
           /** Orders not closed (phase 2 §1): the Suppliers page's "Active POs", the same rule as its Open POs card. */
           openPos: sql<number>`count(${orders.id}) filter (where not ${orderClosed})`.mapWith(Number),
@@ -135,10 +170,14 @@ export function suppliersRoutes({ db }: RouteContext) {
 
   router.post("/suppliers", admin, async (req, res) => {
     const input = parse(newSupplier, req.body);
+    const money = moneyOf(input);
     const created = await db
       .transaction(async (tx) => {
         const code = input.code ?? (await nextCode(tx));
-        return tx.insert(suppliers).values({ ...input, code, createdBy: req.user!.id }).returning({ id: suppliers.id });
+        return tx
+          .insert(suppliers)
+          .values({ ...input, ...money, rateUpdatedAt: money.exchangeRate === null ? null : new Date(), code, createdBy: req.user!.id })
+          .returning({ id: suppliers.id });
       })
       .catch(takenAsConflict);
     res.status(201).json({ supplier: (await load(created[0]!.id))[0] });
@@ -149,7 +188,21 @@ export function suppliersRoutes({ db }: RouteContext) {
     if (!isUuid(id)) throw notFound("Supplier");
     const input = parse(changes, req.body);
     if (Object.keys(input).length === 0) throw new HttpError(400, "bad_request", GENERIC_MESSAGE);
-    const updated = await db.update(suppliers).set(input).where(eq(suppliers.id, id)).returning({ id: suppliers.id }).catch(takenAsConflict);
+    const updated = await db
+      .transaction(async (tx) => {
+        // The row locked while its money is checked, so two edits can't leave a rate that belongs to neither currency.
+        const [current] = await tx.select({ currency: suppliers.currency, exchangeRate: suppliers.exchangeRate }).from(suppliers).where(eq(suppliers.id, id)).for("update");
+        if (!current) return [];
+        const moneyGiven = input.currency !== undefined || input.exchangeRate !== undefined;
+        const money = moneyGiven ? moneyOf(input, current) : null;
+        const changed = money !== null && (money.currency !== current.currency || money.exchangeRate !== current.exchangeRate);
+        return tx
+          .update(suppliers)
+          .set({ ...input, ...money, ...(changed ? { rateUpdatedAt: new Date() } : {}) })
+          .where(eq(suppliers.id, id))
+          .returning({ id: suppliers.id });
+      })
+      .catch(takenAsConflict);
     if (!updated[0]) throw notFound("Supplier");
     res.json({ supplier: (await load(id))[0] });
   });

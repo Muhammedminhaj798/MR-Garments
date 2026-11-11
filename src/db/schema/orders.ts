@@ -30,6 +30,11 @@ export const orders = pgTable(
     orderDate: date("order_date").notNull(),
     deliveryDate: date("delivery_date").notNull(),
     currency: text("currency").$type<Currency>().notNull().default("CNY"),
+    /**
+     * INR per 1 of `currency` when the order was placed (0012): the supplier's rate then, 1 for INR; null for orders
+     * from before 0012 or placed while the supplier had no rate. Never updated: the supplier's later rates don't apply.
+     */
+    exchangeRate: rate("exchange_rate"),
     stage: smallint("stage").notNull().default(1),
     /**
      * The deposit the supplier asked for, in the order's currency (0009); null when none was agreed. Paid supplier
@@ -43,6 +48,7 @@ export const orders = pgTable(
     // One PO number in any letter case (MR-001 and mr-001 are the same order).
     uniqueIndex("orders_po_number_unique").on(sql`lower(${t.poNumber})`),
     check("orders_currency_check", inList("currency", CURRENCIES)),
+    check("orders_exchange_rate_check", sql`exchange_rate is null or exchange_rate > 0`),
     check("orders_stage_check", sql`stage between 1 and 6`),
     check("orders_dates_check", sql`delivery_date >= order_date`),
     check("orders_deposit_required_check", sql`deposit_required_cny is null or deposit_required_cny > 0`),

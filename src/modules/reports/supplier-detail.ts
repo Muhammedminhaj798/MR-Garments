@@ -54,6 +54,9 @@ export async function supplierPaymentDetail(db: Database, supplierId: string, q:
       taxNumber: suppliers.taxNumber,
       notes: suppliers.notes,
       currency: suppliers.currency,
+      /** INR per 1 unit of `currency` now (docs/supplier-currency.md), null while not set, and when it was last set. */
+      exchangeRate: suppliers.exchangeRate,
+      rateUpdatedAt: suppliers.rateUpdatedAt,
       status: suppliers.status,
     })
     .from(suppliers)

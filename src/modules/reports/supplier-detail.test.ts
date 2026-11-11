@@ -335,6 +335,8 @@ describe("GET /reports/payments-per-supplier/:supplierId on a larger data set", 
       taxNumber: "",
       notes: "",
       currency: "USD",
+      exchangeRate: null,
+      rateUpdatedAt: null,
       status: "Inactive",
     });
     expect(body.filter).toEqual({ from: indiaDay(-100), to: indiaDay(0) });

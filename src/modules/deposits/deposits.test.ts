@@ -55,6 +55,7 @@ const OPEN_ROW = {
   supplier: "Guangzhou Textile Co.",
   direction: "give",
   currency: "CNY",
+  exchangeRate: null,
   amount: 1000,
   settled: 0,
   pending: 1000,
@@ -118,10 +119,18 @@ describe("SD-2 POST /suppliers/:supplierId/deposits", () => {
     expect((await ctx.db.select().from(supplierDeposits))[0]).toMatchObject({ supplierId: guangzhou, currency: "CNY", amount: 1000, createdBy: anita });
   });
 
-  it("opens a deposit to receive in another currency, with the reference and notes trimmed; today is accepted", async () => {
+  it("opens a deposit to receive in the supplier's currency (USD, its rate snapshotted), with the reference and notes trimmed; today is accepted", async () => {
+    await ctx.db.update(suppliers).set({ currency: "USD", exchangeRate: 88.25 }).where(eq(suppliers.id, hangzhou));
     const res = await open(hangzhou, { direction: "receive", amount: 250.5, currency: "USD", openedOn: indiaDay(0), reference: "  INV-77 ", notes: " Returned mould " });
     expect(res.status).toBe(201);
-    expect(res.body.deposit).toMatchObject({ supplier: "Hangzhou Knits", direction: "receive", currency: "USD", amount: 250.5, pending: 250.5, openedOn: indiaDay(0), reference: "INV-77", notes: "Returned mould" });
+    expect(res.body.deposit).toMatchObject({ supplier: "Hangzhou Knits", direction: "receive", currency: "USD", exchangeRate: 88.25, amount: 250.5, pending: 250.5, openedOn: indiaDay(0), reference: "INV-77", notes: "Returned mould" });
+  });
+
+  it("refuses a deposit in a currency other than the supplier's (docs/supplier-currency.md), storing nothing", async () => {
+    const res = await open(guangzhou, give({ currency: "USD" }));
+    expect(res.status).toBe(422);
+    expect(res.body.error.fields).toEqual({ currency: "This supplier's deposits are in CNY." });
+    expect(await ctx.db.select().from(supplierDeposits)).toHaveLength(0);
   });
 
   it("takes a deposit for an inactive supplier (a deposit to get back is still a record); SD-1 shows the supplier Inactive", async () => {
@@ -198,6 +207,7 @@ describe("SD-3 POST /supplier-deposits/:id/transactions", () => {
   });
 
   it("a receipt against a deposit to receive works the same, in the deposit's currency", async () => {
+    await ctx.db.update(suppliers).set({ currency: "USD", exchangeRate: 88 }).where(eq(suppliers.id, hangzhou));
     const deposit = await opened(hangzhou, { direction: "receive", amount: 500, currency: "USD", openedOn: "2026-10-01" });
     const res = await settled(deposit.id, settlement({ amount: 120 }));
     expect(res.deposit).toMatchObject({ direction: "receive", currency: "USD", settled: 120, pending: 380, status: "partly settled" });
@@ -247,7 +257,10 @@ describe("SD-1 GET /suppliers/:supplierId/deposits", () => {
     const toReceive = await opened(guangzhou, { direction: "receive", amount: 500, openedOn: "2026-10-10", reference: "Mould" });
     await settled(toReceive.id, settlement({ amount: 60, paidOn: "2026-10-12", mode: "Cash" }));
     await settled(toReceive.id, settlement({ amount: 40, paidOn: "2026-10-20", mode: "Cash" }));
+    // Guangzhou was paid in USD for a while: the deposit from then keeps its currency after the switch back to CNY.
+    await ctx.db.update(suppliers).set({ currency: "USD", exchangeRate: 88 }).where(eq(suppliers.id, guangzhou));
     const usd = await opened(guangzhou, give({ amount: 200, currency: "USD", openedOn: "2026-09-15" }));
+    await ctx.db.update(suppliers).set({ currency: "CNY", exchangeRate: null }).where(eq(suppliers.id, guangzhou));
     await opened(hangzhou, give({ amount: 999 })); // another supplier's: not here
 
     const res = await get(`/suppliers/${guangzhou}/deposits`, procurement);

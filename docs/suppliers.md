@@ -86,3 +86,7 @@ window. `MoneyTotal = { currency, amount }`.
 
 Tests: `master-data/suppliers.test.ts` (profile fields, codes, email) and `master-data/supplier-insights.test.ts`
 (money columns, SUP-1, SUP-2).
+
+## Currency and exchange rate
+
+Since migration 0012 a supplier has one currency and an INR exchange rate that new orders and deposits snapshot: see docs/supplier-currency.md.

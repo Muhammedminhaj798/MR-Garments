@@ -26,6 +26,8 @@ export const supplierDeposits = pgTable(
     /** The agreed amount, in `currency`. */
     amount: money("amount").notNull(),
     currency: text("currency").$type<Currency>().notNull(),
+    /** INR per 1 of `currency` when the deposit was opened (0012): the supplier's rate then, 1 for INR; null before 0012 or while the supplier had no rate. */
+    exchangeRate: numeric("exchange_rate", { precision: 12, scale: 4, mode: "number" }),
     /** The day the deposit was agreed. */
     openedOn: date("opened_on").notNull(),
     reference: text("reference").notNull().default(""),
@@ -37,6 +39,7 @@ export const supplierDeposits = pgTable(
     index("supplier_deposits_supplier_idx").on(t.supplierId),
     check("supplier_deposits_direction_check", inList("direction", DEPOSIT_DIRECTIONS)),
     check("supplier_deposits_currency_check", inList("currency", CURRENCIES)),
+    check("supplier_deposits_exchange_rate_check", sql`exchange_rate is null or exchange_rate > 0`),
     check("supplier_deposits_amount_check", sql`amount > 0`),
   ],
 );

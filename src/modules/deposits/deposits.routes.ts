@@ -23,6 +23,8 @@ export const MESSAGES = {
   direction: "Choose Give or Receive.",
   amount: "Enter an amount above 0.",
   currency: "Choose CNY, USD or INR.",
+  /** SD-2: the deposit's currency must be the supplier's (docs/supplier-currency.md). */
+  supplierCurrency: (currency: string) => `This supplier's deposits are in ${currency}.`,
   openedOn: "Enter the date the deposit was agreed.",
   paidOn: "Enter the date of the payment or receipt.",
   future: "The date can't be in the future.",
@@ -49,7 +51,7 @@ const notes = z.string({ error: M.notesTooLong }).trim().max(1000, M.notesTooLon
 const newDeposit = z.strictObject({
   direction: z.enum(DEPOSIT_DIRECTIONS, { error: M.direction }),
   amount,
-  /** Left out: the supplier's currency. */
+  /** Left out: the supplier's currency; given, it must be the supplier's. */
   currency: z.enum(CURRENCIES, { error: M.currency }).optional(),
   openedOn: notAfterToday(M.openedOn),
   reference,
@@ -81,6 +83,8 @@ export function depositRows(db: Pick<Database, "select">, where: SQL) {
       supplier: suppliers.name,
       direction: supplierDeposits.direction,
       currency: supplierDeposits.currency,
+      /** INR per 1 of `currency` when the deposit was opened (the supplier's rate then); null before 0012 or without a rate. */
+      exchangeRate: supplierDeposits.exchangeRate,
       amount: supplierDeposits.amount,
       settled,
       openedOn: supplierDeposits.openedOn,
@@ -238,7 +242,7 @@ export function depositsRoutes({ db }: RouteContext) {
   });
 
   // SD-2. Opens a deposit for a supplier (any known one: a deposit to get back from a supplier no longer used is still
-  // a record). The currency defaults to the supplier's.
+  // a record). The currency is the supplier's (a different one is 422); the supplier's rate is snapshotted on the deposit.
   router.post("/suppliers/:supplierId/deposits", requirePermission("payments", "Enter"), async (req, res) => {
     const supplierId = String(req.params.supplierId);
     if (!isUuid(supplierId)) throw notFound("Supplier");
@@ -246,12 +250,23 @@ export function depositsRoutes({ db }: RouteContext) {
     const deposit = await db.transaction(async (tx) => {
       // The supplier's row share-locked (as PAY-2 locks the agent): a delete of the supplier waits for this deposit and
       // then counts it, instead of the insert failing on the foreign key.
-      const [supplier] = await tx.select({ currency: suppliers.currency }).from(suppliers).where(eq(suppliers.id, supplierId)).for("share");
+      const [supplier] = await tx
+        .select({ currency: suppliers.currency, exchangeRate: suppliers.exchangeRate })
+        .from(suppliers)
+        .where(eq(suppliers.id, supplierId))
+        .for("share");
       if (!supplier) throw notFound("Supplier");
+      if (input.currency !== undefined && input.currency !== supplier.currency) throw validationFailed({ currency: M.supplierCurrency(supplier.currency) });
       const created = (
         await tx
           .insert(supplierDeposits)
-          .values({ ...input, supplierId, currency: input.currency ?? supplier.currency, createdBy: req.user!.id })
+          .values({
+            ...input,
+            supplierId,
+            currency: supplier.currency,
+            exchangeRate: supplier.currency === "INR" ? 1 : supplier.exchangeRate,
+            createdBy: req.user!.id,
+          })
           .returning({ id: supplierDeposits.id })
       )[0]!;
       return toRow((await depositRows(tx, eq(supplierDeposits.id, created.id)))[0]!);

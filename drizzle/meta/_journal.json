@@ -85,6 +85,13 @@
       "when": 1794294751588,
       "tag": "0011_suppliers_profile",
       "breakpoints": true
+    },
+    {
+      "idx": 12,
+      "version": "7",
+      "when": 1794383967728,
+      "tag": "0012_supplier_currency",
+      "breakpoints": true
     }
   ]
 }

@@ -1,5 +1,5 @@
 import { sql } from "drizzle-orm";
-import { check, index, json, pgTable, primaryKey, smallint, text, timestamp, uniqueIndex, uuid, varchar } from "drizzle-orm/pg-core";
+import { check, index, json, numeric, pgTable, primaryKey, smallint, text, timestamp, uniqueIndex, uuid, varchar } from "drizzle-orm/pg-core";
 
 import { citext, type Currency, CURRENCIES, inList, LOCATION_TYPES, ROLES, status, STATUSES, timestamps } from "./columns";
 
@@ -108,6 +108,13 @@ export const suppliers = pgTable(
     taxNumber: text("tax_number").notNull().default(""),
     notes: text("notes").notNull().default(""),
     currency: text("currency").$type<Currency>().notNull().default("CNY"),
+    /**
+     * INR per 1 unit of `currency` (0012): what the supplier's new orders and deposits snapshot, always 1 for INR;
+     * null while never set (rows from before 0012 in CNY or USD). Never used to recompute a saved transaction.
+     */
+    exchangeRate: numeric("exchange_rate", { precision: 12, scale: 4, mode: "number" }),
+    /** When `currency` or `exchangeRate` was last set through the API; null while never set. */
+    rateUpdatedAt: timestamp("rate_updated_at", { withTimezone: true }),
     status,
     ...timestamps,
     createdBy: uuid("created_by"),
@@ -118,6 +125,8 @@ export const suppliers = pgTable(
       .on(sql`upper(${t.code})`)
       .where(sql`code <> ''`),
     check("suppliers_currency_check", inList("currency", CURRENCIES)),
+    check("suppliers_exchange_rate_check", sql`exchange_rate is null or exchange_rate > 0`),
+    check("suppliers_inr_rate_check", sql`currency <> 'INR' or exchange_rate = 1`),
     check("suppliers_status_check", inList("status", STATUSES)),
   ],
 );

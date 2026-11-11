@@ -111,6 +111,7 @@ describe("ORD-4 GET /orders/:po", () => {
       depositPaidCny: 1234.56,
       depositPendingCny: null,
       depositStatus: "none",
+      exchangeRate: null,
       lines: [
         { id: jeans, position: 0, item: { id: ids.jeans, name: "Denim jeans" }, unit: "pcs", quantity: 1000, rateCny: 12.5, valueCny: 12500, received: 900, loaded: 700 },
         { id: fabric, position: 1, item: { id: ids.fabric, name: "Cotton fabric" }, unit: "m", quantity: 300, rateCny: 8.25, valueCny: 2475, received: 100, loaded: 0 },

@@ -202,6 +202,7 @@ export function orderDetailRoutes({ db }: RouteContext) {
       stage: row.stage,
       supplier: { id: row.supplierId, name: row.supplierName, ...supplier[0]! },
       currency: row.currency,
+      exchangeRate: row.exchangeRate,
       item: row.item,
       quantity: row.quantity,
       unit: row.unit,

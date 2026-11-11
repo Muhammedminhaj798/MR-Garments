@@ -113,6 +113,9 @@ export async function orderReports(db: Database, q: Query) {
       stage: row.stage,
       supplier: { id: row.supplierId, name: row.supplierName, code: row.supplierCode },
       currency: row.currency,
+      /** The rate saved on the order (null for older orders) and the PO value at it; paidInr stays at each payment's own rate. */
+      exchangeRate: row.exchangeRate,
+      orderValueInr: row.exchangeRate === null ? null : round2(row.orderValueCny * row.exchangeRate),
       item: row.item,
       quantity: row.quantity,
       unit: row.unit,

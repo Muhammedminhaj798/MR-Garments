@@ -32,7 +32,7 @@ const NINGBO = {
   email: "xu.feng@ningbo-denim.cn",
 };
 // The profile fields a row has when they were never set, and the money lists of a supplier without orders.
-const EXTRAS = { state: "", postalCode: "", paymentTerms: "", taxNumber: "", openPos: 0, ytdValue: [], balance: [] };
+const EXTRAS = { state: "", postalCode: "", paymentTerms: "", taxNumber: "", openPos: 0, ytdValue: [], balance: [], exchangeRate: null, rateUpdatedAt: null, hasTransactions: false };
 
 const UNKNOWN = "00000000-0000-4000-8000-000000000000";
 const list = (query = "") => http.get(`/suppliers${query}`).set("Cookie", management);
@@ -306,16 +306,16 @@ describe("PATCH /suppliers/:id", () => {
     expect((await edit(id, { address: "a".repeat(1000), notes: "" })).status).toBe(200);
   });
 
-  it("changes the currency for new orders only: the supplier's existing orders keep theirs", async () => {
+  it("changes the currency (with its rate) for new orders only: the supplier's existing orders keep theirs", async () => {
     const id = await idOf(ctx, suppliers, "Yiwu Trims Ltd.");
     const order = await makeOrder(ctx, { supplier: "Yiwu Trims Ltd.", lines: [{ item: "Denim jeans", quantity: 10, rateCny: 5 }] });
-    const res = await edit(id, { currency: "USD" });
+    const res = await edit(id, { currency: "USD", exchangeRate: 88.25 });
     expect(res.status).toBe(200);
-    expect(res.body.supplier).toMatchObject({ name: "Yiwu Trims Ltd.", currency: "USD" });
+    expect(res.body.supplier).toMatchObject({ name: "Yiwu Trims Ltd.", currency: "USD", exchangeRate: 88.25, hasTransactions: true });
     expect((await ctx.db.select({ currency: orders.currency }).from(orders).where(eq(orders.id, order.id)))[0]!.currency).toBe("CNY");
-    expect((await edit(id, { currency: "INR" })).body.supplier.currency).toBe("INR");
+    expect((await edit(id, { currency: "INR" })).body.supplier).toMatchObject({ currency: "INR", exchangeRate: 1 });
     expect((await edit(id, { currency: "EUR" })).body.error.fields).toEqual({ currency: "Choose CNY, USD or INR." });
-    expect((await edit(id, { currency: "CNY" })).status).toBe(200);
+    expect((await edit(id, { currency: "CNY", exchangeRate: 11.5 })).status).toBe(200);
     await ctx.db.delete(orders).where(eq(orders.id, order.id));
   });
 

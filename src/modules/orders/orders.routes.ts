@@ -49,6 +49,8 @@ export const MESSAGES = {
   rateForInr: "Leave the rate empty for an INR order.",
   mode: "Enter the payment mode.",
   currency: "Choose CNY, USD or INR.",
+  /** The order is in its supplier's currency (docs/supplier-currency.md); another one is refused. */
+  supplierCurrency: (currency: string) => `This supplier's orders are in ${currency}.`,
   po: "Enter the PO number.",
   poTooLong: "Use 50 characters or fewer.",
   poTaken: "This PO number is already used by another order.",
@@ -90,8 +92,8 @@ const newOrder = z.strictObject({
   // kept as typed apart from the surrounding spaces. Left out, the server assigns the next PO-<number>.
   po: z.string({ error: M.po }).trim().min(1, M.po).max(PO_MAX_LENGTH, M.poTooLong).optional(),
   supplierId: z.uuid({ error: M.supplier }),
-  // Left out (an older frontend), the order is CNY: that frontend shows every amount in yuan.
-  currency: z.enum(CURRENCIES, { error: M.currency }).default("CNY"),
+  // The supplier's currency: left out, it is filled in; given, it must match (checkRules).
+  currency: z.enum(CURRENCIES, { error: M.currency }).optional(),
   orderDate: z.iso.date({ error: M.orderDate }),
   deliveryDate: z.iso.date({ error: M.deliveryDate }),
   lines: lineList(line),
@@ -137,20 +139,25 @@ async function checkRules(db: Database, input: NewOrder) {
   const problems: Record<string, string> = {};
   if (input.po && (await db.select({ id: orders.id }).from(orders).where(byPo(input.po))).length > 0) problems.po = M.poTaken;
   if (input.deliveryDate < input.orderDate) problems.deliveryDate = M.deliveryBeforeOrder;
-  const supplier = await db
-    .select({ id: suppliers.id })
+  const [supplier] = await db
+    .select({ id: suppliers.id, currency: suppliers.currency, exchangeRate: suppliers.exchangeRate })
     .from(suppliers)
     .where(and(eq(suppliers.id, input.supplierId), eq(suppliers.status, "Active")));
-  if (supplier.length === 0) problems.supplierId = M.supplier;
+  if (!supplier) problems.supplierId = M.supplier;
+  // The order is in the supplier's currency (docs/supplier-currency.md): another one is refused, left out it is filled in.
+  else if (input.currency !== undefined && input.currency !== supplier.currency) problems.currency = M.supplierCurrency(supplier.currency);
+  const currency: Currency = supplier?.currency ?? input.currency ?? "CNY";
   const itemIds = [...new Set(input.lines.map((entry) => entry.itemId))];
   const active = await db
     .select({ id: items.id })
     .from(items)
     .where(and(inArray(items.id, itemIds), eq(items.status, "Active")));
   if (active.length < itemIds.length) problems.lines = M.item;
-  const rate = input.deposits.map((entry) => rateProblem(input.currency, entry.rateInr, M.rateInr)).find(Boolean);
+  const rate = input.deposits.map((entry) => rateProblem(currency, entry.rateInr, M.rateInr)).find(Boolean);
   if (rate) problems.deposits = rate;
   if (Object.keys(problems).length > 0) throw validationFailed(problems);
+  /** The order's money: its currency and the supplier's rate now (1 for INR; null while the supplier has none), kept on the order for good. */
+  return { currency, exchangeRate: currency === "INR" ? 1 : (supplier!.exchangeRate ?? null) };
 }
 
 // The main line (position 0) gives the item, quantity and received figures the lists show; the money comes from
@@ -162,6 +169,10 @@ export const orderColumns = {
   orderDate: orders.orderDate,
   deliveryDate: orders.deliveryDate,
   currency: orders.currency,
+  /** INR per 1 of `currency` when the order was placed (0012); null for older orders or a supplier without a rate then. */
+  exchangeRate: orders.exchangeRate,
+  /** The supplier's rate now (null while not set): a new payment's default rate, never the order's. */
+  supplierRate: suppliers.exchangeRate,
   stage: orders.stage,
   supplierId: suppliers.id,
   supplierName: suppliers.name,
@@ -209,6 +220,7 @@ export function ordersRoutes({ db }: RouteContext) {
         stage: row.stage,
         supplier: { id: row.supplierId, name: row.supplierName },
         currency: row.currency,
+        exchangeRate: row.exchangeRate,
         item: row.item,
         quantity: row.quantity,
         unit: row.unit,
@@ -238,6 +250,8 @@ export function ordersRoutes({ db }: RouteContext) {
           phone: suppliers.phone,
           city: suppliers.city,
           currency: suppliers.currency,
+          /** The supplier's rate now, snapshotted on the order placed (null while not set: the form says so). */
+          exchangeRate: suppliers.exchangeRate,
         })
         .from(suppliers)
         .where(eq(suppliers.status, "Active"))
@@ -265,7 +279,7 @@ export function ordersRoutes({ db }: RouteContext) {
   // ORD-3. The order, its lines and its deposits in one transaction; the PO number is the form's or assigned inside it.
   router.post("/orders", requirePermission("ordersEdit", "Enter"), async (req, res) => {
     const input = parse(newOrder, req.body);
-    await checkRules(db, input);
+    const money = await checkRules(db, input);
     const userId = req.user!.id;
     for (let attempt = 1; ; attempt++) {
       try {
@@ -279,7 +293,8 @@ export function ordersRoutes({ db }: RouteContext) {
               supplierId: input.supplierId,
               orderDate: input.orderDate,
               deliveryDate: input.deliveryDate,
-              currency: input.currency,
+              currency: money.currency,
+              exchangeRate: money.exchangeRate,
               depositRequiredCny: input.depositRequiredCny ?? null,
               createdBy: userId,
             })
@@ -378,6 +393,7 @@ export function ordersRoutes({ db }: RouteContext) {
         po: row.po,
         supplier: row.supplierName,
         currency: row.currency,
+        supplierRate: row.supplierRate,
         orderValueCny: row.orderValueCny,
         paidCny: row.paidCny,
         paidInr: row.paidInr,

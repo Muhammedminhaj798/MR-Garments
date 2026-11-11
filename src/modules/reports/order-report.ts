@@ -115,6 +115,8 @@ export async function orderReport(db: Database, po: string, user: CurrentUser) {
           taxNumber: suppliers.taxNumber,
           supplierNotes: suppliers.notes,
           supplierCurrency: suppliers.currency,
+          supplierRate: suppliers.exchangeRate,
+          supplierRateUpdatedAt: suppliers.rateUpdatedAt,
           supplierStatus: suppliers.status,
           createdAt: orders.createdAt,
           updatedAt: orders.updatedAt,
@@ -478,6 +480,9 @@ export async function orderReport(db: Database, po: string, user: CurrentUser) {
         taxNumber: header!.taxNumber,
         notes: header!.supplierNotes,
         currency: header!.supplierCurrency,
+        /** The supplier's rate now, for new transactions; the order keeps its own `exchangeRate` below. */
+        exchangeRate: header!.supplierRate,
+        rateUpdatedAt: iso(header!.supplierRateUpdatedAt),
         status: header!.supplierStatus,
       },
       orderDate: row.orderDate,
@@ -490,6 +495,9 @@ export async function orderReport(db: Database, po: string, user: CurrentUser) {
       closedOn: row.closedOn,
       currency: row.currency,
       orderValueCny: row.orderValueCny,
+      /** The rate saved when the order was placed (null for older orders), and the PO value at that rate, never a later one. */
+      exchangeRate: row.exchangeRate,
+      orderValueInr: row.exchangeRate === null ? null : round2(row.orderValueCny * row.exchangeRate),
       products: lines.length,
       totals,
     },

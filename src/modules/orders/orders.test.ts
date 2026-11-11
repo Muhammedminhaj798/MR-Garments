@@ -87,7 +87,7 @@ describe("ORD-2 GET /orders/options", () => {
     expect(res.status).toBe(200);
     expect(res.body.nextPo).toBe("PO-2050");
     expect(res.body.suppliers.map((row: { name: string }) => row.name)).toEqual(["Guangzhou Textile Co.", "Shenzhen Apparel", "Yiwu Trims Ltd.", "Hangzhou Knits"]);
-    expect(res.body.suppliers[0]).toEqual({ id: ids.supplier, name: "Guangzhou Textile Co.", contactPerson: "Mr. Zhao Lin", phone: "+86 138 0013 2244", city: "Guangzhou", currency: "CNY" });
+    expect(res.body.suppliers[0]).toEqual({ id: ids.supplier, name: "Guangzhou Textile Co.", contactPerson: "Mr. Zhao Lin", phone: "+86 138 0013 2244", city: "Guangzhou", currency: "CNY", exchangeRate: null });
     expect(res.body.items).toHaveLength(8);
     expect(res.body.items).toContainEqual({ id: ids.jeans, name: "Denim jeans", unit: "pcs", price: null });
     expect(res.body.items).toContainEqual({ id: ids.fabric, name: "Cotton fabric", unit: "m", price: null });
@@ -128,6 +128,7 @@ describe("ORD-3 POST /orders and ORD-1 GET /orders", () => {
       stage: 1,
       supplier: { id: ids.supplier, name: "Guangzhou Textile Co." },
       currency: "CNY",
+      exchangeRate: null,
       item: "Denim jeans",
       quantity: 1000,
       unit: "pcs",
@@ -313,6 +314,7 @@ describe("PAY-1 GET /payments", () => {
         po: bare.po,
         supplier: "Guangzhou Textile Co.",
         currency: "CNY",
+        supplierRate: null,
         orderValueCny: 14975,
         paidCny: 0,
         paidInr: 0,
@@ -330,6 +332,7 @@ describe("PAY-1 GET /payments", () => {
         po: withDeposits.po,
         supplier: "Guangzhou Textile Co.",
         currency: "CNY",
+        supplierRate: null,
         orderValueCny: 14975,
         paidCny: 2234.56,
         paidInr: 26562.25,
@@ -377,8 +380,16 @@ describe("currencies (migration 0006): CNY, USD and INR orders", () => {
     ...overrides,
   });
 
-  it("stores the order's currency (CNY when left out) and returns it on ORD-1, ORD-4 and PAY-1", async () => {
-    const usd = (await create(orderBody({ currency: "USD", deposits: [supplierDeposit()] }))).body.order;
+  // Each supplier has one currency (docs/supplier-currency.md): the USD and INR orders below go to suppliers set to it.
+  const supplierIn = async (name: string, currency: "USD" | "INR", exchangeRate: number | null) => {
+    const id = (await ctx.db.select({ id: suppliers.id }).from(suppliers).where(eq(suppliers.name, name)))[0]!.id;
+    await ctx.db.update(suppliers).set({ currency, exchangeRate }).where(eq(suppliers.id, id));
+    return id;
+  };
+
+  it("stores the order's currency (the supplier's when left out) and returns it on ORD-1, ORD-4 and PAY-1", async () => {
+    const shenzhen = await supplierIn("Shenzhen Apparel", "USD", 88.25);
+    const usd = (await create(orderBody({ supplierId: shenzhen, currency: "USD", deposits: [supplierDeposit()] }))).body.order;
     const cny = (await create(orderBody({ deposits: [] }))).body.order;
     const stored = await ctx.db.select({ id: orders.id, currency: orders.currency }).from(orders);
     expect(stored).toEqual(expect.arrayContaining([{ id: usd.id, currency: "USD" }, { id: cny.id, currency: "CNY" }]));
@@ -392,20 +403,26 @@ describe("currencies (migration 0006): CNY, USD and INR orders", () => {
   });
 
   it("an INR order's deposits take no rate: stored as 1, so INR is the amount", async () => {
-    const inr = await create(orderBody({ currency: "INR", deposits: [supplierDeposit({ rateInr: undefined, amountCny: 50000 }), supplierDeposit({ rateInr: 1 })] }));
+    const foshan = await supplierIn("Foshan Fabrics", "INR", 1);
+    const inr = await create(orderBody({ supplierId: foshan, currency: "INR", deposits: [supplierDeposit({ rateInr: undefined, amountCny: 50000 }), supplierDeposit({ rateInr: 1 })] }));
     expect(inr.status).toBe(201);
     const rows = await ctx.db.select({ rateInr: payments.rateInr }).from(payments).where(eq(payments.orderId, inr.body.order.id));
     expect(rows).toEqual([{ rateInr: 1 }, { rateInr: 1 }]);
     expect((await get("/orders")).body[0]).toMatchObject({ currency: "INR", paidCny: 51000, paidInr: 51000 });
   });
 
-  it("refuses a rate on an INR deposit, a missing rate otherwise, and another currency, storing nothing", async () => {
+  it("refuses a rate on an INR deposit, a missing rate otherwise, another currency, and a currency not the supplier's, storing nothing", async () => {
+    const foshan = await supplierIn("Foshan Fabrics", "INR", 1);
+    const shenzhen = await supplierIn("Shenzhen Apparel", "USD", 88.25);
     const cases: [object, Record<string, string>][] = [
-      [{ currency: "INR", deposits: [supplierDeposit({ rateInr: 12 })] }, { deposits: MESSAGES.rateForInr }],
-      [{ currency: "USD", deposits: [supplierDeposit({ rateInr: undefined })] }, { deposits: MESSAGES.rateInr }],
+      [{ supplierId: foshan, currency: "INR", deposits: [supplierDeposit({ rateInr: 12 })] }, { deposits: MESSAGES.rateForInr }],
+      [{ supplierId: shenzhen, currency: "USD", deposits: [supplierDeposit({ rateInr: undefined })] }, { deposits: MESSAGES.rateInr }],
       [{ deposits: [supplierDeposit({ rateInr: undefined })] }, { deposits: MESSAGES.rateInr }],
       [{ currency: "EUR" }, { currency: MESSAGES.currency }],
       [{ currency: "usd" }, { currency: MESSAGES.currency }],
+      // The order's currency is the supplier's (docs/supplier-currency.md): the deposit rule is checked for that currency.
+      [{ currency: "USD" }, { currency: MESSAGES.supplierCurrency("CNY") }],
+      [{ supplierId: foshan, currency: "CNY", deposits: [supplierDeposit({ rateInr: 12 })] }, { currency: MESSAGES.supplierCurrency("INR"), deposits: MESSAGES.rateForInr }],
     ];
     for (const [overrides, fields] of cases) {
       const res = await create(orderBody(overrides));
@@ -415,9 +432,9 @@ describe("currencies (migration 0006): CNY, USD and INR orders", () => {
     expect(await countOrders()).toBe(0);
   });
 
-  it("ORD-2 gives each supplier's currency, the new-order default", async () => {
-    await ctx.db.update(suppliers).set({ currency: "USD" }).where(eq(suppliers.id, ids.supplier));
-    expect((await get("/orders/options")).body.suppliers[0]).toMatchObject({ id: ids.supplier, currency: "USD" });
+  it("ORD-2 gives each supplier's currency and rate, the new order's", async () => {
+    await ctx.db.update(suppliers).set({ currency: "USD", exchangeRate: 88 }).where(eq(suppliers.id, ids.supplier));
+    expect((await get("/orders/options")).body.suppliers[0]).toMatchObject({ id: ids.supplier, currency: "USD", exchangeRate: 88 });
   });
 
   it("the database refuses any other currency (check constraint)", async () => {
