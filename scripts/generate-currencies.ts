@@ -1,22 +1,36 @@
-import { writeFileSync } from "node:fs";
-import { createRequire } from "node:module";
+import { readFileSync, writeFileSync } from "node:fs";
 
-// npm run currencies:generate — writes src/currencies/iso4217.ts, the currency master (docs/supplier-currency.md):
-// every active ISO 4217 currency from the currency-codes package (ISO list one), minus the fund codes and the X codes
-// that are not currencies (metals, bond units, SDR, testing, "no currency"), with the English name and symbol from
-// ICU/CLDR (Intl) and the minor units from ISO. Re-run after upgrading currency-codes or Node; commit the result.
+// npm run currencies:generate — writes src/currencies/iso4217.ts, the currency master (docs/supplier-currency.md),
+// from scripts/iso4217-list-one.xml: ISO 4217 list one ("current currency & funds") as the maintenance agency (SIX)
+// publishes it. Kept: every entry with a currency code that is not a fund (IsFund="true": BOV, CHE, CLF, USN, XAD ...)
+// and has minor units (the X units, metals, SDR, testing code and "no currency" have "N.A."). A code ISO has withdrawn
+// (BGN, ANG, CUC ...) is not in list one, so it is not in the master. Names and symbols come from ICU/CLDR (Intl),
+// the minor units from ISO.
+//
+// npm run currencies:generate -- --download   fetches the latest list one first (then commit both files).
 
-const require = createRequire(import.meta.url);
-type IsoEntry = { code: string; number: string; digits: number; currency: string; countries: string[] };
-const iso = require("currency-codes") as { data: IsoEntry[] };
-const version = (require("currency-codes/package.json") as { version: string }).version;
+const LIST_URL = "https://www.six-group.com/dam/download/financial-information/data-center/iso-currrency/lists/list-one.xml";
+const LIST_FILE = new URL("./iso4217-list-one.xml", import.meta.url);
 
-/** Supranational currencies people are paid in; every other X code is a unit (gold, SDR, testing, no currency). */
-const REAL_X_CODES = new Set(["XAF", "XOF", "XPF", "XCD", "XCG"]);
-/** ISO "funds" codes: accounting units beside a country's currency, never a transaction currency. */
-const FUND_CODES = new Set(["BOV", "CHE", "CHW", "CLF", "COU", "MXV", "USN", "UYI", "UYW"]);
-/** Codes ISO added after currency-codes@2.2.0 (list one, 2024). XCG: Caribbean guilder, ISO 4217 amendment 177 (2025). */
-const ADDITIONS: IsoEntry[] = [{ code: "XCG", number: "532", digits: 2, currency: "Caribbean Guilder", countries: ["Curaçao", "Sint Maarten"] }];
+if (process.argv.includes("--download")) {
+  const response = await fetch(LIST_URL);
+  if (!response.ok) throw new Error(`${LIST_URL}: HTTP ${response.status}`);
+  writeFileSync(LIST_FILE, await response.text());
+}
+const xml = readFileSync(LIST_FILE, "utf8");
+const published = /<ISO_4217 Pblshd="([^"]+)"/.exec(xml)?.[1];
+if (!published) throw new Error("scripts/iso4217-list-one.xml is not ISO 4217 list one");
+
+const decode = (text: string) => text.replace(/&apos;/g, "'").replace(/&quot;/g, '"').replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&amp;/g, "&").trim();
+type IsoEntry = { code: string; isoName: string; minorUnits: number };
+const entries = new Map<string, IsoEntry>();
+for (const [, body] of xml.matchAll(/<CcyNtry>([\s\S]*?)<\/CcyNtry>/g)) {
+  const code = /<Ccy>([^<]*)<\/Ccy>/.exec(body!)?.[1];
+  const name = /<CcyNm( IsFund="true")?>([^<]*)<\/CcyNm>/.exec(body!);
+  const units = /<CcyMnrUnts>([^<]*)<\/CcyMnrUnts>/.exec(body!)?.[1];
+  if (!code || !name || name[1] || !units || !/^\d$/.test(units)) continue;
+  entries.set(code, { code, isoName: decode(name[2]!), minorUnits: Number(units) });
+}
 
 /** The three the app started with keep their symbols; another currency sharing one of them gets its longer form or its code. */
 const RESERVED: Record<string, string> = { CNY: "¥", USD: "$", INR: "₹" };
@@ -36,33 +50,36 @@ function symbolOf(code: string) {
   const symbol = part(code, "symbol");
   return taken.has(symbol) ? code : symbol;
 }
-function nameOf(entry: IsoEntry) {
-  const name = (() => {
-    try {
-      return names.of(entry.code);
-    } catch {
-      return undefined;
-    }
-  })();
-  return !name || name === entry.code ? entry.currency : name;
+/** CLDR's English name; ISO's when CLDR has none, or has the same words in other case ("Caribbean guilder"). */
+function nameOf({ code, isoName }: IsoEntry) {
+  let name: string | undefined;
+  try {
+    name = names.of(code);
+  } catch {
+    name = undefined;
+  }
+  return !name || name === code || name.toLowerCase() === isoName.toLowerCase() ? isoName : name;
 }
 
-const kept = [...iso.data, ...ADDITIONS.filter((add) => !iso.data.some((entry) => entry.code === add.code))]
-  .filter((entry) => /^[A-Z]{3}$/.test(entry.code) && !FUND_CODES.has(entry.code) && (!entry.code.startsWith("X") || REAL_X_CODES.has(entry.code)))
-  .map((entry) => ({ code: entry.code, name: nameOf(entry), symbol: symbolOf(entry.code), minorUnits: entry.digits }))
+const kept = [...entries.values()]
+  .map((entry) => ({ code: entry.code, name: nameOf(entry), isoName: entry.isoName, symbol: symbolOf(entry.code), minorUnits: entry.minorUnits }))
   .sort((a, b) => a.code.localeCompare(b.code));
 
 const icu = process.versions.icu ?? "unknown";
-const lines = kept.map((c) => `  { code: ${JSON.stringify(c.code)}, name: ${JSON.stringify(c.name)}, symbol: ${JSON.stringify(c.symbol)}, minorUnits: ${c.minorUnits} },`);
-const source = `// Generated by scripts/generate-currencies.ts: ${kept.length} active ISO 4217 currencies from currency-codes@${version} (ISO list
-// one) plus ISO amendments it predates, without fund codes and non-currency X codes; names and symbols from ICU ${icu}
-// (CLDR), minor units from ISO. Do not edit by hand: npm run currencies:generate (docs/supplier-currency.md).
+const lines = kept.map(
+  (c) => `  { code: ${JSON.stringify(c.code)}, name: ${JSON.stringify(c.name)}, isoName: ${JSON.stringify(c.isoName)}, symbol: ${JSON.stringify(c.symbol)}, minorUnits: ${c.minorUnits} },`,
+);
+const source = `// Generated by scripts/generate-currencies.ts: ${kept.length} active ISO 4217 currencies from ISO 4217 list one published
+// ${published} (scripts/iso4217-list-one.xml), without fund codes and the units that have no minor unit; names and
+// symbols from ICU ${icu} (CLDR), minor units from ISO. Do not edit by hand: npm run currencies:generate (docs/supplier-currency.md).
 
 export type CurrencyInfo = {
   /** ISO 4217 alphabetic code. */
   code: string;
-  /** English name ("Chinese Yuan"). */
+  /** English name ("Chinese Yuan", "United Arab Emirates Dirham"). */
   name: string;
+  /** ISO's own name ("Yuan Renminbi", "UAE Dirham", "Pound Sterling"): searched by the picker as well. */
+  isoName: string;
   /** "¥", "$", "₹" for CNY, USD and INR; another currency's narrow symbol unless it is one of those, then its longer form ("A$") or its code. */
   symbol: string;
   /** Decimal places of the minor unit (JPY 0, KWD 3). Amounts are stored with 2 decimals (docs/supplier-currency.md). */
@@ -74,4 +91,4 @@ ${lines.join("\n")}
 ];
 `;
 writeFileSync(new URL("../src/currencies/iso4217.ts", import.meta.url), source);
-console.info(`Wrote src/currencies/iso4217.ts: ${kept.length} currencies (currency-codes@${version}, ICU ${icu}).`);
+console.info(`Wrote src/currencies/iso4217.ts: ${kept.length} currencies (ISO list one ${published}, ICU ${icu}).`);

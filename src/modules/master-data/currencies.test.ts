@@ -2,7 +2,7 @@ import { eq } from "drizzle-orm";
 import { afterAll, beforeEach, describe, expect, it } from "vitest";
 
 import { compareCurrencies, currencySymbol, ISO_4217, isCurrency, orderedCurrencies, PREFERRED_CURRENCIES } from "../../currencies";
-import { items, orders, supplierDeposits, suppliers } from "../../db/schema";
+import { items, orders, payments, supplierDeposits, suppliers } from "../../db/schema";
 import { api, createTestContext, resetData, SEEDED, signInAs } from "../../test/harness";
 import { money } from "../notifications/notify";
 import { idOf } from "../stock/fixtures";
@@ -28,9 +28,12 @@ const add = (body: object) => http.post("/suppliers", body).set("Cookie", manage
 describe("the master", () => {
   it("holds the active ISO 4217 currencies with code, name, symbol and minor units, and nothing that isn't money", () => {
     expect(ISO_4217.length).toBeGreaterThanOrEqual(150);
-    for (const code of ["AED", "AUD", "CNY", "EUR", "GBP", "INR", "JPY", "KWD", "SAR", "USD", "XAF", "XCD"]) expect(isCurrency(code), code).toBe(true);
-    // Metals, bond units, SDR, testing and "no currency" codes; fund codes; retired currencies; crypto.
-    for (const code of ["XAU", "XAG", "XDR", "XTS", "XXX", "CLF", "USN", "MXV", "HRK", "SLL", "ZWL", "VEF", "BTC", "cny", ""]) expect(isCurrency(code), code).toBe(false);
+    for (const code of ["AED", "AUD", "CNY", "EUR", "GBP", "INR", "JPY", "KWD", "SAR", "USD", "XAF", "XCD", "XCG", "ZWG", "BRL", "ZAR", "NZD"]) expect(isCurrency(code), code).toBe(true);
+    // Metals, bond units, SDR, testing and "no currency" codes; fund codes (XAD too); currencies ISO has withdrawn
+    // (BGN: Bulgaria joined the euro on 2026-01-01; ANG: replaced by XCG; CUC); crypto; not a code.
+    for (const code of ["XAU", "XAG", "XDR", "XSU", "XUA", "XTS", "XXX", "XAD", "CLF", "USN", "MXV", "BGN", "ANG", "CUC", "HRK", "SLL", "ZWL", "VEF", "BTC", "cny", ""]) {
+      expect(isCurrency(code), code).toBe(false);
+    }
     for (const currency of ISO_4217) {
       expect(currency.code).toMatch(/^[A-Z]{3}$/);
       expect(currency.name.length).toBeGreaterThan(2);
@@ -39,6 +42,11 @@ describe("the master", () => {
     }
     expect(ISO_4217.find((c) => c.code === "JPY")).toMatchObject({ name: "Japanese Yen", minorUnits: 0 });
     expect(ISO_4217.find((c) => c.code === "KWD")).toMatchObject({ minorUnits: 3 });
+    // ISO's own names ride along for the picker's search.
+    expect(ISO_4217.find((c) => c.code === "AED")).toMatchObject({ name: "United Arab Emirates Dirham", isoName: "UAE Dirham" });
+    expect(ISO_4217.find((c) => c.code === "CNY")).toMatchObject({ name: "Chinese Yuan", isoName: "Yuan Renminbi", symbol: "¥" });
+    expect(ISO_4217.find((c) => c.code === "XCG")).toMatchObject({ name: "Caribbean Guilder" });
+    expect(new Set(ISO_4217.map((c) => c.code)).size).toBe(ISO_4217.length);
   });
 
   it("keeps ¥, $ and ₹ for CNY, USD and INR; another currency sharing one of them gets a longer form or its code", () => {
@@ -71,7 +79,7 @@ describe("GET /currencies", () => {
       expect(res.headers["cache-control"]).toBe("private, max-age=86400");
     }
     const res = await get("/currencies");
-    expect(res.body.currencies.find((c: { code: string }) => c.code === "AED")).toEqual({ code: "AED", name: "United Arab Emirates Dirham", symbol: "AED", minorUnits: 2 });
+    expect(res.body.currencies.find((c: { code: string }) => c.code === "AED")).toEqual({ code: "AED", name: "United Arab Emirates Dirham", isoName: "UAE Dirham", symbol: "AED", minorUnits: 2 });
   });
 });
 
@@ -91,13 +99,25 @@ describe("any currency of the master, and only those, for suppliers, orders and 
     expect(deposit.status, deposit.text).toBe(201);
     expect(deposit.body.deposit).toMatchObject({ currency: "AED", exchangeRate: 23.5 });
     expect((await ctx.db.select({ currency: supplierDeposits.currency }).from(supplierDeposits))[0]).toEqual({ currency: "AED" });
+    // A payment on the AED order: the amount in dirhams at its own typed rate, INR worked out from it.
+    const paid = await http
+      .post("/payments", { orderId: order.body.order.id, kind: "Balance", payeeRole: "supplier", agentId: null, amountCny: 20, paidOn: "2026-10-21", rateInr: 23.75, mode: "Bank transfer" })
+      .set("Cookie", accounts);
+    expect(paid.status, paid.text).toBe(201);
+    expect((await ctx.db.select({ amountCny: payments.amountCny, rateInr: payments.rateInr }).from(payments))[0]).toEqual({ amountCny: 20, rateInr: 23.75 });
+    // The supplier moves to a new rate, then to yen: the order, the deposit and the payment keep dirhams and their rates.
+    expect((await http.patch(`/suppliers/${aed.body.supplier.id}`, { exchangeRate: 24 }).set("Cookie", management)).status).toBe(200);
+    expect((await http.patch(`/suppliers/${aed.body.supplier.id}`, { currency: "JPY", exchangeRate: 0.57 }).set("Cookie", management)).status).toBe(200);
+    expect(await ctx.db.select({ currency: orders.currency, exchangeRate: orders.exchangeRate }).from(orders)).toEqual([{ currency: "AED", exchangeRate: 23.5 }]);
+    expect(await ctx.db.select({ currency: supplierDeposits.currency, exchangeRate: supplierDeposits.exchangeRate }).from(supplierDeposits)).toEqual([{ currency: "AED", exchangeRate: 23.5 }]);
+    expect((await ctx.db.select({ rateInr: payments.rateInr }).from(payments))[0]).toEqual({ rateInr: 23.75 });
     const jpy = await add({ name: "Osaka Textiles", currency: "JPY", exchangeRate: 0.58 });
     expect(jpy.status, jpy.text).toBe(201);
     expect((await get("/suppliers")).body.filter((row: { currency: string }) => ["AED", "JPY"].includes(row.currency))).toHaveLength(2);
   });
 
   it("refuses a code outside the master on a supplier, an order and a deposit, storing nothing", async () => {
-    for (const code of ["XAU", "ZZZ", "eur", "EURO"]) {
+    for (const code of ["XAU", "BGN", "ZZZ", "eur", "EURO"]) {
       const supplier = await add({ name: "Nope", currency: code, exchangeRate: 1 });
       expect(supplier.status, code).toBe(422);
       expect(supplier.body.error.fields).toEqual({ currency: CURRENCY });
