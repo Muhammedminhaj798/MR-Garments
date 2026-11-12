@@ -4,10 +4,10 @@ import { Router } from "express";
 import { z } from "zod";
 
 import { requirePermission } from "../../auth/current-user";
+import { currencyCode } from "../../currencies";
 import type { Database } from "../../db/client";
 import {
   type Currency,
-  CURRENCIES,
   items,
   orderLines,
   orders,
@@ -48,7 +48,7 @@ export const MESSAGES = {
   rateInr: "Enter the INR rate.",
   rateForInr: "Leave the rate empty for an INR order.",
   mode: "Enter the payment mode.",
-  currency: "Choose CNY, USD or INR.",
+  currency: "Choose a supported currency code (ISO 4217, such as CNY, USD or AED).",
   /** The order is in its supplier's currency (docs/supplier-currency.md); another one is refused. */
   supplierCurrency: (currency: string) => `This supplier's orders are in ${currency}.`,
   po: "Enter the PO number.",
@@ -92,8 +92,8 @@ const newOrder = z.strictObject({
   // kept as typed apart from the surrounding spaces. Left out, the server assigns the next PO-<number>.
   po: z.string({ error: M.po }).trim().min(1, M.po).max(PO_MAX_LENGTH, M.poTooLong).optional(),
   supplierId: z.uuid({ error: M.supplier }),
-  // The supplier's currency: left out, it is filled in; given, it must match (checkRules).
-  currency: z.enum(CURRENCIES, { error: M.currency }).optional(),
+  // The supplier's currency (any code of the currency master): left out, it is filled in; given, it must match (checkRules).
+  currency: currencyCode(M.currency).optional(),
   orderDate: z.iso.date({ error: M.orderDate }),
   deliveryDate: z.iso.date({ error: M.deliveryDate }),
   lines: lineList(line),

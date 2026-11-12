@@ -1,8 +1,9 @@
 import { and, count, eq, gte, lte, type SQL, sql } from "drizzle-orm";
 import { z } from "zod";
 
+import { orderedCurrencies } from "../../currencies";
 import type { Database } from "../../db/client";
-import { containerLines, containers, type Currency, CURRENCIES, orderLines, orders, payments, receipts, suppliers } from "../../db/schema";
+import { containerLines, containers, type Currency, orderLines, orders, payments, receipts, suppliers } from "../../db/schema";
 import { orderClosed } from "../orders/closure";
 import { round2, supplierMoney } from "../orders/money";
 import { addDays } from "../reports/reports";
@@ -21,9 +22,9 @@ const average = (values: number[]) => (values.length ? Math.round(sum(values, (v
 const daysBetween = (from: string, to: string) => Math.round((Date.parse(to) - Date.parse(from)) / 86_400_000);
 const distinct = <T>(values: T[]) => [...new Set(values)];
 
-/** One total per currency present (CNY, USD, INR order); amounts in different currencies are never added together. */
+/** One total per currency present (CNY, USD, INR, then the rest by code); amounts in different currencies are never added together. */
 export function byCurrency<T extends { currency: Currency }>(rows: T[], pick: (row: T) => number): MoneyTotal[] {
-  return CURRENCIES.filter((currency) => rows.some((row) => row.currency === currency)).map((currency) => ({
+  return orderedCurrencies(rows.map((row) => row.currency)).map((currency) => ({
     currency,
     amount: round2(sum(rows.filter((row) => row.currency === currency), pick)),
   }));
@@ -147,9 +148,10 @@ const shiftMonth = (month: string, by: number) => {
   return `${Math.floor(index / 12)}-${String((index % 12) + 1).padStart(2, "0")}`;
 };
 const amountIn = (totals: MoneyTotal[], currency: Currency) => totals.find((total) => total.currency === currency)?.amount ?? 0;
-/** Biggest first, currency by currency (CNY, then USD, then INR), then by name. */
+/** Biggest first, currency by currency (CNY, then USD, then INR, then the rest by code), then by name. */
 const byValue = <T extends { name: string; value: MoneyTotal[] }>(a: T, b: T) =>
-  CURRENCIES.reduce((order, currency) => order || amountIn(b.value, currency) - amountIn(a.value, currency), 0) || a.name.localeCompare(b.name);
+  orderedCurrencies([...a.value, ...b.value].map((total) => total.currency)).reduce((order, currency) => order || amountIn(b.value, currency) - amountIn(a.value, currency), 0) ||
+  a.name.localeCompare(b.name);
 
 /**
  * SUP-2: the Supplier Performance and Analytics tabs for the orders placed in `from`-`to` (order date) with the

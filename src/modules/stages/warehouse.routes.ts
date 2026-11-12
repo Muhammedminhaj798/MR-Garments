@@ -4,10 +4,10 @@ import { Router } from "express";
 import { z } from "zod";
 
 import { requirePermission } from "../../auth/current-user";
+import { orderedCurrencies } from "../../currencies";
 import type { Database } from "../../db/client";
 import {
   containers,
-  CURRENCIES,
   items,
   locations,
   orderLines,
@@ -147,7 +147,7 @@ async function previousOutstanding(db: Database, orderIds: string[], tripDate: s
       supplier: owner.name,
       currency: owner.currency,
       orders: rows.reduce((total, row) => total + row.orders, 0),
-      byCurrency: CURRENCIES.flatMap((currency) => rows.filter((row) => row.currency === currency).map((row) => ({ currency, amount: round2(row.amount) }))),
+      byCurrency: orderedCurrencies(rows.map((row) => row.currency)).flatMap((currency) => rows.filter((row) => row.currency === currency).map((row) => ({ currency, amount: round2(row.amount) }))),
     };
   });
 }

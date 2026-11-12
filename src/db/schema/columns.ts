@@ -9,9 +9,10 @@ export const ROLES = ["Management", "Procurement", "Accounts", "China staff", "I
 export type Role = (typeof ROLES)[number];
 export const STATUSES = ["Active", "Inactive"] as const;
 export type RecordStatus = (typeof STATUSES)[number];
-/** Order and supplier currencies. Stage costs (clearing, transport) are always INR. */
-export const CURRENCIES = ["CNY", "USD", "INR"] as const;
-export type Currency = (typeof CURRENCIES)[number];
+/** An ISO 4217 code of the currency master (src/currencies): a supplier's, order's or deposit's currency. Stage costs (clearing, transport) are always INR. */
+export type Currency = string;
+/** The database keeps the shape (three capitals); the API checks the code against the master (docs/supplier-currency.md). */
+export const CURRENCY_SHAPE = sql.raw("currency ~ '^[A-Z]{3}$'");
 export const LOCATION_TYPES = ["China office", "India office", "Warehouse"] as const;
 export type LocationType = (typeof LOCATION_TYPES)[number];
 

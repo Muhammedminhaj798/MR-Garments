@@ -133,17 +133,17 @@ describe("MD-2 POST /suppliers", () => {
     const unknown = await add({ ...NINGBO, openOrders: 3 });
     expect(unknown.status).toBe(400);
     expect(unknown.body.error.code).toBe("bad_request");
-    for (const other of ["EUR", "cny", ""]) {
+    for (const other of ["XAU", "cny", ""]) {
       const currency = await add({ ...NINGBO, currency: other });
       expect(currency.status, other).toBe(422);
-      expect(currency.body.error.fields).toEqual({ currency: "Choose CNY, USD or INR." });
+      expect(currency.body.error.fields).toEqual({ currency: "Choose a supported currency code (ISO 4217, such as CNY, USD or AED)." });
     }
     expect((await ctx.db.select().from(suppliers)).length).toBe(5);
   });
 
   it("the database refuses any other currency (check constraint, migration 0006)", async () => {
     const foshan = await idOf(ctx, suppliers, "Foshan Fabrics");
-    await expect(ctx.db.update(suppliers).set({ currency: "EUR" as "CNY" }).where(eq(suppliers.id, foshan))).rejects.toMatchObject({
+    await expect(ctx.db.update(suppliers).set({ currency: "eur" }).where(eq(suppliers.id, foshan))).rejects.toMatchObject({
       cause: { code: "23514", constraint: "suppliers_currency_check" },
     });
   });
@@ -314,7 +314,7 @@ describe("PATCH /suppliers/:id", () => {
     expect(res.body.supplier).toMatchObject({ name: "Yiwu Trims Ltd.", currency: "USD", exchangeRate: 88.25, hasTransactions: true });
     expect((await ctx.db.select({ currency: orders.currency }).from(orders).where(eq(orders.id, order.id)))[0]!.currency).toBe("CNY");
     expect((await edit(id, { currency: "INR" })).body.supplier).toMatchObject({ currency: "INR", exchangeRate: 1 });
-    expect((await edit(id, { currency: "EUR" })).body.error.fields).toEqual({ currency: "Choose CNY, USD or INR." });
+    expect((await edit(id, { currency: "XAU" })).body.error.fields).toEqual({ currency: "Choose a supported currency code (ISO 4217, such as CNY, USD or AED)." });
     expect((await edit(id, { currency: "CNY", exchangeRate: 11.5 })).status).toBe(200);
     await ctx.db.delete(orders).where(eq(orders.id, order.id));
   });

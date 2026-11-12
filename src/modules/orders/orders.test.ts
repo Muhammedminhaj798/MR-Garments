@@ -418,7 +418,7 @@ describe("currencies (migration 0006): CNY, USD and INR orders", () => {
       [{ supplierId: foshan, currency: "INR", deposits: [supplierDeposit({ rateInr: 12 })] }, { deposits: MESSAGES.rateForInr }],
       [{ supplierId: shenzhen, currency: "USD", deposits: [supplierDeposit({ rateInr: undefined })] }, { deposits: MESSAGES.rateInr }],
       [{ deposits: [supplierDeposit({ rateInr: undefined })] }, { deposits: MESSAGES.rateInr }],
-      [{ currency: "EUR" }, { currency: MESSAGES.currency }],
+      [{ currency: "XAU" }, { currency: MESSAGES.currency }],
       [{ currency: "usd" }, { currency: MESSAGES.currency }],
       // The order's currency is the supplier's (docs/supplier-currency.md): the deposit rule is checked for that currency.
       [{ currency: "USD" }, { currency: MESSAGES.supplierCurrency("CNY") }],
@@ -439,7 +439,7 @@ describe("currencies (migration 0006): CNY, USD and INR orders", () => {
 
   it("the database refuses any other currency (check constraint)", async () => {
     await expect(
-      ctx.db.insert(orders).values({ poNumber: "PO-1", supplierId: ids.supplier, orderDate: "2026-10-20", deliveryDate: "2026-10-30", currency: "EUR" as "CNY" }),
+      ctx.db.insert(orders).values({ poNumber: "PO-1", supplierId: ids.supplier, orderDate: "2026-10-20", deliveryDate: "2026-10-30", currency: "eur" }),
     ).rejects.toMatchObject({ cause: { code: "23514", constraint: "orders_currency_check" } });
   });
 });

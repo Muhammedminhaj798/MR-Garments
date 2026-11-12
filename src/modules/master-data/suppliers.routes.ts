@@ -3,7 +3,8 @@ import { Router } from "express";
 import { z } from "zod";
 
 import { requirePermission } from "../../auth/current-user";
-import { CURRENCIES, type Currency, orders, STATUSES, supplierDeposits, suppliers } from "../../db/schema";
+import { currencyCode } from "../../currencies";
+import { type Currency, orders, STATUSES, supplierDeposits, suppliers } from "../../db/schema";
 import { conflict, GENERIC_MESSAGE, HttpError, notFound, validationFailed } from "../../http/errors";
 import { parse } from "../../http/validate";
 import type { RouteContext } from "../context";
@@ -23,7 +24,7 @@ const CODE_SHAPE = "Use up to 20 letters, digits or dashes.";
 const CODE_TAKEN = "A supplier with this code already exists.";
 const EMAIL = "Enter a valid email address."; // M14
 const PHONE = "Enter a valid phone number.";
-const CURRENCY = "Choose CNY, USD or INR.";
+const CURRENCY = "Choose a supported currency code (ISO 4217, such as CNY, USD or AED).";
 export const RATE_MESSAGES = {
   rate: "Enter the exchange rate: INR per 1 unit, above 0, with at most 4 decimals.",
   rateForInr: "An INR supplier's rate is always 1.",
@@ -64,9 +65,9 @@ const fields = {
   paymentTerms: text(),
   taxNumber: text(),
   notes: text(1000),
-  // The supplier's one currency (docs/supplier-currency.md): its new orders and deposits are in it; a change leaves
-  // existing ones in their own currency. Left out on create: CNY.
-  currency: z.enum(CURRENCIES, { error: CURRENCY }).optional(),
+  // The supplier's one currency (docs/supplier-currency.md), any code of the currency master: its new orders and
+  // deposits are in it; a change leaves existing ones in their own currency. Left out on create: CNY.
+  currency: currencyCode(CURRENCY).optional(),
   /** INR per 1 unit of `currency`: above 0, at most 4 decimals; an INR supplier's is 1. Left out on create: not set. */
   exchangeRate: z
     .number({ error: RATE_MESSAGES.rate })

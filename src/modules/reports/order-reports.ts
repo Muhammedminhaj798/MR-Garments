@@ -1,8 +1,9 @@
 import { and, asc, count, eq, ilike, inArray, sql } from "drizzle-orm";
 import { z } from "zod";
 
+import { isCurrency, orderedCurrencies } from "../../currencies";
 import type { Database } from "../../db/client";
-import { CURRENCIES, items, locations, orderLines, orders, suppliers, warehouseReceiptLines, warehouseReceipts } from "../../db/schema";
+import { items, locations, orderLines, orders, suppliers, warehouseReceiptLines, warehouseReceipts } from "../../db/schema";
 import { loadLandedCosts } from "../costs/landed-cost";
 import { main, newestFirst, orderColumns, PO_MAX_LENGTH, round2, unitSymbol } from "../orders/orders.routes";
 import { orderFilter, supplierMoney } from "./reports";
@@ -30,7 +31,7 @@ export const orderReportsQuery = z
       .regex(/^[1-6]$/)
       .transform(Number)
       .optional(),
-    currency: z.enum(CURRENCIES).optional(),
+    currency: z.string().refine(isCurrency).optional(),
     warehouseId: z.uuid().optional(),
     paymentStatus: z.enum(PAYMENT_STATES).optional(),
   })
@@ -140,7 +141,7 @@ export async function orderReports(db: Database, q: Query) {
     rows: list,
     summary: {
       orders: list.length,
-      byCurrency: CURRENCIES.filter((currency) => list.some((row) => row.currency === currency)).map((currency) => {
+      byCurrency: orderedCurrencies(list.map((row) => row.currency)).map((currency) => {
         const inCurrency = list.filter((row) => row.currency === currency);
         return {
           currency,

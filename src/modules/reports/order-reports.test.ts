@@ -443,7 +443,7 @@ describe("RPT-O2 GET /reports/orders", () => {
   });
 
   it("is 400 for a malformed query", async () => {
-    const bad = ["status=done", "paymentStatus=half", "supplierId=abc", "warehouseId=1", "from=2026-13-01", "from=2026-10-02&to=2026-10-01", "foo=1", "po=x&po=y", `po=${"x".repeat(51)}`, "stage=7", "stage=a", "currency=EUR", `supplier=${"s".repeat(201)}`];
+    const bad = ["status=done", "paymentStatus=half", "supplierId=abc", "warehouseId=1", "from=2026-13-01", "from=2026-10-02&to=2026-10-01", "foo=1", "po=x&po=y", `po=${"x".repeat(51)}`, "stage=7", "stage=a", "currency=XAU", `supplier=${"s".repeat(201)}`];
     for (const query of bad) {
       const res = await http.get(`/reports/orders?${query}`).set("Cookie", suresh);
       expect(res.status, query).toBe(400);

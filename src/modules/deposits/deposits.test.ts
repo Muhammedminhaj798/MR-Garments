@@ -150,7 +150,7 @@ describe("SD-2 POST /suppliers/:supplierId/deposits", () => {
       [{ amount: "100" }, { amount: MESSAGES.amount }],
       [{ amount: 1e12 }, { amount: MESSAGES.amount }],
       [{ amount: 12.345 }, { amount: MESSAGES.amount }],
-      [{ currency: "EUR" }, { currency: MESSAGES.currency }],
+      [{ currency: "XAU" }, { currency: MESSAGES.currency }],
       [{ openedOn: undefined }, { openedOn: MESSAGES.openedOn }],
       [{ openedOn: "20-10-2026" }, { openedOn: MESSAGES.openedOn }],
       [{ openedOn: indiaDay(1) }, { openedOn: MESSAGES.future }],

@@ -332,7 +332,7 @@ Messages (`MESSAGES` in deposits.routes.ts; 422 `validation_failed` under the fi
 | direction | Choose Give or Receive. |
 | amount (0.01 .. 999,999,999,999, 2 decimals) | Enter an amount above 0. |
 | amount (SD-3, more than pending) | Only ¥1,234.50 left to settle. (pending in the deposit's currency: ¥, $ or ₹, Indian grouping, 2 decimals unless whole) |
-| currency | Choose CNY, USD or INR. |
+| currency | Choose a supported currency code (ISO 4217, such as CNY, USD or AED). |
 | openedOn (missing or malformed) | Enter the date the deposit was agreed. |
 | paidOn (missing or malformed) | Enter the date of the payment or receipt. |
 | openedOn / paidOn after today in India | The date can't be in the future. |

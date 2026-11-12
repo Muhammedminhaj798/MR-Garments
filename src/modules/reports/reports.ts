@@ -1,12 +1,12 @@
 import { and, asc, desc, eq, gte, lt, lte, type SQL, sql } from "drizzle-orm";
 
+import { compareCurrencies, orderedCurrencies } from "../../currencies";
 import type { Database } from "../../db/client";
 import {
   clearings,
   containerLines,
   containers,
   type Currency,
-  CURRENCIES,
   items,
   orderLines,
   orders,
@@ -38,11 +38,11 @@ const daysBetween = (from: string, to: string) => (Date.parse(to) - Date.parse(f
 const sum = <T>(rows: T[], pick: (row: T) => number) => rows.reduce((total, row) => total + pick(row), 0);
 
 /**
- * Totals of order-currency money, one per currency the rows have (CNY, USD, INR order): amounts in different
- * currencies are never added together, and none is converted (no rate is known for them).
+ * Totals of order-currency money, one per currency the rows have (CNY, USD, INR, then the rest by code): amounts in
+ * different currencies are never added together, and none is converted (no rate is known for them).
  */
 function byCurrency<T extends { currency: Currency }>(rows: T[], pick: (row: T) => number) {
-  return CURRENCIES.filter((currency) => rows.some((row) => row.currency === currency)).map((currency) => ({
+  return orderedCurrencies(rows.map((row) => row.currency)).map((currency) => ({
     currency,
     amount: round2(sum(rows.filter((row) => row.currency === currency), pick)),
   }));
@@ -248,10 +248,9 @@ export async function paymentsPerSupplier(db: Database, f: Filters, today: strin
     const row = bySupplier.get(key) ?? { supplierId: order.supplierId, supplier: order.supplier, currency: order.currency, orders: [], orderValueCny: 0, paidCny: 0, paidInr: 0 };
     bySupplier.set(key, { ...row, orders: [...row.orders, order.po], orderValueCny: row.orderValueCny + order.orderValueCny, paidCny: row.paidCny + order.paidCny, paidInr: row.paidInr + order.paidInr });
   }
-  const rank = (currency: Currency) => CURRENCIES.indexOf(currency);
   const rows = [...bySupplier.values()]
     .map((row) => ({ ...row, orderValueCny: round2(row.orderValueCny), paidCny: round2(row.paidCny), paidInr: round2(row.paidInr), balanceCny: round2(row.orderValueCny - row.paidCny) }))
-    .sort((a, b) => rank(a.currency) - rank(b.currency) || b.orderValueCny - a.orderValueCny || a.supplier.localeCompare(b.supplier));
+    .sort((a, b) => compareCurrencies(a.currency, b.currency) || b.orderValueCny - a.orderValueCny || a.supplier.localeCompare(b.supplier));
   const totalsOf = (list: typeof rows) => {
     const total = (pick: (row: (typeof rows)[number]) => number) => round2(sum(list, pick));
     return {
@@ -265,7 +264,7 @@ export async function paymentsPerSupplier(db: Database, f: Filters, today: strin
   return {
     suppliers: rows,
     totals: totalsOf(inCny(rows)),
-    totalsByCurrency: CURRENCIES.filter((currency) => rows.some((row) => row.currency === currency)).map((currency) => ({
+    totalsByCurrency: orderedCurrencies(rows.map((row) => row.currency)).map((currency) => ({
       currency,
       ...totalsOf(rows.filter((row) => row.currency === currency)),
     })),

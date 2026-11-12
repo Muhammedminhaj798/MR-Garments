@@ -1,8 +1,9 @@
 import { and, asc, desc, eq, gte, lte, type SQL, sql } from "drizzle-orm";
 import { z } from "zod";
 
+import { compareCurrencies } from "../../currencies";
 import type { Database } from "../../db/client";
-import { CURRENCIES, items, orderLines, orders, payments, suppliers } from "../../db/schema";
+import { items, orderLines, orders, payments, suppliers } from "../../db/schema";
 import { notFound } from "../../http/errors";
 import { orderClosed } from "../orders/closure";
 import { main, newestFirst, orderColumns, round2, unitSymbol } from "../orders/orders.routes";
@@ -195,7 +196,7 @@ export async function supplierPaymentDetail(db: Database, supplierId: string, q:
       lineItems: lineCounts?.all ?? 0,
       products: lineCounts?.products ?? 0,
       byCurrency: currencies
-        .sort((a, b) => CURRENCIES.indexOf(a.currency) - CURRENCIES.indexOf(b.currency))
+        .sort((a, b) => compareCurrencies(a.currency, b.currency))
         .map((row) => ({
           currency: row.currency,
           orders: row.orders,

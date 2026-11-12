@@ -1,7 +1,7 @@
 import { sql } from "drizzle-orm";
 import { check, date, index, numeric, pgTable, text, uuid } from "drizzle-orm/pg-core";
 
-import { type Currency, CURRENCIES, inList, timestamps } from "./columns";
+import { type Currency, CURRENCY_SHAPE, inList, timestamps } from "./columns";
 import { suppliers } from "./core";
 
 // Migration 0008 (docs/phase2-contracts.md section 2): supplier-level deposits, money agreed with a supplier outside
@@ -38,7 +38,7 @@ export const supplierDeposits = pgTable(
   (t) => [
     index("supplier_deposits_supplier_idx").on(t.supplierId),
     check("supplier_deposits_direction_check", inList("direction", DEPOSIT_DIRECTIONS)),
-    check("supplier_deposits_currency_check", inList("currency", CURRENCIES)),
+    check("supplier_deposits_currency_check", CURRENCY_SHAPE),
     check("supplier_deposits_exchange_rate_check", sql`exchange_rate is null or exchange_rate > 0`),
     check("supplier_deposits_amount_check", sql`amount > 0`),
   ],

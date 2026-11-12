@@ -72,7 +72,7 @@ backend returns exactly those shapes. Summary:
   `rateInr` required unless the order is INR, where it must be left out or 1 and is stored as 1; otherwise 422 on
   `deposits`: "Enter the INR rate." / "Leave the rate empty for an INR order.").
   201 `{ order: { id, po } }`. 422 `validation_failed` with fields `po`, `supplierId`, `orderDate`, `deliveryDate`
-  ("The delivery date can't be before the order date."), `currency` ("Choose CNY, USD or INR."), `lines`, `deposits`. Inactive or unknown supplier/item: 422 on
+  ("The delivery date can't be before the order date."), `currency` ("Choose a supported currency code (ISO 4217, such as CNY, USD or AED)."), `lines`, `deposits`. Inactive or unknown supplier/item: 422 on
   that field. An agent deposit's `payee` must be an active shipping agent's name (any letter case), read inside the
   transaction with the agent's row locked `FOR SHARE`, otherwise 422 on `deposits` "Choose who the deposit was paid
   to." (2026-11-04, so agent payments always match an agent: see wave3-contracts 4.1). One transaction.

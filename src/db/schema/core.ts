@@ -1,7 +1,7 @@
 import { sql } from "drizzle-orm";
 import { check, index, json, numeric, pgTable, primaryKey, smallint, text, timestamp, uniqueIndex, uuid, varchar } from "drizzle-orm/pg-core";
 
-import { citext, type Currency, CURRENCIES, inList, LOCATION_TYPES, ROLES, status, STATUSES, timestamps } from "./columns";
+import { citext, type Currency, CURRENCY_SHAPE, inList, LOCATION_TYPES, ROLES, status, STATUSES, timestamps } from "./columns";
 
 // Migration 0001: sign-in, users and suppliers. Coordinator-owned.
 
@@ -124,7 +124,7 @@ export const suppliers = pgTable(
     uniqueIndex("suppliers_code_unique")
       .on(sql`upper(${t.code})`)
       .where(sql`code <> ''`),
-    check("suppliers_currency_check", inList("currency", CURRENCIES)),
+    check("suppliers_currency_check", CURRENCY_SHAPE),
     check("suppliers_exchange_rate_check", sql`exchange_rate is null or exchange_rate > 0`),
     check("suppliers_inr_rate_check", sql`currency <> 'INR' or coalesce(exchange_rate, 0) = 1`),
     check("suppliers_status_check", inList("status", STATUSES)),

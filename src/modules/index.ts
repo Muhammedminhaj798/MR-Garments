@@ -5,6 +5,7 @@ import { passwordRoutes } from "./auth/password.routes";
 import type { RouteContext } from "./context";
 import { coreRoutes } from "./core/core.routes";
 import { clearingAgentsRoutes } from "./master-data/clearing-agents.routes";
+import { currenciesRoutes } from "./master-data/currencies.routes";
 import { itemsRoutes } from "./master-data/items.routes";
 import { locationsRoutes } from "./master-data/locations.routes";
 import { shippingAgentsRoutes } from "./master-data/shipping-agents.routes";
@@ -33,6 +34,7 @@ export function apiRoutes(ctx: RouteContext) {
   router.use(usersRoutes(ctx));
   router.use(profileRoutes(ctx));
   router.use(suppliersRoutes(ctx));
+  router.use(currenciesRoutes(ctx));
   router.use(shippingAgentsRoutes(ctx));
   router.use(clearingAgentsRoutes(ctx));
   router.use(transportCompaniesRoutes(ctx));

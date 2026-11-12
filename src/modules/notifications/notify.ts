@@ -1,5 +1,6 @@
 import { and, eq, ne } from "drizzle-orm";
 
+import { currencySymbol } from "../../currencies";
 import type { Database } from "../../db/client";
 import { type Currency, NOTIFICATION_KINDS, type NotificationKind, notifications, type Role, users, userStageGrants } from "../../db/schema";
 import { atLeast, type Capability, effectiveAccess } from "../../permissions/matrix";
@@ -61,10 +62,12 @@ export async function notify(tx: Pick<Database, "select" | "insert">, event: Not
 
 const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
 
-const SYMBOL: Record<Currency, string> = { CNY: "¥", USD: "$", INR: "₹" };
-/** ¥1,41,000, $2,345.60 or ₹0.50: the order currency's symbol and Indian digit grouping, as the frontend shows money. */
-export const money = (amount: number, currency: Currency) =>
-  `${SYMBOL[currency]}${amount.toLocaleString("en-IN", { minimumFractionDigits: Number.isInteger(amount) ? 0 : 2, maximumFractionDigits: 2 })}`;
+/** ¥1,41,000, $2,345.60, ₹0.50 or "AED 1,200": the currency's symbol (its code, spaced, when it has none) and Indian digit grouping, as the frontend shows money. */
+export const money = (amount: number, currency: Currency) => {
+  const symbol = currencySymbol(currency);
+  const sep = /[A-Za-z]$/.test(symbol) ? " " : "";
+  return `${symbol}${sep}${amount.toLocaleString("en-IN", { minimumFractionDigits: Number.isInteger(amount) ? 0 : 2, maximumFractionDigits: 2 })}`;
+};
 /** 1,800 pcs */
 export const qty = (value: number, unit: string) => `${value.toLocaleString("en-IN")} ${unit}`;
 /** 30 Sep 2026, from YYYY-MM-DD (the frontend's formatDate). */

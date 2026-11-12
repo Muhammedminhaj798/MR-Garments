@@ -4,7 +4,8 @@ import { z } from "zod";
 
 import { requirePermission } from "../../auth/current-user";
 import type { Database } from "../../db/client";
-import { CURRENCIES, DEPOSIT_DIRECTIONS, orders, payments, supplierDeposits, supplierDepositTransactions, suppliers } from "../../db/schema";
+import { compareCurrencies, currencyCode } from "../../currencies";
+import { DEPOSIT_DIRECTIONS, orders, payments, supplierDeposits, supplierDepositTransactions, suppliers } from "../../db/schema";
 import { conflict, notFound, validationFailed } from "../../http/errors";
 import { parse } from "../../http/validate";
 import type { RouteContext } from "../context";
@@ -22,7 +23,7 @@ import { isUuid, todayInIndia } from "../stages/common";
 export const MESSAGES = {
   direction: "Choose Give or Receive.",
   amount: "Enter an amount above 0.",
-  currency: "Choose CNY, USD or INR.",
+  currency: "Choose a supported currency code (ISO 4217, such as CNY, USD or AED).",
   /** SD-2: the deposit's currency must be the supplier's (docs/supplier-currency.md). */
   supplierCurrency: (currency: string) => `This supplier's deposits are in ${currency}.`,
   openedOn: "Enter the date the deposit was agreed.",
@@ -52,7 +53,7 @@ const newDeposit = z.strictObject({
   direction: z.enum(DEPOSIT_DIRECTIONS, { error: M.direction }),
   amount,
   /** Left out: the supplier's currency; given, it must be the supplier's. */
-  currency: z.enum(CURRENCIES, { error: M.currency }).optional(),
+  currency: currencyCode(M.currency).optional(),
   openedOn: notAfterToday(M.openedOn),
   reference,
   notes,
@@ -108,7 +109,7 @@ export function toRow(row: Loaded) {
 }
 export type SupplierDepositRow = ReturnType<typeof toRow>;
 
-/** Give and receive are never netted: one summary line per (currency, direction) that has a deposit, CNY, USD, INR order. */
+/** Give and receive are never netted: one summary line per (currency, direction) that has a deposit, CNY, USD, INR, then the rest by code. */
 export function summarise(rows: SupplierDepositRow[]) {
   const lines = new Map<string, { currency: Loaded["currency"]; direction: Loaded["direction"]; amount: number; settled: number; pending: number }>();
   for (const row of rows) {
@@ -120,7 +121,7 @@ export function summarise(rows: SupplierDepositRow[]) {
     lines.set(key, line);
   }
   return [...lines.values()].sort(
-    (a, b) => CURRENCIES.indexOf(a.currency) - CURRENCIES.indexOf(b.currency) || DEPOSIT_DIRECTIONS.indexOf(a.direction) - DEPOSIT_DIRECTIONS.indexOf(b.direction),
+    (a, b) => compareCurrencies(a.currency, b.currency) || DEPOSIT_DIRECTIONS.indexOf(a.direction) - DEPOSIT_DIRECTIONS.indexOf(b.direction),
   );
 }
 
