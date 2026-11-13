@@ -4,6 +4,7 @@ import { alias } from "drizzle-orm/pg-core";
 import type { Database } from "../../db/client";
 import { containerLines, containers, items, orderLines, orders, payments, suppliers, teams, warehouseReceiptLines, warehouseReceipts } from "../../db/schema";
 import { loadLandedCosts } from "../costs/landed-cost";
+import { orderMoney } from "../orders/money";
 import { round2, unitSymbol } from "../orders/orders.routes";
 
 // GET /landed-cost (docs/wave3-contracts.md sections 6.4 and 8): one row per order with any cost so far, newest first.
@@ -28,6 +29,11 @@ export async function landedCostList(db: Database, { supplierId, teamId }: { sup
       item: items.name,
       unit: unitSymbol,
       quantity: main.quantity,
+      // The PO in its own currency and the rate saved on the order (0012; null for older orders), for the report
+      // download (docs/report-downloads.md). The landed cost's goods stay the payments at their own rates.
+      orderDate: orders.orderDate,
+      orderValueCny: orderMoney.orderValueCny,
+      exchangeRate: orders.exchangeRate,
     })
     .from(orders)
     .innerJoin(suppliers, eq(suppliers.id, orders.supplierId))

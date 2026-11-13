@@ -240,6 +240,35 @@ export function ordersRoutes({ db }: RouteContext) {
     );
   });
 
+  // ORD-7 (docs/report-downloads.md): every line of every order, ORD-1's order then position, for the Orders report's
+  // item sheet. `rateCny` is the rate saved on the line, never the item's price now; received (China) and stocked
+  // (India warehouse) are per line. Its own path, as /orders/:po would take "lines" for a PO number.
+  router.get("/order-lines", requirePermission("ordersView", "View"), async (_req, res) => {
+    const ofLine = sql`${receiptLines.orderLineId} = ${orderLines.id}`;
+    const stockedOfLine = sql`${warehouseReceiptLines.orderLineId} = ${orderLines.id}`;
+    const rows = await db
+      .select({
+        orderId: orders.id,
+        po: orders.poNumber,
+        currency: orders.currency,
+        position: orderLines.position,
+        item: items.name,
+        unit: unitSymbol,
+        quantity: orderLines.quantity,
+        rateCny: orderLines.rateCny,
+        valueCny: sql<number>`round(${orderLines.quantity} * ${orderLines.rateCny}, 2)`.mapWith(Number),
+        received: sql<number>`(select coalesce(sum(${receiptLines.quantity}), 0) from ${receiptLines} where ${ofLine})`.mapWith(Number),
+        stocked: sql<number>`(select coalesce(sum(${warehouseReceiptLines.quantity}), 0) from ${warehouseReceiptLines}
+          join ${warehouseReceipts} on ${warehouseReceipts.id} = ${warehouseReceiptLines.receiptId} and ${warehouseReceipts.status} = 'stocked'
+          where ${stockedOfLine})`.mapWith(Number),
+      })
+      .from(orderLines)
+      .innerJoin(orders, eq(orders.id, orderLines.orderId))
+      .innerJoin(items, eq(items.id, orderLines.itemId))
+      .orderBy(...newestFirst, asc(orderLines.position));
+    res.json(rows);
+  });
+
   // ORD-2. What the new-order form offers; readable by anyone who can open Orders (no Settings access needed).
   router.get("/orders/options", requirePermission("ordersView", "View"), async (_req, res) => {
     const [po, supplierRows, itemRows, agents] = await Promise.all([

@@ -73,6 +73,11 @@ describe("CLR-1 GET /clearings", () => {
       orders: waiting.orders.map((order) => order.po),
       status: "waiting",
       clearingCostInr: 0,
+      goodsValueInr: null,
+      customsDutyInr: null,
+      otherDutiesInr: null,
+      agentChargesInr: null,
+      portChargesInr: null,
       trip: null,
     });
     expect(draft).toMatchObject({ agent: { id: m.southern, name: "Southern Port Agents" }, arrivedOn: indiaDay(-3), status: "in_clearing", clearingCostInr: 37050 });

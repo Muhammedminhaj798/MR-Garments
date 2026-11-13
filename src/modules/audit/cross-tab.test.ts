@@ -174,11 +174,13 @@ async function expectConsistent(want: Expected) {
   for (const c of listed as { id: string }[]) {
     const d = await get(`/containers/${c.id}`);
     expect(d.status).toBe(200);
-    const { lines, portOfLoading, portOfArrival, ...rest } = d.body;
+    const { lines, ...rest } = d.body;
     expect(lines.length).toBeGreaterThan(0);
-    expect(typeof portOfLoading).toBe("string");
-    expect(typeof portOfArrival).toBe("string");
-    expect(rest).toEqual(c1.body.find((x: { id: string }) => x.id === c.id));
+    expect(typeof rest.portOfLoading).toBe("string");
+    expect(typeof rest.portOfArrival).toBe("string");
+    // CON-1 adds each order's supplier (report downloads); CON-4 names the POs only.
+    const row = c1.body.find((x: { id: string }) => x.id === c.id);
+    expect(rest).toEqual({ ...row, orders: row.orders.map((o: { po: string; part: boolean }) => ({ po: o.po, part: o.part })) });
     expect(rest.bundles).toBe(lines.reduce((sum: number, l: { bundles: number }) => sum + l.bundles, 0));
   }
   return { ord1, detail };
@@ -322,7 +324,7 @@ describe("one order across all five tabs", () => {
     expect(over.status).toBe(422); // 60 loaded + 31 > 90 received
     // Both containers hold only part of the order's lines, so both are `part`.
     const list = await get("/containers");
-    for (const id of containerIds) expect(list.body.find((c: { id: string }) => c.id === id).orders).toEqual([{ po: order.po, part: true }]);
+    for (const id of containerIds) expect(list.body.find((c: { id: string }) => c.id === id).orders).toMatchObject([{ po: order.po, part: true }]);
   });
 
   it("CON-5 concurrency: two simultaneous sea moves, exactly one 200; stages untouched", async () => {

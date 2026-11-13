@@ -27,6 +27,8 @@ export const detailQuery = z
     paymentsPage: page,
     ordersPage: page,
     linesPage: page,
+    // The report download (docs/report-downloads.md): every row of each list in one answer, the pages ignored.
+    all: z.literal("1").optional(),
   })
   .refine((q) => (!q.from || !q.to || q.from <= q.to) && (!q.paymentFrom || !q.paymentTo || q.paymentFrom <= q.paymentTo));
 type DetailQuery = z.infer<typeof detailQuery>;
@@ -34,6 +36,8 @@ type DetailQuery = z.infer<typeof detailQuery>;
 const count = sql<number>`count(*)`.mapWith(Number);
 const sumOf = (column: SQL.Aliased<number>) => sql<number>`coalesce(sum(${column}), 0)`.mapWith(Number);
 const pageOf = <T>(rows: T[], total: number, page: number) => ({ rows, total, page, pageSize: PAGE_SIZE });
+// ponytail: `all` lists at most this many rows per list; page the download if one supplier ever has more.
+const ALL_ROWS = 100_000;
 
 /** The supplier's detail, or 404 for a malformed or unknown id. Seven queries, none per row. */
 export async function supplierPaymentDetail(db: Database, supplierId: string, q: DetailQuery) {
@@ -66,7 +70,8 @@ export async function supplierPaymentDetail(db: Database, supplierId: string, q:
 
   const scope = orderFilter({ supplierId, from: q.from, to: q.to });
   const pages = { payments: q.paymentsPage ?? 1, orders: q.ordersPage ?? 1, lines: q.linesPage ?? 1 };
-  const offset = (n: number) => (n - 1) * PAGE_SIZE;
+  const offset = (n: number) => (q.all ? 0 : (n - 1) * PAGE_SIZE);
+  const limit = q.all ? ALL_ROWS : PAGE_SIZE;
   const paymentDay = sql`coalesce(${payments.paidOn}, ${payments.dueDate})`;
   const inPaymentRange = and(q.paymentFrom ? gte(paymentDay, q.paymentFrom) : undefined, q.paymentTo ? lte(paymentDay, q.paymentTo) : undefined) ?? sql`true`;
   const ofSupplier = and(scope, eq(payments.payeeRole, "supplier"));
@@ -138,7 +143,7 @@ export async function supplierPaymentDetail(db: Database, supplierId: string, q:
       .where(and(ofSupplier, inPaymentRange))
       // PAY-1's order; the id last keeps pages stable when payments share a timestamp (one insert).
       .orderBy(desc(paymentDay), desc(payments.createdAt), desc(payments.id))
-      .limit(PAGE_SIZE)
+      .limit(limit)
       .offset(offset(pages.payments)),
     db
       .select({
@@ -161,7 +166,7 @@ export async function supplierPaymentDetail(db: Database, supplierId: string, q:
       .innerJoin(items, eq(items.id, main.itemId))
       .where(and(scope, q.stage ? eq(orders.stage, q.stage) : undefined))
       .orderBy(...newestFirst)
-      .limit(PAGE_SIZE)
+      .limit(limit)
       .offset(offset(pages.orders)),
     db
       .select({
@@ -181,7 +186,7 @@ export async function supplierPaymentDetail(db: Database, supplierId: string, q:
       .innerJoin(items, eq(items.id, orderLines.itemId))
       .where(scope)
       .orderBy(...newestFirst, asc(orderLines.position))
-      .limit(PAGE_SIZE)
+      .limit(limit)
       .offset(offset(pages.lines)),
   ]);
 

@@ -86,6 +86,12 @@ describe("TRN-1 GET /transports", () => {
       status: "on_road",
       costInr: 2650,
       warehouseReceipt: null,
+      freightInr: 2200,
+      handlingInr: 450,
+      destination: "Main warehouse",
+      driverName: "Suresh P",
+      shortRemark: "",
+      quantities: [{ unit: "pcs", quantity: 100 }],
     });
     expect(res.body.rows[1]).toMatchObject({ id: short.tripId, status: "unloaded", unloadedOn: indiaDay(-3), bundlesReceived: 3, costInr: 1000.5 });
     expect(res.body.ready).toEqual([

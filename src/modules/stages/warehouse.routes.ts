@@ -24,7 +24,7 @@ import { loadLandedCosts } from "../costs/landed-cost";
 import type { RouteContext } from "../context";
 import { notify } from "../notifications/notify";
 import { atLeast, effectiveAccess } from "../../permissions/matrix";
-import { round2 } from "../orders/orders.routes";
+import { round2, unitSymbol } from "../orders/orders.routes";
 import { supplierMoney } from "../reports/reports";
 import { moveOrdersToStage, settleStages } from "../stages-shared";
 import {
@@ -91,9 +91,12 @@ type RowTotals = {
   /** Pieces per team id. */
   teams: Record<string, number>;
   costPerPieceInr: number | null;
+  /** The order's lines on this receipt, all teams together (docs/report-downloads.md): `ordered` is the line's quantity. */
+  lines: { orderLineId: string; item: string; unit: string; ordered: number; quantity: number }[];
 };
 
 const mainLine = alias(orderLines, "main_line");
+const mainItem = alias(items, "main_item");
 /** A draft receipt's warehouse, next to the trip's destination. */
 const draftLocation = alias(locations, "draft_location");
 
@@ -173,10 +176,17 @@ export function warehouseRoutes({ db }: RouteContext) {
           bundlesReceived: warehouseReceipts.bundlesReceived,
           orderId: orders.id,
           po: orders.poNumber,
-          item: items.name,
+          item: mainItem.name,
           supplier: suppliers.name,
           teamId: warehouseReceiptLines.teamId,
           quantity: warehouseReceiptLines.quantity,
+          // The line itself and the trip's bundles and remark, for the report download.
+          orderLineId: orderLines.id,
+          lineItem: items.name,
+          lineUnit: unitSymbol,
+          ordered: orderLines.quantity,
+          bundlesLoaded: transports.bundlesLoaded,
+          shortRemark: transports.shortRemark,
         })
         .from(warehouseReceiptLines)
         .innerJoin(warehouseReceipts, and(eq(warehouseReceipts.id, warehouseReceiptLines.receiptId), eq(warehouseReceipts.status, "stocked")))
@@ -187,8 +197,9 @@ export function warehouseRoutes({ db }: RouteContext) {
         .innerJoin(orders, eq(orders.id, orderLines.orderId))
         .innerJoin(suppliers, eq(suppliers.id, orders.supplierId))
         .innerJoin(mainLine, and(eq(mainLine.orderId, orders.id), eq(mainLine.position, 0)))
-        .innerJoin(items, eq(items.id, mainLine.itemId))
-        .orderBy(desc(warehouseReceipts.receivedOn), desc(warehouseReceipts.createdAt), asc(warehouseReceipts.id), asc(orders.poNumber)),
+        .innerJoin(mainItem, eq(mainItem.id, mainLine.itemId))
+        .innerJoin(items, eq(items.id, orderLines.itemId))
+        .orderBy(desc(warehouseReceipts.receivedOn), desc(warehouseReceipts.createdAt), asc(warehouseReceipts.id), asc(orders.poNumber), asc(orderLines.position)),
       db
         .select({
           transportId: transports.id,
@@ -247,8 +258,9 @@ export function warehouseRoutes({ db }: RouteContext) {
       return { received: Object.values(teamsOf).reduce((sum, pieces) => sum + pieces, 0), teams: teamsOf };
     };
     // Lines arrive grouped by receipt and PO, so the rows keep that order.
-    const rows = new Map<string, Omit<(typeof lines)[number], "teamId" | "quantity" | "locationId" | "locationName"> & RowTotals>();
-    for (const { teamId, quantity, locationId, locationName, ...line } of lines) {
+    type Line = (typeof lines)[number];
+    const rows = new Map<string, Omit<Line, "teamId" | "quantity" | "locationId" | "locationName" | "orderLineId" | "lineItem" | "lineUnit" | "ordered"> & RowTotals>();
+    for (const { teamId, quantity, locationId, locationName, orderLineId, lineItem, lineUnit, ordered, ...line } of lines) {
       const key = `${line.receiptId}:${line.orderId}`;
       const row = rows.get(key) ?? {
         ...line,
@@ -257,9 +269,13 @@ export function warehouseRoutes({ db }: RouteContext) {
         received: 0,
         teams: {},
         costPerPieceInr: costs?.get(line.orderId)?.perPieceInr ?? null,
+        lines: [],
       };
       row.received += quantity;
       row.teams[teamId] = (row.teams[teamId] ?? 0) + quantity;
+      const own = row.lines.find((entry) => entry.orderLineId === orderLineId);
+      if (own) own.quantity += quantity;
+      else row.lines.push({ orderLineId, item: lineItem, unit: lineUnit, ordered, quantity });
       rows.set(key, row);
     }
     res.json({

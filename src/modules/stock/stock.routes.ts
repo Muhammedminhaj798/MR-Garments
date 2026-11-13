@@ -164,6 +164,9 @@ export function stockRoutes({ db }: RouteContext) {
             and (${earlier.receivedOn}, ${earlier.createdAt}) <= (${receipts.receivedOn}, ${receipts.createdAt}))`.mapWith(Number),
         bundles: receipts.bundles,
         receivedBy: users.name,
+        // The receipt's notes, for the report download (docs/report-downloads.md).
+        deliveryNote: receipts.deliveryNote,
+        shortRemark: receipts.shortRemark,
       })
       .from(receipts)
       .innerJoin(orders, eq(orders.id, receipts.orderId))
@@ -181,6 +184,7 @@ export function stockRoutes({ db }: RouteContext) {
         quantity: receiptLines.quantity,
         item: items.name,
         unit: unitSymbol,
+        ordered: orderLines.quantity,
         received: receivedOf(),
         loaded: loadedOf(),
       })
@@ -205,7 +209,10 @@ export function stockRoutes({ db }: RouteContext) {
         return {
           ...row,
           receivedBy: receivedBy ?? "",
-          lines: own.filter((line) => line.quantity > 0).map((line) => ({ item: line.item, unit: line.unit, quantity: line.quantity })),
+          // `ordered`: the order line's quantity; `received`: that line's total over every receipt so far.
+          lines: own
+            .filter((line) => line.quantity > 0)
+            .map((line) => ({ item: line.item, unit: line.unit, quantity: line.quantity, ordered: line.ordered, received: line.received })),
           containers: [...new Set(held.filter((h) => loaded.has(h.orderLineId)).map((h) => h.number))],
         };
       }),
@@ -370,6 +377,9 @@ export function stockRoutes({ db }: RouteContext) {
         eta: containers.eta,
         etaEstimated: containers.etaEstimated,
         status: containers.status,
+        // For the report download (docs/report-downloads.md).
+        portOfLoading: containers.portOfLoading,
+        portOfArrival: containers.portOfArrival,
       })
       .from(containers)
       .innerJoin(shippingAgents, eq(shippingAgents.id, containers.shippingAgentId))
@@ -384,10 +394,12 @@ export function stockRoutes({ db }: RouteContext) {
         quantity: containerLines.quantity,
         orderId: orderLines.orderId,
         po: orders.poNumber,
+        supplier: suppliers.name,
       })
       .from(containerLines)
       .innerJoin(orderLines, eq(orderLines.id, containerLines.orderLineId))
       .innerJoin(orders, eq(orders.id, orderLines.orderId))
+      .innerJoin(suppliers, eq(suppliers.id, orders.supplierId))
       .where(
         inArray(
           containerLines.containerId,
@@ -403,12 +415,13 @@ export function stockRoutes({ db }: RouteContext) {
       rows.map((row) => {
         const mine = loaded.filter((line) => line.containerId === row.id);
         const inThis = new Map(mine.map((line) => [line.orderLineId, line.quantity]));
-        const pos = new Map(mine.map((line) => [line.orderId, line.po]));
+        const pos = new Map(mine.map((line) => [line.orderId, line]));
         return {
           ...row,
           bundles: mine.reduce((sum, line) => sum + line.bundles, 0),
-          orders: [...pos].map(([orderId, po]) => ({
+          orders: [...pos].map(([orderId, { po, supplier }]) => ({
             po,
+            supplier,
             part: lines.some((line) => line.orderId === orderId && (inThis.get(line.id) ?? 0) < line.quantity),
           })),
         };

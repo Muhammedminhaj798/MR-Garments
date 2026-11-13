@@ -117,6 +117,10 @@ describe("WH-1 GET /warehouse-receipts", () => {
       lrNumber: "LR-558214",
       bundlesReceived: 4,
       supplier: "Guangzhou Textile Co.",
+      // The trip's bundles loaded and remark, and the per-line detail (report-downloads.test.ts checks its figures).
+      bundlesLoaded: 4,
+      shortRemark: "",
+      lines: expect.any(Array),
     };
     const location = { id: m.warehouse, name: "Main warehouse" };
     expect(res.body.rows).toEqual([

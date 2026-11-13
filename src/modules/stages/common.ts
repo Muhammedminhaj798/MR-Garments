@@ -98,19 +98,24 @@ export const goodsView = (goods: Awaited<ReturnType<typeof goodsIn>>) => ({
 
 /** Per container: its POs (in PO order) and its bundles. */
 export async function containerOrders(db: Pick<Database, "select">, containerIds: string[]) {
-  const byContainer = new Map<string, { orders: string[]; bundles: number }>();
+  /** `quantities`: the goods in the container, one total per unit (pieces and metres are never added together). */
+  const byContainer = new Map<string, { orders: string[]; bundles: number; quantities: { unit: string; quantity: number }[] }>();
   if (containerIds.length === 0) return byContainer;
   const rows = await db
-    .select({ containerId: containerLines.containerId, po: orders.poNumber, bundles: containerLines.bundles })
+    .select({ containerId: containerLines.containerId, po: orders.poNumber, bundles: containerLines.bundles, quantity: containerLines.quantity, unit: unitSymbol })
     .from(containerLines)
     .innerJoin(orderLines, eq(orderLines.id, containerLines.orderLineId))
     .innerJoin(orders, eq(orders.id, orderLines.orderId))
+    .innerJoin(items, eq(items.id, orderLines.itemId))
     .where(inArray(containerLines.containerId, containerIds))
     .orderBy(asc(orders.poNumber));
-  for (const { containerId, po, bundles } of rows) {
-    const entry = byContainer.get(containerId) ?? { orders: [], bundles: 0 };
+  for (const { containerId, po, bundles, quantity, unit } of rows) {
+    const entry = byContainer.get(containerId) ?? { orders: [], bundles: 0, quantities: [] };
     if (!entry.orders.includes(po)) entry.orders.push(po);
     entry.bundles += bundles;
+    const total = entry.quantities.find((q) => q.unit === unit);
+    if (total) total.quantity += quantity;
+    else entry.quantities.push({ unit, quantity });
     byContainer.set(containerId, entry);
   }
   return byContainer;

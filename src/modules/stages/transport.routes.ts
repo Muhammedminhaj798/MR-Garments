@@ -121,9 +121,16 @@ export function transportRoutes({ db }: RouteContext) {
           costInr: costOf,
           // What depends on the trip (TRN-4 refuses while there is a warehouse receipt).
           warehouseReceipt: warehouseReceipts.status,
+          // The trip's own facts for the report download (docs/report-downloads.md): the cost apart, where it went, who drove.
+          freightInr: transports.freightInr,
+          handlingInr: transports.handlingInr,
+          destination: locations.name,
+          driverName: transports.driverName,
+          shortRemark: transports.shortRemark,
         })
         .from(transports)
         .innerJoin(containers, eq(containers.id, transports.containerId))
+        .innerJoin(locations, eq(locations.id, transports.destinationId))
         .leftJoin(warehouseReceipts, eq(warehouseReceipts.transportId, transports.id))
         .innerJoin(transportCompanies, eq(transportCompanies.id, transports.transportCompanyId))
         .orderBy(desc(transports.loadedOn), desc(transports.createdAt)),
@@ -161,6 +168,7 @@ export function transportRoutes({ db }: RouteContext) {
         ...trip,
         company: { id: companyId, name: companyName },
         orders: byContainer.get(trip.containerId)?.orders ?? [],
+        quantities: byContainer.get(trip.containerId)?.quantities ?? [],
       })),
       ready: ready.map((row) => ({ ...row, orders: byContainer.get(row.containerId)?.orders ?? [], bundles: byContainer.get(row.containerId)?.bundles ?? 0 })),
       companies,

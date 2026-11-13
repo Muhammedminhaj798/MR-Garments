@@ -96,8 +96,10 @@ describe("CON-3 POST /containers and CON-1 GET /containers", () => {
         eta: indiaDay(20),
         etaEstimated: false,
         status: "loading",
+        portOfLoading: "Nansha",
+        portOfArrival: "Kochi",
         bundles: 1,
-        orders: [{ po: a.po, part: true }],
+        orders: [{ po: a.po, supplier: "Guangzhou Textile Co.", part: true }],
       },
       {
         id: res.body.container.id,
@@ -109,10 +111,12 @@ describe("CON-3 POST /containers and CON-1 GET /containers", () => {
         eta: indiaDay(20),
         etaEstimated: false,
         status: "loading",
+        portOfLoading: "Nansha",
+        portOfArrival: "Kochi",
         bundles: 5,
         orders: [
-          { po: a.po, part: true },
-          { po: b.po, part: false },
+          { po: a.po, supplier: "Guangzhou Textile Co.", part: true },
+          { po: b.po, supplier: "Guangzhou Textile Co.", part: false },
         ],
       },
     ]);

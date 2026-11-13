@@ -106,6 +106,12 @@ export function clearingRoutes({ db }: RouteContext) {
         clearedOn: clearings.clearedOn,
         status: clearings.status,
         clearingCostInr: costOf,
+        // The four charges apart and the value of goods for duty (docs/report-downloads.md); null while waiting.
+        goodsValueInr: clearings.goodsValueInr,
+        customsDutyInr: clearings.customsDutyInr,
+        otherDutiesInr: clearings.otherDutiesInr,
+        agentChargesInr: clearings.agentChargesInr,
+        portChargesInr: clearings.portChargesInr,
         tripLr: transports.lrNumber,
         tripStatus: transports.status,
         warehouseReceipt: warehouseReceipts.status,
