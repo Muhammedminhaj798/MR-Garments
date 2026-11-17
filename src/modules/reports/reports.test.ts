@@ -140,11 +140,11 @@ describe("GET /reports/<name> on the lifecycle data", () => {
   it("payments-per-supplier: open orders per supplier, supplier payments only, and the finished POs", async () => {
     expect(await get("/reports/payments-per-supplier")).toMatchObject({
       suppliers: [
-        { supplier: "Foshan Fabrics", orders: [data.c.po], orderValueCny: 4000, paidCny: 1000, paidInr: 12000, balanceCny: 3000 },
-        { supplier: "Yiwu Trims Ltd.", orders: [data.d.po], orderValueCny: 1000, paidCny: 0, paidInr: 0, balanceCny: 1000 },
+        { supplier: "Foshan Fabrics", orders: [data.c.po], orderValueCny: 4000, paidCny: 1000, paidInr: 12000, advanceCny: 0, balanceCny: 3000 },
+        { supplier: "Yiwu Trims Ltd.", orders: [data.d.po], orderValueCny: 1000, paidCny: 0, paidInr: 0, advanceCny: 0, balanceCny: 1000 },
         { supplier: "Hangzhou Knits", orders: [data.e.po], orderValueCny: 800, paidCny: 0, balanceCny: 800 },
       ],
-      totals: { orders: 3, orderValueCny: 5800, paidCny: 1000, paidInr: 12000, balanceCny: 4800 },
+      totals: { orders: 3, orderValueCny: 5800, paidCny: 1000, paidInr: 12000, advanceCny: 0, balanceCny: 4800 },
       dueNext30Cny: 3000,
       finishedPos: [data.b.po, data.a.po],
     });
@@ -199,13 +199,14 @@ describe("reports never add amounts in different currencies (migration 0006)", (
       orderValueCny: 200,
       paidCny: 50,
       paidInr: 4400,
+      advanceCny: 0,
       balanceCny: 150,
     });
-    const cny = { orders: 3, orderValueCny: 5800, paidCny: 1000, paidInr: 12000, balanceCny: 4800 };
+    const cny = { orders: 3, orderValueCny: 5800, paidCny: 1000, paidInr: 12000, advanceCny: 0, balanceCny: 4800 };
     expect(body.totals).toEqual(cny);
     expect(body.totalsByCurrency).toEqual([
       { currency: "CNY", ...cny },
-      { currency: "USD", orders: 1, orderValueCny: 200, paidCny: 50, paidInr: 4400, balanceCny: 150 },
+      { currency: "USD", orders: 1, orderValueCny: 200, paidCny: 50, paidInr: 4400, advanceCny: 0, balanceCny: 150 },
     ]);
     expect(body).toMatchObject({ dueNext30Cny: 3000, dueNext30ByCurrency: [{ currency: "CNY", amount: 3000 }, { currency: "USD", amount: 30 }] });
   });

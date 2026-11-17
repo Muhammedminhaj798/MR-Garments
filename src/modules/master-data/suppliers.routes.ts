@@ -4,7 +4,7 @@ import { z } from "zod";
 
 import { requirePermission } from "../../auth/current-user";
 import { currencyCode } from "../../currencies";
-import { type Currency, orders, STATUSES, supplierDeposits, suppliers } from "../../db/schema";
+import { type Currency, orders, STATUSES, supplierAdvanceEntries, supplierDeposits, suppliers } from "../../db/schema";
 import { conflict, GENERIC_MESSAGE, HttpError, notFound, validationFailed } from "../../http/errors";
 import { parse } from "../../http/validate";
 import type { RouteContext } from "../context";
@@ -208,10 +208,12 @@ export function suppliersRoutes({ db }: RouteContext) {
     res.json({ supplier: (await load(id))[0] });
   });
 
-  // A supplier with orders or supplier deposits (docs/phase2-contracts.md 3.2) is deactivated instead of deleted.
+  // A supplier with orders, supplier deposits (docs/phase2-contracts.md 3.2) or an advance account (docs/supplier-advance.md)
+  // is deactivated instead of deleted.
   deleteRoute(router, db, "/suppliers", suppliers, "Supplier", [
     { what: "order", table: orders, of: (id) => eq(orders.supplierId, id) },
     { what: "deposit", table: supplierDeposits, of: (id) => eq(supplierDeposits.supplierId, id) },
+    { what: "advance record", table: supplierAdvanceEntries, of: (id) => eq(supplierAdvanceEntries.supplierId, id) },
   ]);
 
   return router;

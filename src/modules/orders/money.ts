@@ -1,6 +1,6 @@
 import { type SQL, sql } from "drizzle-orm";
 
-import { orderLines, orders, payments } from "../../db/schema";
+import { orderLines, orders, payments, supplierAdvanceEntries as advances } from "../../db/schema";
 
 // The money of the order in the row (`orders.id`), as correlated subqueries: the one place the payee rules live
 // (docs/phase2-fixes.md section 1). Every list, detail, report and statement reads these, so a figure called the same
@@ -24,6 +24,14 @@ const sumCny = (where: SQL) => sql<number>`(select coalesce(sum(${payments.amoun
 const sumInr = (where: SQL) =>
   sql<number>`(select coalesce(sum(round(${payments.amountCny} * ${payments.rateInr}, 2)), 0) from ${payments} where ${where})`.mapWith(Number);
 
+// The supplier advance applied to the order (docs/supplier-advance.md): its allocations less their reversals, each at
+// the rate of the advance it came from. Never a payment: the balance, payment status and the deposit against what the
+// supplier asked for count it beside the supplier payments, once.
+const advanceOfOrder = sql`${advances.orderId} = ${orders.id} and ${advances.kind} <> 'receipt'`;
+const appliedSign = sql`case when ${advances.kind} = 'allocation' then 1 else -1 end`;
+const advanceCny = sql<number>`(select coalesce(sum(${appliedSign} * ${advances.amount}), 0) from ${advances} where ${advanceOfOrder})`.mapWith(Number);
+const advanceInr = sql<number>`(select coalesce(sum(${appliedSign} * round(${advances.amount} * ${advances.exchangeRate}, 2)), 0) from ${advances} where ${advanceOfOrder})`.mapWith(Number);
+
 // Each correlation is its own fragment, nested: drizzle keeps a nested fragment's table names, but drops them from a
 // single-table select's top-level columns (so an inlined `orders.id` would become the subquery's own `id`).
 const linesOfOrder = sql`${orderLines.orderId} = ${orders.id}`;
@@ -36,14 +44,26 @@ export const orderMoney = {
   /** Paid to the supplier only: the order's balance, payment status and deposit figures read these. */
   supplierPaidCny: sumCny(paidToSupplier),
   supplierPaidInr: sumInr(paidToSupplier),
-  /** Paid supplier deposits: what counts against `orders.deposit_required_cny`. */
-  depositPaidCny: sumCny(sql`${paidToSupplier} and ${payments.kind} = 'Deposit'`),
+  /** The supplier advance applied to the order (not a payment), and its INR at each advance's own rate. */
+  advanceCny,
+  advanceInr,
+  /** Paid supplier deposits plus the advance applied: what counts against `orders.deposit_required_cny`. */
+  depositPaidCny: sql<number>`(${sumCny(sql`${paidToSupplier} and ${payments.kind} = 'Deposit'`)} + ${advanceCny})`.mapWith(Number),
   /** The earliest due payment, or null. */
   nextDue: sql<string | null>`(select min(${payments.dueDate})::text from ${payments} where ${ofOrder} and ${payments.status} = 'due')`,
 };
 
 /** 13.5's names for the supplier-only figures (Payments per supplier, its detail, the order reports, warehouse outstanding). */
-export const supplierMoney = { orderValueCny: orderMoney.orderValueCny, paidCny: orderMoney.supplierPaidCny, paidInr: orderMoney.supplierPaidInr };
+export const supplierMoney = {
+  orderValueCny: orderMoney.orderValueCny,
+  paidCny: orderMoney.supplierPaidCny,
+  paidInr: orderMoney.supplierPaidInr,
+  advanceCny: orderMoney.advanceCny,
+  advanceInr: orderMoney.advanceInr,
+};
+
+/** What the supplier is still owed: the order value less direct supplier payments and the advance applied (one rule, every screen). */
+export const balanceOf = (row: { orderValueCny: number; paidCny: number; advanceCny: number }) => round2(row.orderValueCny - row.paidCny - row.advanceCny);
 
 export const DEPOSIT_STATUSES = ["none", "due", "partly", "paid"] as const;
 export type DepositStatus = (typeof DEPOSIT_STATUSES)[number];

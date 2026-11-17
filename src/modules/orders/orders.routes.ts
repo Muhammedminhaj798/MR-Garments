@@ -22,9 +22,10 @@ import {
 } from "../../db/schema";
 import { validationFailed } from "../../http/errors";
 import { parse } from "../../http/validate";
+import { advanceTotals, settleAdvance } from "../advances/advances";
 import type { RouteContext } from "../context";
 import { orderClosed, orderClosedOn } from "./closure";
-import { depositState, orderMoney, round2 } from "./money";
+import { balanceOf, depositState, orderMoney, round2 } from "./money";
 
 // Owner: BE-orders. ORD-1 GET /orders, ORD-2 GET /orders/options, ORD-3 POST /orders, CAL-1 GET /deliveries,
 // PAY-1 GET /payments (docs/live-screens-contracts.md). Payments are records only: nothing here moves money.
@@ -235,6 +236,9 @@ export function ordersRoutes({ db }: RouteContext) {
         paidInr: row.paidInr,
         supplierPaidCny: row.supplierPaidCny,
         supplierPaidInr: row.supplierPaidInr,
+        // The supplier advance applied (docs/supplier-advance.md): balance to supplier = value - supplier paid - advance.
+        advanceCny: row.advanceCny,
+        advanceInr: row.advanceInr,
         ...depositState(row.depositRequiredCny, row.depositPaidCny),
       })),
     );
@@ -299,9 +303,11 @@ export function ordersRoutes({ db }: RouteContext) {
         .where(eq(shippingAgents.status, "Active"))
         .orderBy(asc(shippingAgents.createdAt), asc(shippingAgents.name)),
     ]);
+    // Each supplier's advance available in its own currency (docs/supplier-advance.md): ORD-3 applies it automatically.
+    const advance = new Map((await advanceTotals(db)).map((row) => [`${row.supplierId} ${row.currency}`, row.availableCny]));
     res.json({
       nextPo: po,
-      suppliers: supplierRows,
+      suppliers: supplierRows.map((row) => ({ ...row, advanceAvailable: advance.get(`${row.id} ${row.currency}`) ?? 0 })),
       items: itemRows,
       agents,
     });
@@ -351,9 +357,13 @@ export function ordersRoutes({ db }: RouteContext) {
               .insert(payments)
               .values(input.deposits.map((entry) => ({ ...entry, rateInr: entry.rateInr ?? 1, orderId, kind: "Deposit", status: "paid", createdBy: userId })));
           }
-          return created[0]!;
+          // The supplier's advance in the order's currency covers what the deposits above leave to pay, as far as it
+          // goes (docs/supplier-advance.md); in this transaction, so the order and its allocation stand or fall together.
+          const advance = await settleAdvance(tx, { id: orderId, po: created[0]!.po, supplierId: input.supplierId, currency: supplier.currency }, userId);
+          return { ...created[0]!, advance };
         });
-        res.status(201).json({ order });
+        const { advance, ...created } = order;
+        res.status(201).json({ order: created, advance });
         return;
       } catch (error) {
         if (!isPoTaken(error)) throw error;
@@ -394,7 +404,7 @@ export function ordersRoutes({ db }: RouteContext) {
   });
 
   // PAY-1. Every order's figures (newest first) and every payment record (latest date first). `balanceCny` is what
-  // the supplier is still owed (order value less supplier payments); `paidCny`/`paidInr` count every payee.
+  // the supplier is still owed (order value less supplier payments and the advance applied); `paidCny`/`paidInr` count every payee.
   router.get("/payments", requirePermission("payments", "View"), async (_req, res) => {
     const [orderList, paymentList] = await Promise.all([
       orderRows(db, newestFirst),
@@ -434,7 +444,9 @@ export function ordersRoutes({ db }: RouteContext) {
         paidInr: row.paidInr,
         supplierPaidCny: row.supplierPaidCny,
         supplierPaidInr: row.supplierPaidInr,
-        balanceCny: round2(row.orderValueCny - row.supplierPaidCny),
+        advanceCny: row.advanceCny,
+        advanceInr: row.advanceInr,
+        balanceCny: balanceOf({ orderValueCny: row.orderValueCny, paidCny: row.supplierPaidCny, advanceCny: row.advanceCny }),
         ...depositState(row.depositRequiredCny, row.depositPaidCny),
         nextDue: row.nextDue,
       })),

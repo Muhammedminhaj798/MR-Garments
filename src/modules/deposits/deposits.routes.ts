@@ -9,6 +9,7 @@ import { DEPOSIT_DIRECTIONS, orders, payments, supplierDeposits, supplierDeposit
 import { conflict, notFound, validationFailed } from "../../http/errors";
 import { parse } from "../../http/validate";
 import type { RouteContext } from "../context";
+import { advanceAccount, advanceTotals } from "../advances/advances";
 import { money } from "../notifications/notify";
 import { depositState, orderMoney, round2 } from "../orders/money";
 import { isUuid, todayInIndia } from "../stages/common";
@@ -140,7 +141,7 @@ export function depositsRoutes({ db }: RouteContext) {
 
   // DEP-1. Order deposits (payments of kind Deposit, PAY-1's order), every supplier deposit, and the suppliers to filter by.
   router.get("/deposits", requirePermission("payments", "View"), async (_req, res) => {
-    const [orderDeposits, requirementRows, supplierRows, active] = await Promise.all([
+    const [orderDeposits, requirementRows, supplierRows, active, advanceRows] = await Promise.all([
       db
         .select({
           id: payments.id,
@@ -177,7 +178,9 @@ export function depositsRoutes({ db }: RouteContext) {
           supplier: suppliers.name,
           currency: orders.currency,
           required: orders.depositRequiredCny,
+          /** Paid supplier deposits plus the supplier advance applied (docs/supplier-advance.md). */
           paid: orderMoney.depositPaidCny,
+          advance: orderMoney.advanceCny,
           lastPaidOn: sql<string | null>`(select max(${payments.paidOn})::text from ${payments}
             where ${payments.orderId} = ${orders.id} and ${payments.status} = 'paid' and ${payments.kind} = 'Deposit' and ${payments.payeeRole} = 'supplier')`,
           payments: sql<number>`(select count(*) from ${payments}
@@ -189,19 +192,28 @@ export function depositsRoutes({ db }: RouteContext) {
         .orderBy(desc(orders.orderDate), desc(orders.poNumber)),
       depositRows(db, sql`true`),
       db.select({ id: suppliers.id, name: suppliers.name }).from(suppliers).where(eq(suppliers.status, "Active")),
+      advanceTotals(db),
     ]);
     const supplierDepositList = supplierRows.map(toRow);
-    const orderObligations = requirementRows.map(({ required, paid, ...row }) => {
+    const orderObligations = requirementRows.map(({ required, paid, advance, ...row }) => {
       const state = depositState(required, paid);
-      return { ...row, requiredCny: required!, paidCny: paid, pendingCny: state.depositPendingCny!, status: state.depositStatus };
+      return { ...row, requiredCny: required!, paidCny: paid, advanceCny: advance, pendingCny: state.depositPendingCny!, status: state.depositStatus };
     });
-    // Active suppliers plus any (inactive) one that still has a deposit of either kind, so every row can be filtered; by name.
+    // Active suppliers plus any (inactive) one that still has a deposit of either kind or an advance account, so every
+    // row can be filtered; by name.
     const byId = new Map(active.map((s) => [s.id, s]));
     for (const row of [...orderDeposits, ...orderObligations, ...supplierDepositList]) byId.set(row.supplierId, { id: row.supplierId, name: row.supplier });
+    const names = new Map((await db.select({ id: suppliers.id, name: suppliers.name }).from(suppliers)).map((s) => [s.id, s.name]));
+    for (const row of advanceRows) byId.set(row.supplierId, { id: row.supplierId, name: names.get(row.supplierId)! });
+    // One line per supplier and currency with an advance account (docs/supplier-advance.md), by name then currency.
+    const advances = advanceRows
+      .map((row) => ({ ...row, supplier: names.get(row.supplierId)! }))
+      .sort((x, y) => x.supplier.localeCompare(y.supplier) || compareCurrencies(x.currency, y.currency));
     res.json({
       orderDeposits,
       orderObligations,
       supplierDeposits: supplierDepositList,
+      advances,
       suppliers: [...byId.values()].sort((a, b) => a.name.localeCompare(b.name)),
     });
   });
@@ -234,6 +246,8 @@ export function depositsRoutes({ db }: RouteContext) {
       : [];
     res.json({
       supplier,
+      // The supplier advance account beside the deposits, never netted with them (docs/supplier-advance.md).
+      advance: await advanceAccount(db, supplierId),
       summary: summarise(deposits),
       deposits: deposits.map((deposit) => ({
         ...deposit,

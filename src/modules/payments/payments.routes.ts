@@ -8,6 +8,7 @@ import { orders, PAYEE_ROLES, PAYMENT_KINDS, payments, shippingAgents, suppliers
 import { notFound, validationFailed } from "../../http/errors";
 import { parse } from "../../http/validate";
 import type { RouteContext } from "../context";
+import { settleAdvance } from "../advances/advances";
 import { money, notify } from "../notifications/notify";
 import { rateProblem } from "../orders/orders.routes";
 import { isUuid } from "../stages/common";
@@ -56,7 +57,7 @@ type NewPayment = z.infer<typeof newPayment>;
 async function payeeName(db: Pick<Database, "select">, input: NewPayment) {
   const problems: Record<string, string> = {};
   const order = await db
-    .select({ supplier: suppliers.name, po: orders.poNumber, currency: orders.currency })
+    .select({ supplier: suppliers.name, supplierId: orders.supplierId, po: orders.poNumber, currency: orders.currency })
     .from(orders)
     .innerJoin(suppliers, eq(suppliers.id, orders.supplierId))
     .where(eq(orders.id, input.orderId));
@@ -80,19 +81,24 @@ async function payeeName(db: Pick<Database, "select">, input: NewPayment) {
   }
 
   if (Object.keys(problems).length > 0) throw validationFailed(problems);
-  return { payee: input.payeeRole === "supplier" ? order[0]!.supplier : agent!, po: order[0]!.po, currency: order[0]!.currency };
+  return { payee: input.payeeRole === "supplier" ? order[0]!.supplier : agent!, supplierId: order[0]!.supplierId, po: order[0]!.po, currency: order[0]!.currency };
 }
 
 export function paymentsRoutes({ db }: RouteContext) {
   const router = Router();
 
-  // PAY-2. A payment already made: saved as paid, at any stage. No overpayment check (the balance may go below 0).
+  // PAY-2. A payment already made: saved as paid, at any stage. No overpayment check (the balance may go below 0). A
+  // supplier payment re-checks the supplier advance applied to the order (docs/supplier-advance.md): what the direct
+  // payments now cover goes back to the supplier's account, so supplier payments plus advance never pass the order value.
   router.post("/payments", requirePermission("payments", "Enter"), async (req, res) => {
     const input = parse(newPayment, req.body);
-    const payment = await db.transaction(async (tx) => {
+    const { payment, advance } = await db.transaction(async (tx) => {
       // Read inside the transaction, the agent's row share-locked: an agent payment keeps the agent's name, so a rename
       // or delete of that agent waits for this payment and then counts it (master-data DELETE, shipping-agent PATCH).
-      const { payee, po, currency } = await payeeName(tx, input);
+      const { payee, supplierId, po, currency } = await payeeName(tx, input);
+      const toSupplier = input.payeeRole === "supplier";
+      // The order row first, as ORD-5, ORD-6, PAY-3 and ADV-4 lock it; the advance lock comes after (settleAdvance).
+      if (toSupplier) await tx.select({ id: orders.id }).from(orders).where(eq(orders.id, input.orderId)).for("update");
       const created = (
         await tx
           .insert(payments)
@@ -120,9 +126,11 @@ export function paymentsRoutes({ db }: RouteContext) {
         details: [`${input.kind} ${money(input.amountCny, currency)}`, payee],
         href: (canView) => (canView("ordersView") ? `/orders/${encodeURIComponent(po)}/payments` : "/payments"),
       });
-      return created;
+      // After the payment, in its transaction: never draws more advance, only gives back the excess.
+      const advance = toSupplier ? await settleAdvance(tx, { id: input.orderId, po, supplierId, currency }, req.user!.id, "cap") : null;
+      return { payment: created, advance };
     });
-    res.status(201).json({ payment });
+    res.status(201).json(advance ? { payment, advance } : { payment });
   });
 
   // PAY-3. Management only (payments Full). A deposit or a balance payment, paid or due. One transaction: the payment's

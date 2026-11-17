@@ -5,7 +5,7 @@ import { orderedCurrencies } from "../../currencies";
 import type { Database } from "../../db/client";
 import { containerLines, containers, type Currency, orderLines, orders, payments, receipts, suppliers } from "../../db/schema";
 import { orderClosed } from "../orders/closure";
-import { round2, supplierMoney } from "../orders/money";
+import { balanceOf as supplierBalance, round2, supplierMoney } from "../orders/money";
 import { addDays } from "../reports/reports";
 import { creationOrder } from "./list-query";
 
@@ -52,6 +52,7 @@ function orderRows(db: Database, where?: SQL) {
       closed: orderClosed,
       orderValueCny: supplierMoney.orderValueCny,
       paidCny: supplierMoney.paidCny,
+      advanceCny: supplierMoney.advanceCny,
       receivedOn: sql<string | null>`(select min(${receipts.receivedOn})::text from ${receipts} where ${receipts.orderId} = ${orders.id})`,
     })
     .from(orders)
@@ -60,7 +61,8 @@ function orderRows(db: Database, where?: SQL) {
 }
 type OrderRow = Awaited<ReturnType<typeof orderRows>>[number];
 
-const balanceOf = (row: OrderRow) => row.orderValueCny - row.paidCny;
+/** Less direct supplier payments and the supplier advance applied (money.ts balanceOf). */
+const balanceOf = (row: OrderRow) => supplierBalance(row);
 
 // ponytail: every order is loaded and grouped in memory (a few hundred rows); a GROUP BY over money.ts when orders reach thousands.
 /** Per supplier: this year's order value (orders dated from 1 January) and the balance still owed, per currency. */

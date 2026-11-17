@@ -99,6 +99,13 @@
       "when": 1794459885481,
       "tag": "0013_iso_currencies",
       "breakpoints": true
+    },
+    {
+      "idx": 14,
+      "version": "7",
+      "when": 1794922753180,
+      "tag": "0014_supplier_advances",
+      "breakpoints": true
     }
   ]
 }

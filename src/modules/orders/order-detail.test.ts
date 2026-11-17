@@ -106,6 +106,11 @@ describe("ORD-4 GET /orders/:po", () => {
       paidInr: 26562.25, // 1234.56 * 11.8765 = 14662.25 (rounded) + 1000 * 11.9
       supplierPaidCny: 1234.56,
       supplierPaidInr: 14662.25,
+      advanceCny: 0,
+      advanceInr: 0,
+      advanceStatus: "none",
+      advanceEntries: [],
+      advanceAvailableCny: 0,
       balanceCny: 13740.44, // owed to the supplier: the ¥1,000 agent deposit is freight
       depositRequiredCny: null,
       depositPaidCny: 1234.56,

@@ -81,7 +81,8 @@ describe("PAY-2 POST /payments", () => {
   it("saves a paid supplier payment, and PAY-1 and ORD-1 count it", async () => {
     const res = await record(body());
     expect(res.status).toBe(201);
-    expect(res.body).toEqual({ payment: { id: expect.any(String) } });
+    // A supplier payment also answers what it did to the supplier advance (docs/supplier-advance.md): nothing here.
+    expect(res.body).toEqual({ payment: { id: expect.any(String) }, advance: expect.objectContaining({ appliedCny: 0, changeCny: 0, status: "none" }) });
 
     const rows = await stored();
     expect(rows).toHaveLength(1);

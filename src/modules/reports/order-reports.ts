@@ -6,6 +6,7 @@ import type { Database } from "../../db/client";
 import { items, locations, orderLines, orders, suppliers, warehouseReceiptLines, warehouseReceipts } from "../../db/schema";
 import { loadLandedCosts } from "../costs/landed-cost";
 import { main, newestFirst, orderColumns, PO_MAX_LENGTH, round2, unitSymbol } from "../orders/orders.routes";
+import { balanceOf } from "../orders/money";
 import { orderFilter, supplierMoney } from "./reports";
 
 // Owner: Agent R. RPT-O2 GET /reports/orders (docs/phase2-contracts.md section 4.2; shape in 8.R; the comprehensive
@@ -41,7 +42,11 @@ type Query = z.infer<typeof orderReportsQuery>;
 /** Pending: not yet received (stage 1); closed: section 1's rule (ORD-1 `closed`); active: the rest. */
 const stateOf = (row: { stage: number; closed: boolean }) => (row.stage === 1 ? "pending" : row.closed ? "closed" : "active");
 /** Supplier payments against the order value: nothing paid, part of it, or all of it (an overpayment counts as paid). */
-const paymentStateOf = (row: { paidCny: number; orderValueCny: number }) => (row.paidCny <= 0 ? "unpaid" : row.paidCny >= row.orderValueCny ? "paid" : "partly");
+/** Supplier payments and the supplier advance applied together (docs/supplier-advance.md): unpaid, partly or paid. */
+const paymentStateOf = (row: { paidCny: number; advanceCny: number; orderValueCny: number }) => {
+  const covered = round2(row.paidCny + row.advanceCny);
+  return covered <= 0 ? "unpaid" : covered >= row.orderValueCny ? "paid" : "partly";
+};
 const sum = <T>(rows: T[], pick: (row: T) => number) => rows.reduce((total, row) => total + pick(row), 0);
 /** `%`, `_` and `\` typed in the PO filter match themselves (LIKE's default escape is `\`). */
 const escapeLike = (value: string) => value.replace(/[\\%_]/g, "\\$&");
@@ -130,7 +135,10 @@ export async function orderReports(db: Database, q: Query) {
       orderValueCny: row.orderValueCny,
       paidCny: row.paidCny,
       paidInr: row.paidInr,
-      balanceCny: round2(row.orderValueCny - row.paidCny),
+      /** The supplier advance applied (not a payment); the balance counts it once. */
+      advanceCny: row.advanceCny,
+      advanceInr: row.advanceInr,
+      balanceCny: balanceOf(row),
       paymentStatus: paymentStateOf(row),
       /** null until the order has any cost (as the Landed Cost list hides costless orders). */
       landedCostInr: cost.totalInr > 0 ? cost.totalInr : null,
@@ -147,6 +155,7 @@ export async function orderReports(db: Database, q: Query) {
           currency,
           orderValueCny: round2(sum(inCurrency, (row) => row.orderValueCny)),
           paidCny: round2(sum(inCurrency, (row) => row.paidCny)),
+          advanceCny: round2(sum(inCurrency, (row) => row.advanceCny)),
           balanceCny: round2(sum(inCurrency, (row) => row.balanceCny)),
         };
       }),

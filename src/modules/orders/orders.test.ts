@@ -87,7 +87,7 @@ describe("ORD-2 GET /orders/options", () => {
     expect(res.status).toBe(200);
     expect(res.body.nextPo).toBe("PO-2050");
     expect(res.body.suppliers.map((row: { name: string }) => row.name)).toEqual(["Guangzhou Textile Co.", "Shenzhen Apparel", "Yiwu Trims Ltd.", "Hangzhou Knits"]);
-    expect(res.body.suppliers[0]).toEqual({ id: ids.supplier, name: "Guangzhou Textile Co.", contactPerson: "Mr. Zhao Lin", phone: "+86 138 0013 2244", city: "Guangzhou", currency: "CNY", exchangeRate: null });
+    expect(res.body.suppliers[0]).toEqual({ id: ids.supplier, name: "Guangzhou Textile Co.", contactPerson: "Mr. Zhao Lin", phone: "+86 138 0013 2244", city: "Guangzhou", currency: "CNY", exchangeRate: null, advanceAvailable: 0 });
     expect(res.body.items).toHaveLength(8);
     expect(res.body.items).toContainEqual({ id: ids.jeans, name: "Denim jeans", unit: "pcs", price: null });
     expect(res.body.items).toContainEqual({ id: ids.fabric, name: "Cotton fabric", unit: "m", price: null });
@@ -99,7 +99,8 @@ describe("ORD-3 POST /orders and ORD-1 GET /orders", () => {
   it("creates PO-2050 then PO-2051 with lines and deposits, and lists their figures", async () => {
     const first = await create(orderBody());
     expect(first.status).toBe(201);
-    expect(first.body).toEqual({ order: { id: expect.any(String), po: "PO-2050" } });
+    // No supplier advance: nothing applied, the order owes its value less the supplier deposit (docs/supplier-advance.md).
+    expect(first.body).toEqual({ order: { id: expect.any(String), po: "PO-2050" }, advance: { appliedCny: 0, changeCny: 0, availableCny: 0, balanceCny: 13740.44, status: "none" } });
     const second = await create(orderBody({ orderDate: "2026-10-20", lines: [{ itemId: ids.fabric, quantity: 50, rateCny: 3 }], deposits: [] }));
     expect(second.body.order.po).toBe("PO-2051");
     expect((await get("/orders/options")).body.nextPo).toBe("PO-2052");
@@ -141,6 +142,8 @@ describe("ORD-3 POST /orders and ORD-1 GET /orders", () => {
       paidInr: 26562.25, // 1234.56 * 11.8765 = 14662.25 (rounded) + 1000 * 11.9
       supplierPaidCny: 1234.56, // the ¥1,000 agent deposit is sea freight
       supplierPaidInr: 14662.25,
+      advanceCny: 0,
+      advanceInr: 0,
       depositRequiredCny: null,
       depositPaidCny: 1234.56,
       depositPendingCny: null,
@@ -320,6 +323,8 @@ describe("PAY-1 GET /payments", () => {
         paidInr: 0,
         supplierPaidCny: 0,
         supplierPaidInr: 0,
+        advanceCny: 0,
+        advanceInr: 0,
         balanceCny: 14975,
         depositRequiredCny: null,
         depositPaidCny: 0,
@@ -338,6 +343,8 @@ describe("PAY-1 GET /payments", () => {
         paidInr: 26562.25,
         supplierPaidCny: 1234.56,
         supplierPaidInr: 14662.25,
+        advanceCny: 0,
+        advanceInr: 0,
         balanceCny: 13740.44, // what the supplier is owed: due payments are not paid, the agent deposit is freight
         depositRequiredCny: null,
         depositPaidCny: 1234.56,

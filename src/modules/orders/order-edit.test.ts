@@ -120,7 +120,11 @@ describe("ORD-5 PATCH /orders/:po", () => {
       ],
     });
     expect(res.status, JSON.stringify(res.body)).toBe(200);
-    expect(res.body).toEqual({ order: { id: order.id, po: order.po, stage: 1, orderDate: "2026-10-22", deliveryDate: "2026-12-15" } });
+    // A lines edit also answers with the supplier advance re-settled (docs/supplier-advance.md); none here.
+    expect(res.body).toEqual({
+      order: { id: order.id, po: order.po, stage: 1, orderDate: "2026-10-22", deliveryDate: "2026-12-15" },
+      advance: { appliedCny: 0, changeCny: 0, availableCny: 0, balanceCny: 11800, status: "none" },
+    });
     const lines = await linesOf(order.id);
     expect(lines).toEqual([
       { id: expect.any(String), itemId: ids.polo, position: 0, quantity: 50, rateCny: 20 },
@@ -306,6 +310,8 @@ describe("ORD-6 DELETE /orders/:po", () => {
         "payments.order_id -> orders", // payments
         "receipt_lines.order_line_id -> order_lines", // receipts
         "receipts.order_id -> orders", // receipts
+        // ON DELETE SET NULL: ORD-6 returns the order's advance first; the ledger keeps its rows (docs/supplier-advance.md).
+        "supplier_advance_entries.order_id -> orders",
         "warehouse_receipt_lines.order_line_id -> order_lines", // warehouse receipts
       ].sort(),
     );

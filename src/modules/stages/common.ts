@@ -96,7 +96,7 @@ export const goodsView = (goods: Awaited<ReturnType<typeof goodsIn>>) => ({
   suppliers: [...new Set(goods.map((line) => line.supplier))],
 });
 
-/** Per container: its POs (in PO order) and its bundles. */
+/** Per container: its POs (in PO order) and its bundles; units in the order they first appear by PO, then line position. */
 export async function containerOrders(db: Pick<Database, "select">, containerIds: string[]) {
   /** `quantities`: the goods in the container, one total per unit (pieces and metres are never added together). */
   const byContainer = new Map<string, { orders: string[]; bundles: number; quantities: { unit: string; quantity: number }[] }>();
@@ -108,7 +108,9 @@ export async function containerOrders(db: Pick<Database, "select">, containerIds
     .innerJoin(orders, eq(orders.id, orderLines.orderId))
     .innerJoin(items, eq(items.id, orderLines.itemId))
     .where(inArray(containerLines.containerId, containerIds))
-    .orderBy(asc(orders.poNumber));
+    // PO alone left one PO's lines (so its units) in any order; a container holds each order line once, so the line's
+    // position makes the order the same every time.
+    .orderBy(asc(orders.poNumber), asc(orderLines.position));
   for (const { containerId, po, bundles, quantity, unit } of rows) {
     const entry = byContainer.get(containerId) ?? { orders: [], bundles: 0, quantities: [] };
     if (!entry.orders.includes(po)) entry.orders.push(po);

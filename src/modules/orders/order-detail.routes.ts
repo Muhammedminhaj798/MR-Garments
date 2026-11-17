@@ -15,6 +15,7 @@ import {
   receiptLines,
   receipts,
   shippingAgents,
+  supplierAdvanceEntries,
   suppliers,
   users,
   warehouseReceiptLines,
@@ -25,7 +26,8 @@ import { atLeast, type Capability, effectiveAccess } from "../../permissions/mat
 import type { RouteContext } from "../context";
 import { containerOrders } from "../stages/common";
 import { money } from "../notifications/notify";
-import { depositState } from "./money";
+import { advanceStatus, advanceTotals, orderAdvanceEntries, settleAdvance } from "../advances/advances";
+import { balanceOf, depositState } from "./money";
 import { byPo, depositRequired, line, lineList, MESSAGES as M, orderRows, round2, unitSymbol } from "./orders.routes";
 
 // Owner: BE-orders. ORD-4 GET /orders/:po (docs/live-screens-contracts.md, "Five-tab completion"); ORD-5 PATCH and
@@ -63,7 +65,7 @@ export function orderDetailRoutes({ db }: RouteContext) {
     const section = <T>(capability: Capability, query: () => Promise<T>) =>
       atLeast(effectiveAccess(role, stages, capability), "View") ? query() : Promise.resolve(null);
 
-    const [supplier, lines, paymentList, receiptList, containerList] = await Promise.all([
+    const [supplier, lines, paymentList, receiptList, containerList, advanceList, advanceAvailable] = await Promise.all([
       db
         .select({ contactPerson: suppliers.contactPerson, phone: suppliers.phone, city: suppliers.city })
         .from(suppliers)
@@ -192,7 +194,13 @@ export function orderDetailRoutes({ db }: RouteContext) {
             .map((line) => ({ orderLineId: line.orderLineId, item: line.item, unit: line.unit, bundles: line.bundles, quantity: line.quantity })),
         }));
       }),
+      // The supplier advance applied to this order (docs/supplier-advance.md): its allocations and reversals, oldest
+      // first, each with the advance it came from. Money, so it follows the payments section's access.
+      section("payments", () => orderAdvanceEntries(db, orderId)),
+      // What the supplier has available in the order's currency: ADV-4 can apply it to this order.
+      section("payments", async () => (await advanceTotals(db, and(eq(supplierAdvanceEntries.supplierId, row.supplierId), eq(supplierAdvanceEntries.currency, row.currency))))[0]?.availableCny ?? 0),
     ]);
+    const balanceCny = balanceOf({ orderValueCny: row.orderValueCny, paidCny: row.supplierPaidCny, advanceCny: row.advanceCny });
 
     res.json({
       id: row.id,
@@ -215,11 +223,19 @@ export function orderDetailRoutes({ db }: RouteContext) {
       paidInr: row.paidInr,
       supplierPaidCny: row.supplierPaidCny,
       supplierPaidInr: row.supplierPaidInr,
-      // What the supplier is still owed: agent payments are sea freight, not the goods (docs/phase2-fixes.md 1).
-      balanceCny: round2(row.orderValueCny - row.supplierPaidCny),
+      // The supplier advance applied (not a payment) and its INR at each advance's rate (docs/supplier-advance.md).
+      advanceCny: row.advanceCny,
+      advanceInr: row.advanceInr,
+      advanceStatus: advanceStatus(row.advanceCny, balanceCny),
+      // What the supplier is still owed: agent payments are sea freight, not the goods (docs/phase2-fixes.md 1); the
+      // advance applied counts as the supplier's money already.
+      balanceCny,
       ...depositState(row.depositRequiredCny, row.depositPaidCny),
       lines: lines.map(({ itemId, itemName, ...line }) => ({ ...line, item: { id: itemId, name: itemName } })),
       payments: paymentList,
+      advanceEntries: advanceList,
+      /** The supplier's advance available in the order's currency (null without payments View). */
+      advanceAvailableCny: advanceAvailable,
       receipts: receiptList,
       containers: containerList,
     });
@@ -287,14 +303,17 @@ export function orderDetailRoutes({ db }: RouteContext) {
         }
         if (added.length > 0) await tx.insert(orderLines).values(added);
       }
+      // A new total re-settles the supplier advance (docs/supplier-advance.md): more is applied when the order grows and
+      // advance is available, the excess goes back when it shrinks. Never left at an amount the order no longer owes.
+      const advance = input.lines ? await settleAdvance(tx, { id: row.id, po: row.poNumber, supplierId: row.supplierId, currency: row.currency }, req.user!.id) : null;
       const updated = await tx
         .update(orders)
         .set({ orderDate: input.orderDate, deliveryDate: input.deliveryDate, depositRequiredCny: input.depositRequiredCny, updatedAt: new Date() })
         .where(eq(orders.id, row.id))
         .returning({ id: orders.id, po: orders.poNumber, stage: orders.stage, orderDate: orders.orderDate, deliveryDate: orders.deliveryDate });
-      return updated[0]!;
+      return { order: updated[0]!, advance };
     });
-    res.json({ order });
+    res.json(order.advance ? order : { order: order.order });
   });
 
   // ORD-6. Only an order nothing depends on is deleted, with its own lines (the order_lines cascade). The order and its
@@ -303,9 +322,11 @@ export function orderDetailRoutes({ db }: RouteContext) {
   router.delete("/orders/:po", requirePermission("admin", "Full"), async (req, res) => {
     const po = String(req.params.po);
     const inUse = (what: string) => conflict("in_use", `This order has ${what}, so it can't be deleted.`);
-    await db
+    const returned = await db
       .transaction(async (tx) => {
-        const row = (await tx.select({ id: orders.id }).from(orders).where(byPo(po)).for("update"))[0];
+        const row = (
+          await tx.select({ id: orders.id, po: orders.poNumber, supplierId: orders.supplierId, currency: orders.currency }).from(orders).where(byPo(po)).for("update")
+        )[0];
         if (!row) throw notFound("Order");
         await tx.select({ id: orderLines.id }).from(orderLines).where(eq(orderLines.orderId, row.id)).for("update");
         const lines = tx.select({ id: orderLines.id }).from(orderLines).where(eq(orderLines.orderId, row.id));
@@ -326,7 +347,11 @@ export function orderDetailRoutes({ db }: RouteContext) {
           if (n > 0) used.push(`${n} ${what}${n === 1 ? "" : "s"}`);
         }
         if (used.length > 0) throw inUse(joined(used));
+        // Deleting is cancelling (docs/supplier-advance.md): the advance applied goes back to the supplier's account as
+        // reversals first; the allocations and reversals stay in the ledger with the PO number (order_id set null).
+        const advance = await settleAdvance(tx, row, req.user!.id, "release");
         await tx.delete(orders).where(eq(orders.id, row.id));
+        return { ...row, amount: -advance.changeCny };
       })
       .catch((error: unknown) => {
         // A use the counts missed through a NO ACTION foreign key refuses the delete (none exists today).
@@ -334,6 +359,8 @@ export function orderDetailRoutes({ db }: RouteContext) {
         if (((error as PgError)?.cause ?? (error as PgError))?.code === "23503") throw inUse("other records");
         throw error;
       });
+    // The ledger's reversal rows are the record; this line says who cancelled it.
+    if (returned.amount > 0) console.info(`Order ${returned.po} deleted by user ${req.user!.id}: ${money(returned.amount, returned.currency)} supplier advance returned.`);
     res.status(204).end();
   });
 

@@ -480,6 +480,8 @@ describe("RPT-O2 GET /reports/orders", () => {
       orderValueCny: 1400,
       paidCny: 800,
       paidInr: 9850,
+      advanceCny: 0,
+      advanceInr: 0,
       balanceCny: 600,
       paymentStatus: "partly",
       landedCostInr: 49550,
@@ -492,8 +494,8 @@ describe("RPT-O2 GET /reports/orders", () => {
     expect(body.summary).toEqual({
       orders: 5,
       byCurrency: [
-        { currency: "CNY", orderValueCny: 1831, paidCny: 1200, balanceCny: 631 },
-        { currency: "USD", orderValueCny: 100, paidCny: 60, balanceCny: 40 },
+        { currency: "CNY", orderValueCny: 1831, paidCny: 1200, advanceCny: 0, balanceCny: 631 },
+        { currency: "USD", orderValueCny: 100, paidCny: 60, advanceCny: 0, balanceCny: 40 },
       ],
       paidInr: 19650,
       landedCostInr: 99050,
@@ -513,8 +515,8 @@ describe("RPT-O2 GET /reports/orders", () => {
     expect(foshan.summary).toMatchObject({
       orders: 2,
       byCurrency: [
-        { currency: "CNY", orderValueCny: 30, paidCny: 0, balanceCny: 30 },
-        { currency: "USD", orderValueCny: 100, paidCny: 60, balanceCny: 40 },
+        { currency: "CNY", orderValueCny: 30, paidCny: 0, advanceCny: 0, balanceCny: 30 },
+        { currency: "USD", orderValueCny: 100, paidCny: 60, advanceCny: 0, balanceCny: 40 },
       ],
       paidInr: 5000,
       landedCostInr: 5000,
@@ -555,7 +557,7 @@ describe("RPT-O2 GET /reports/orders", () => {
     const usd = await list("?currency=USD");
     expect(pos(usd)).toEqual([e.po]);
     expect(usd.filter.currency).toBe("USD");
-    expect(usd.summary.byCurrency).toEqual([{ currency: "USD", orderValueCny: 100, paidCny: 60, balanceCny: 40 }]);
+    expect(usd.summary.byCurrency).toEqual([{ currency: "USD", orderValueCny: 100, paidCny: 60, advanceCny: 0, balanceCny: 40 }]);
     expect(pos(await list("?currency=CNY&stage=1"))).toEqual([c.po]);
   });
 });

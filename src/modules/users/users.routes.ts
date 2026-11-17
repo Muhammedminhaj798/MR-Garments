@@ -18,6 +18,7 @@ import {
   type Role,
   ROLES,
   STATUSES,
+  supplierAdvanceEntries,
   supplierDeposits,
   supplierDepositTransactions,
   suppliers,
@@ -73,6 +74,7 @@ export const REFERENCES: { what: string; table: PgTable; columns: PgColumn[] }[]
   { what: "warehouse receipt", table: warehouseReceipts, columns: [warehouseReceipts.createdBy, warehouseReceipts.updatedBy] },
   { what: "supplier deposit", table: supplierDeposits, columns: [supplierDeposits.createdBy] },
   { what: "supplier deposit transaction", table: supplierDepositTransactions, columns: [supplierDepositTransactions.createdBy] },
+  { what: "supplier advance record", table: supplierAdvanceEntries, columns: [supplierAdvanceEntries.createdBy] },
 ];
 
 const joined = (parts: string[]) => (parts.length > 1 ? `${parts.slice(0, -1).join(", ")} and ${parts.at(-1)}` : parts[0]!);

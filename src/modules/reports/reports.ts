@@ -19,7 +19,7 @@ import {
 } from "../../db/schema";
 import { loadLandedCosts } from "../costs/landed-cost";
 import { orderClosed } from "../orders/closure";
-import { supplierMoney, toSupplier } from "../orders/money";
+import { balanceOf, supplierMoney, toSupplier } from "../orders/money";
 import { round2, unitSymbol } from "../orders/orders.routes";
 
 // The supplier-only money fragments live in orders/money.ts (docs/phase2-fixes.md 1); re-exported for the report consumers.
@@ -241,15 +241,30 @@ export async function paymentsPerSupplier(db: Database, f: Filters, today: strin
       .orderBy(...newestFirst),
   ]);
   // ponytail: grouped in memory over the open orders; a GROUP BY over pre-aggregated payments when orders reach thousands.
-  type Row = { supplierId: string; supplier: string; currency: Currency; orders: string[]; orderValueCny: number; paidCny: number; paidInr: number };
+  // `advanceCny`: the supplier advance applied to these orders (docs/supplier-advance.md), apart from paid; the balance counts both.
+  type Row = { supplierId: string; supplier: string; currency: Currency; orders: string[]; orderValueCny: number; paidCny: number; paidInr: number; advanceCny: number };
   const bySupplier = new Map<string, Row>();
   for (const order of open) {
     const key = `${order.supplierId} ${order.currency}`;
-    const row = bySupplier.get(key) ?? { supplierId: order.supplierId, supplier: order.supplier, currency: order.currency, orders: [], orderValueCny: 0, paidCny: 0, paidInr: 0 };
-    bySupplier.set(key, { ...row, orders: [...row.orders, order.po], orderValueCny: row.orderValueCny + order.orderValueCny, paidCny: row.paidCny + order.paidCny, paidInr: row.paidInr + order.paidInr });
+    const row = bySupplier.get(key) ?? { supplierId: order.supplierId, supplier: order.supplier, currency: order.currency, orders: [], orderValueCny: 0, paidCny: 0, paidInr: 0, advanceCny: 0 };
+    bySupplier.set(key, {
+      ...row,
+      orders: [...row.orders, order.po],
+      orderValueCny: row.orderValueCny + order.orderValueCny,
+      paidCny: row.paidCny + order.paidCny,
+      paidInr: row.paidInr + order.paidInr,
+      advanceCny: row.advanceCny + order.advanceCny,
+    });
   }
   const rows = [...bySupplier.values()]
-    .map((row) => ({ ...row, orderValueCny: round2(row.orderValueCny), paidCny: round2(row.paidCny), paidInr: round2(row.paidInr), balanceCny: round2(row.orderValueCny - row.paidCny) }))
+    .map((row) => ({
+      ...row,
+      orderValueCny: round2(row.orderValueCny),
+      paidCny: round2(row.paidCny),
+      paidInr: round2(row.paidInr),
+      advanceCny: round2(row.advanceCny),
+      balanceCny: balanceOf(row),
+    }))
     .sort((a, b) => compareCurrencies(a.currency, b.currency) || b.orderValueCny - a.orderValueCny || a.supplier.localeCompare(b.supplier));
   const totalsOf = (list: typeof rows) => {
     const total = (pick: (row: (typeof rows)[number]) => number) => round2(sum(list, pick));
@@ -258,6 +273,7 @@ export async function paymentsPerSupplier(db: Database, f: Filters, today: strin
       orderValueCny: total((r) => r.orderValueCny),
       paidCny: total((r) => r.paidCny),
       paidInr: total((r) => r.paidInr),
+      advanceCny: total((r) => r.advanceCny),
       balanceCny: total((r) => r.balanceCny),
     };
   };

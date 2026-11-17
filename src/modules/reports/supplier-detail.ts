@@ -5,8 +5,10 @@ import { compareCurrencies } from "../../currencies";
 import type { Database } from "../../db/client";
 import { items, orderLines, orders, payments, suppliers } from "../../db/schema";
 import { notFound } from "../../http/errors";
+import { advanceAccount } from "../advances/advances";
 import { orderClosed } from "../orders/closure";
-import { main, newestFirst, orderColumns, round2, unitSymbol } from "../orders/orders.routes";
+import { balanceOf } from "../orders/money";
+import { main, newestFirst, orderColumns, unitSymbol } from "../orders/orders.routes";
 import { orderFilter, supplierMoney, toSupplier } from "./reports";
 
 // GET /reports/payments-per-supplier/:supplierId (docs/supplier-payment-detail-contract.md): one supplier's orders,
@@ -86,6 +88,7 @@ export async function supplierPaymentDetail(db: Database, supplierId: string, q:
       orderValueCny: supplierMoney.orderValueCny.as("order_value_cny"),
       paidCny: supplierMoney.paidCny.as("paid_cny"),
       paidInr: supplierMoney.paidInr.as("paid_inr"),
+      advanceCny: supplierMoney.advanceCny.as("advance_cny"),
       depositsCny: sql<number>`(select coalesce(sum(${payments.amountCny}), 0) from ${payments}
         where ${toSupplier} and ${payments.status} = 'paid' and ${payments.kind} = 'Deposit')`.as("deposits_cny"),
     })
@@ -97,7 +100,7 @@ export async function supplierPaymentDetail(db: Database, supplierId: string, q:
     sql<number | null>`(select sum(${orderLines.quantity}) from ${orderLines} join ${items} on ${items.id} = ${orderLines.itemId}
       where ${orderLines.orderId} = ${orders.id} and (${items.countedIn} = 'Metres') = ${metres})`.mapWith(Number);
 
-  const [currencies, [paymentCounts], [lineCounts], paymentRows, orderRows, lineRows] = await Promise.all([
+  const [currencies, [paymentCounts], [lineCounts], paymentRows, orderRows, lineRows, advance] = await Promise.all([
     db
       .select({
         currency: perOrder.currency,
@@ -109,7 +112,9 @@ export async function supplierPaymentDetail(db: Database, supplierId: string, q:
         paidCny: sumOf(perOrder.paidCny),
         paidInr: sumOf(perOrder.paidInr),
         depositsCny: sumOf(perOrder.depositsCny),
-        balanceCny: sql<number>`coalesce(sum(${perOrder.orderValueCny}) - sum(${perOrder.paidCny}), 0)`.mapWith(Number),
+        advanceCny: sumOf(perOrder.advanceCny),
+        // Less direct supplier payments and the supplier advance applied (docs/supplier-advance.md), each counted once.
+        balanceCny: sql<number>`coalesce(sum(${perOrder.orderValueCny}) - sum(${perOrder.paidCny}) - sum(${perOrder.advanceCny}), 0)`.mapWith(Number),
       })
       .from(perOrder)
       .groupBy(perOrder.currency),
@@ -160,6 +165,7 @@ export async function supplierPaymentDetail(db: Database, supplierId: string, q:
         unit: orderColumns.unit,
         orderValueCny: supplierMoney.orderValueCny,
         paidCny: supplierMoney.paidCny,
+        advanceCny: supplierMoney.advanceCny,
       })
       .from(orders)
       .innerJoin(main, and(eq(main.orderId, orders.id), eq(main.position, 0)))
@@ -188,6 +194,7 @@ export async function supplierPaymentDetail(db: Database, supplierId: string, q:
       .orderBy(...newestFirst, asc(orderLines.position))
       .limit(limit)
       .offset(offset(pages.lines)),
+    advanceAccount(db, supplierId),
   ]);
 
   const total = (pick: (row: (typeof currencies)[number]) => number) => currencies.reduce((sum, row) => sum + pick(row), 0);
@@ -209,9 +216,12 @@ export async function supplierPaymentDetail(db: Database, supplierId: string, q:
           paidCny: row.paidCny,
           paidInr: row.paidInr,
           depositsCny: row.depositsCny,
+          advanceCny: row.advanceCny,
           balanceCny: row.balanceCny,
         })),
     },
+    // The supplier's advance account (docs/supplier-advance.md), whole: it is not dated by the orders' range.
+    advance,
     payments: pageOf(paymentRows, paymentCounts?.listed ?? 0, pages.payments),
     orders: pageOf(
       orderRows.map(({ pcs, metres, ...row }) => ({
@@ -220,7 +230,7 @@ export async function supplierPaymentDetail(db: Database, supplierId: string, q:
           ...(pcs === null ? [] : [{ unit: "pcs" as const, quantity: pcs }]),
           ...(metres === null ? [] : [{ unit: "m" as const, quantity: metres }]),
         ],
-        balanceCny: round2(row.orderValueCny - row.paidCny),
+        balanceCny: balanceOf(row),
       })),
       total((row) => row.listed),
       pages.orders,

@@ -111,7 +111,7 @@ const teamOptions = (db: RouteContext["db"], extra: string[] = []) =>
 /**
  * Previous supplier outstanding, shown beside the cost so far but never part of it: per supplier of the trip's orders,
  * the unpaid balance of its orders placed before the trip (order date before the trip's `loadedOn`, so same-day orders
- * are out) other than the trip's own POs: order value - paid supplier payments (the Payments per supplier rule), per
+ * are out) other than the trip's own POs: order value - paid supplier payments - supplier advance applied (the Payments per supplier rule), per
  * order currency and never converted. Fully paid and overpaid orders are left out. Two queries, none per order.
  */
 async function previousOutstanding(db: Database, orderIds: string[], tripDate: string) {
@@ -121,7 +121,8 @@ async function previousOutstanding(db: Database, orderIds: string[], tripDate: s
     .select({
       supplierId: orders.supplierId,
       currency: orders.currency,
-      balance: sql<number>`${supplierMoney.orderValueCny} - ${supplierMoney.paidCny}`.as("balance"),
+      // Less the supplier advance applied too (docs/supplier-advance.md): money the supplier already has.
+      balance: sql<number>`${supplierMoney.orderValueCny} - ${supplierMoney.paidCny} - ${supplierMoney.advanceCny}`.as("balance"),
     })
     .from(orders)
     .where(and(inArray(orders.supplierId, tripSuppliers), notInArray(orders.id, orderIds), lt(orders.orderDate, tripDate)))

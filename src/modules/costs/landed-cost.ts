@@ -1,4 +1,4 @@
-import { and, eq, inArray, sql } from "drizzle-orm";
+import { and, eq, inArray, isNotNull, sql } from "drizzle-orm";
 import { alias, type PgColumn } from "drizzle-orm/pg-core";
 
 import type { Database } from "../../db/client";
@@ -10,6 +10,7 @@ import {
   orderLines,
   orders,
   payments,
+  supplierAdvanceEntries,
   transports,
   warehouseReceiptLines,
   warehouseReceipts,
@@ -23,7 +24,7 @@ export type WaitingFor = "supplier payment" | "duty" | "transport" | "warehouse"
 
 export type OrderLandedCost = {
   orderId: string;
-  /** Paid payments to the supplier, each at its own rateInr. */
+  /** Paid payments to the supplier, each at its own rateInr, plus the supplier advance applied at each advance's rate. */
   goodsInr: number;
   /** Paid payments to an agent (FOB sea freight); 0 when every container carrying the order is CNF. */
   seaFreightInr: number;
@@ -56,7 +57,10 @@ type ContainerFacts = {
 /** What computeLandedCosts works from, as loadLandedCosts reads it. */
 export type LandedCostFacts = {
   orders: { id: string; stage: number; valueCny: number }[];
-  /** Paid payments only. `inr` is round2(amountCny * rateInr), rounded in SQL so it matches PAY-1 to the paisa. */
+  /**
+   * Paid payments only, plus one supplier row per advance allocation or reversal (docs/supplier-advance.md; a reversal
+   * negative). `inr` is round2(amountCny * rateInr), rounded in SQL so it matches PAY-1 to the paisa.
+   */
   payments: { orderId: string; payeeRole: string; amountCny: number; inr: number }[];
   /**
    * Every container line of every container carrying one of the orders, other orders' lines included (shares).
@@ -149,7 +153,7 @@ export function computeLandedCosts(facts: LandedCostFacts): Map<string, OrderLan
   return costs;
 }
 
-/** Landed cost of the given orders (every order when omitted), keyed by order id. Five queries, whatever the count. */
+/** Landed cost of the given orders (every order when omitted), keyed by order id. Six queries, whatever the count. */
 export async function loadLandedCosts(db: Pick<Database, "select">, orderIds?: string[]): Promise<Map<string, OrderLandedCost>> {
   if (orderIds?.length === 0) return new Map();
   const of = (column: PgColumn) => (orderIds ? inArray(column, orderIds) : undefined);
@@ -162,7 +166,7 @@ export async function loadLandedCosts(db: Pick<Database, "select">, orderIds?: s
     .innerJoin(carryingLine, eq(carryingLine.id, carrying.orderLineId))
     .where(of(carryingLine.orderId));
 
-  const [orderRows, paymentRows, loads, containerRows, stocked] = await Promise.all([
+  const [orderRows, paymentRows, advanceRows, loads, containerRows, stocked] = await Promise.all([
     // Joined, not a correlated subquery: Drizzle leaves columns unqualified in a select without joins.
     db
       .select({
@@ -183,6 +187,17 @@ export async function loadLandedCosts(db: Pick<Database, "select">, orderIds?: s
       })
       .from(payments)
       .where(and(eq(payments.status, "paid"), of(payments.orderId))),
+    // The advance applied is the supplier's money for the goods, at the rate it was paid at: goods cost and the
+    // "supplier payment" wait count it like a supplier payment (it is never in `payments`, so never twice).
+    db
+      .select({
+        orderId: sql<string>`${supplierAdvanceEntries.orderId}`,
+        payeeRole: sql<string>`'supplier'`,
+        amountCny: sql<number>`case when ${supplierAdvanceEntries.kind} = 'allocation' then ${supplierAdvanceEntries.amount} else -${supplierAdvanceEntries.amount} end`.mapWith(Number),
+        inr: sql<number>`(case when ${supplierAdvanceEntries.kind} = 'allocation' then 1 else -1 end) * round(${supplierAdvanceEntries.amount} * ${supplierAdvanceEntries.exchangeRate}, 2)`.mapWith(Number),
+      })
+      .from(supplierAdvanceEntries)
+      .where(and(isNotNull(supplierAdvanceEntries.orderId), of(supplierAdvanceEntries.orderId))),
     db
       .select({
         containerId: containerLines.containerId,
@@ -223,7 +238,7 @@ export async function loadLandedCosts(db: Pick<Database, "select">, orderIds?: s
 
   return computeLandedCosts({
     orders: orderRows,
-    payments: paymentRows,
+    payments: [...paymentRows, ...advanceRows],
     loads,
     containers: containerRows.map(({ clearingStatus, tripStatus, receiptStatus, ...container }) => ({
       ...container,

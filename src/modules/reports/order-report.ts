@@ -32,7 +32,8 @@ import { loadLandedCosts } from "../costs/landed-cost";
 import { depositRows, summarise, toRow } from "../deposits/deposits.routes";
 import { byCurrency } from "../master-data/supplier-insights";
 import { orderClosed } from "../orders/closure";
-import { depositState } from "../orders/money";
+import { advanceAccount, advanceStatus, orderAdvanceEntries } from "../advances/advances";
+import { balanceOf, depositState } from "../orders/money";
 import { byPo, orderRows, round2, unitSymbol } from "../orders/orders.routes";
 import { supplierMoney, toSupplier } from "./reports";
 
@@ -98,7 +99,7 @@ export async function orderReport(db: Database, po: string, user: CurrentUser) {
     .where(eq(orderLines.orderId, orderId));
   const logistics = can("containers");
 
-  const [[header], lineRows, paymentList, receiptRows, containerList, containerLineRows, clearingRows, tripRows, receiptList, receiptLineRows, costs, account] =
+  const [[header], lineRows, paymentList, receiptRows, containerList, containerLineRows, clearingRows, tripRows, receiptList, receiptLineRows, costs, account, advanceList] =
     await Promise.all([
       db
         .select({
@@ -123,6 +124,8 @@ export async function orderReport(db: Database, po: string, user: CurrentUser) {
           createdBy: authorName,
           paidCny: supplierMoney.paidCny,
           paidInr: supplierMoney.paidInr,
+          advanceCny: supplierMoney.advanceCny,
+          advanceInr: supplierMoney.advanceInr,
           depositsPaidCny: sql<number>`(select coalesce(sum(${payments.amountCny}), 0) from ${payments}
             where ${toSupplier} and ${payments.status} = 'paid' and ${payments.kind} = 'Deposit')`.mapWith(Number),
           dueCny: sql<number>`(select coalesce(sum(${payments.amountCny}), 0) from ${payments} where ${toSupplier} and ${payments.status} = 'due')`.mapWith(Number),
@@ -337,13 +340,21 @@ export async function orderReport(db: Database, po: string, user: CurrentUser) {
       // The supplier's account beside this order (payments View, as the money is): every order's value, paid and
       // balance per currency, and the supplier-level deposits with their transactions, which no order payment counts.
       section("payments", async () => {
-        const [perOrder, deposits] = await Promise.all([
+        const [perOrder, deposits, advance] = await Promise.all([
           db
-            .select({ id: orders.id, currency: orders.currency, closed: orderClosed, orderValueCny: supplierMoney.orderValueCny, paidCny: supplierMoney.paidCny })
+            .select({
+              id: orders.id,
+              currency: orders.currency,
+              closed: orderClosed,
+              orderValueCny: supplierMoney.orderValueCny,
+              paidCny: supplierMoney.paidCny,
+              advanceCny: supplierMoney.advanceCny,
+            })
             .from(orders)
             .innerJoin(suppliers, eq(suppliers.id, orders.supplierId))
             .where(eq(orders.supplierId, row.supplierId)),
           depositRows(db, eq(supplierDeposits.supplierId, row.supplierId)).then((rows) => rows.map(toRow)),
+          advanceAccount(db, row.supplierId),
         ]);
         const t = supplierDepositTransactions;
         const transactions = deposits.length
@@ -364,13 +375,18 @@ export async function orderReport(db: Database, po: string, user: CurrentUser) {
           openOrders: perOrder.filter((order) => !order.closed).length,
           purchaseValue: byCurrency(perOrder, (order) => order.orderValueCny),
           paid: byCurrency(perOrder, (order) => order.paidCny),
-          balance: byCurrency(perOrder, (order) => order.orderValueCny - order.paidCny),
+          advanceApplied: byCurrency(perOrder, (order) => order.advanceCny),
+          balance: byCurrency(perOrder, balanceOf),
+          // The supplier's advance account per currency: received, applied, given back and available (docs/supplier-advance.md).
+          advance: advance.summary,
           deposits: {
             summary: summarise(deposits),
             list: deposits.map(({ supplierId: _supplierId, supplier: _supplier, transactions: _count, ...deposit }) => ({ ...deposit, transactions: byDeposit.get(deposit.id) ?? [] })),
           },
         };
       }),
+      // The order's supplier advance allocations and reversals (docs/supplier-advance.md), as ORD-4 lists them.
+      section("payments", () => orderAdvanceEntries(db, orderId)),
     ]);
 
   const lines = lineRows.map((line) => ({ ...line, excess: Math.max(0, line.received - line.ordered), short: Math.max(0, line.ordered - line.received), pending: Math.max(0, line.ordered - line.received) }));
@@ -506,7 +522,11 @@ export async function orderReport(db: Database, po: string, user: CurrentUser) {
       ? {
           paidCny: header!.paidCny,
           paidInr: header!.paidInr,
-          balanceCny: round2(row.orderValueCny - header!.paidCny),
+          advanceCny: header!.advanceCny,
+          advanceInr: header!.advanceInr,
+          advanceStatus: advanceStatus(header!.advanceCny, balanceOf({ orderValueCny: row.orderValueCny, paidCny: header!.paidCny, advanceCny: header!.advanceCny })),
+          advanceEntries: advanceList ?? [],
+          balanceCny: balanceOf({ orderValueCny: row.orderValueCny, paidCny: header!.paidCny, advanceCny: header!.advanceCny }),
           depositsPaidCny: header!.depositsPaidCny,
           dueCny: header!.dueCny,
           agentPaidCny: header!.agentPaidCny,
