@@ -113,6 +113,13 @@
       "when": 1794978705685,
       "tag": "0015_order_terms",
       "breakpoints": true
+    },
+    {
+      "idx": 16,
+      "version": "7",
+      "when": 1795002191499,
+      "tag": "0016_supplier_excess",
+      "breakpoints": true
     }
   ]
 }

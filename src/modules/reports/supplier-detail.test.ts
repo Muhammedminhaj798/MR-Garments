@@ -405,16 +405,18 @@ describe("GET /reports/payments-per-supplier/:supplierId on a larger data set", 
       lineItems: 14,
       products: 6,
       byCurrency: [
-        { currency: "CNY", orders: 7, orderValueCny: 2090, paidCny: 1734, paidInr: 21308, depositsCny: 604, advanceCny: 0, balanceCny: 356 },
+        // The overpaid fixture order (written directly, so without an excess lot) counts 0, never below (0016).
+        { currency: "CNY", orders: 7, orderValueCny: 2090, paidCny: 1734, paidInr: 21308, depositsCny: 604, advanceCny: 0, balanceCny: 386 },
         // ₹123.57 + ₹123.57 + 3 x ₹12, not round(2 x 10.01 x 12.345) = ₹247.15 + ₹36.
         { currency: "USD", orders: 4, orderValueCny: 155, paidCny: 23.02, paidInr: 283.14, depositsCny: 23.02, advanceCny: 0, balanceCny: 131.98 },
         { currency: "INR", orders: 1, orderValueCny: 1500, paidCny: 1000, paidInr: 1000, depositsCny: 1000, advanceCny: 0, balanceCny: 500 },
       ],
     });
     const overpaid = await get(path(yiwu, `from=${indiaDay(-55)}&to=${indiaDay(-55)}`));
-    expect(overpaid.summary.byCurrency).toEqual([{ currency: "CNY", orders: 1, orderValueCny: 120, paidCny: 150, paidInr: 1800, depositsCny: 100, advanceCny: 0, balanceCny: -30 }]);
-    expect(overpaid.orders.rows).toMatchObject([{ id: y[1]!.id, orderValueCny: 120, paidCny: 150, balanceCny: -30 }]);
-    for (const row of await everyRow<OrderRow>(yiwu, "orders")) expect(row.balanceCny, row.po).toBe(round2(row.orderValueCny - row.paidCny));
+    // Overpaid: the balance is 0, never below (the excess is the supplier's advance once its lot exists, 0016).
+    expect(overpaid.summary.byCurrency).toEqual([{ currency: "CNY", orders: 1, orderValueCny: 120, paidCny: 150, paidInr: 1800, depositsCny: 100, advanceCny: 0, balanceCny: 0 }]);
+    expect(overpaid.orders.rows).toMatchObject([{ id: y[1]!.id, orderValueCny: 120, paidCny: 150, balanceCny: 0 }]);
+    for (const row of await everyRow<OrderRow>(yiwu, "orders")) expect(row.balanceCny, row.po).toBe(Math.max(0, round2(row.orderValueCny - row.paidCny)));
     const inr = (await everyRow<PaymentRow>(yiwu, "payments")).filter((row) => row.currency === "INR");
     expect(inr).toMatchObject([{ orderId: y[3]!.id, amountCny: 1000, amountInr: 1000 }]);
   });
@@ -426,14 +428,14 @@ describe("GET /reports/payments-per-supplier/:supplierId on a larger data set", 
     const supplierId = expect.any(String);
     expect(report.suppliers).toEqual([
       // y[4] is a stage-6 fixture without a stocked receipt, so it is open, not finished (closure rule, docs/phase2-contracts.md 1).
-      { supplierId: yiwu, supplier: "Yiwu Trims Ltd.", currency: "CNY", orders: pos(y[11]!, y[9]!, y[7]!, y[5]!, y[4]!, y[1]!, y[0]!), orderValueCny: 2090, paidCny: 1734, paidInr: 21308, advanceCny: 0, balanceCny: 356 },
+      { supplierId: yiwu, supplier: "Yiwu Trims Ltd.", currency: "CNY", orders: pos(y[11]!, y[9]!, y[7]!, y[5]!, y[4]!, y[1]!, y[0]!), orderValueCny: 2090, paidCny: 1734, paidInr: 21308, advanceCny: 0, balanceCny: 386 },
       { supplierId, supplier: "Shenzhen Apparel", currency: "CNY", orders: pos(others.shenzhen), orderValueCny: 500, paidCny: 0, paidInr: 0, advanceCny: 0, balanceCny: 500 },
       { supplierId, supplier: "Hangzhou Knits", currency: "CNY", orders: pos(h1), orderValueCny: 100, paidCny: 40, paidInr: 480, advanceCny: 0, balanceCny: 60 },
       { supplierId: yiwu, supplier: "Yiwu Trims Ltd.", currency: "USD", orders: pos(y[10]!, y[8]!, y[6]!, y[2]!), orderValueCny: 155, paidCny: 23.02, paidInr: 283.14, advanceCny: 0, balanceCny: 131.98 },
       { supplierId, supplier: "Hangzhou Knits", currency: "USD", orders: pos(h2), orderValueCny: 15, paidCny: 5, paidInr: 440, advanceCny: 0, balanceCny: 10 },
       { supplierId: yiwu, supplier: "Yiwu Trims Ltd.", currency: "INR", orders: pos(y[3]!), orderValueCny: 1500, paidCny: 1000, paidInr: 1000, advanceCny: 0, balanceCny: 500 },
     ]);
-    const cny = { orders: 9, orderValueCny: 2690, paidCny: 1774, paidInr: 21788, advanceCny: 0, balanceCny: 916 };
+    const cny = { orders: 9, orderValueCny: 2690, paidCny: 1774, paidInr: 21788, advanceCny: 0, balanceCny: 946 };
     expect(report).toMatchObject({
       totals: cny,
       totalsByCurrency: [

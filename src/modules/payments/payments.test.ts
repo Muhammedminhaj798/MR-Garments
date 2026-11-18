@@ -118,10 +118,11 @@ describe("PAY-2 POST /payments", () => {
     expect(row).toMatchObject({ kind: "Deposit", payee: "Sino Freight", payeeRole: "agent", status: "paid", paidOn: dayInIndia(0) });
   });
 
-  it("lets the balance go below 0 (no overpayment check)", async () => {
+  it("takes a payment beyond the value (no overpayment check): the balance is 0 and the rest is the supplier's advance (0016)", async () => {
     expect((await record(body({ amountCny: 9500 }))).status).toBe(201);
     const pay1 = await get("/payments");
-    expect(pay1.body.orders[0].balanceCny).toBe(-500);
+    expect(pay1.body.orders[0].balanceCny).toBe(0);
+    expect((await get(`/orders/${encodeURIComponent(pay1.body.orders[0].po)}`)).body).toMatchObject({ balanceCny: 0, excessCny: 500 });
   });
 
   it("refuses broken rules with 422 under the field and stores nothing", async () => {
@@ -172,7 +173,8 @@ describe("PAY-2 in the order's currency (migration 0006)", () => {
   it("an INR order takes no rate: the payment is stored at 1, so its INR is the amount", async () => {
     for (const rateInr of [undefined, 1]) expect((await recordFor("INR", { rateInr, amountCny: 5000 })).status).toBe(201);
     expect((await stored()).map((row) => row.rateInr)).toEqual([1, 1]);
-    expect((await get("/payments")).body.orders[0]).toMatchObject({ currency: "INR", paidCny: 11000, paidInr: 22000 }); // ¥-era deposit 1000 x 12
+    // Paid 11,000 (¥-era deposit 1000 x 12 plus 2 x 5,000) on a 10,000 order: 10,000 toward it, the newest 1,000 (at 1) is excess (0016).
+    expect((await get("/payments")).body.orders[0]).toMatchObject({ currency: "INR", paidCny: 10000, paidInr: 21000 });
   });
 
   it("refuses a rate on an INR order and a missing rate on a USD or CNY order", async () => {

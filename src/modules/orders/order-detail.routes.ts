@@ -242,6 +242,9 @@ export function orderDetailRoutes({ db }: RouteContext) {
       // The supplier advance applied (not a payment) and its INR at each advance's rate (docs/supplier-advance.md).
       advanceCny: row.advanceCny,
       advanceInr: row.advanceInr,
+      // Supplier payments beyond the order's value, now the supplier's available advance (0016); paid figures exclude it.
+      excessCny: row.excessCny,
+      excessInr: row.excessInr,
       advanceStatus: advanceStatus(row.advanceCny, balanceCny),
       // What the supplier is still owed: agent payments are sea freight, not the goods (docs/phase2-fixes.md 1); the
       // advance applied counts as the supplier's money already.

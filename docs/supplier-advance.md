@@ -10,6 +10,8 @@ supplier use it automatically. MR Garments only records it; nothing moves money.
 - The advance applied to an order **counts toward the deposit the supplier asked for** (`deposit_required_cny`).
 - An advance carries a **typed INR rate** (the form prefills the supplier's saved rate), like a payment; INR suppliers
   take none (stored as 1).
+- **2026-11-18: an order deposit is supplier advance.** A paid supplier deposit on an order (entered on New order, ORD-3,
+  or recorded later as a Deposit payment, PAY-2) is advance money already applied to that order. See "Order deposits".
 
 ## Data: `supplier_advance_entries` (append-only ledger)
 
@@ -83,6 +85,53 @@ records are not deleted (409, deactivate instead). USR-5 counts `supplier_advanc
 - **Deposit paid** (`depositPaidCny`) = paid supplier deposits + advance applied (owner decision).
 - **Landed cost** goods INR adds the advance applied at each receipt's rate; the "supplier payment" wait counts it.
 - Supplier deposits (0008) and their settlements are untouched and never read or write the advance ledger.
+- Order deposits are read into the advance account's figures (above), never into `advanceCny`, so they are counted once.
+
+## Order deposits (owner decision 2026-11-18)
+
+A payments row with `kind = 'Deposit'`, `payee_role = 'supplier'` and `status = 'paid'` (`isOrderDeposit`,
+`advances.ts`) is part of the supplier's advance account, **applied in full to its own order**:
+
+- **One record.** The payment stays the deposit's only record; nothing is copied into `supplier_advance_entries` and no
+  migration exists. Historical deposits appear as they are, with their order, paid-on day, the order's currency and the
+  payment's typed rate.
+- **Counted once.** The order's money is unchanged: the deposit is a supplier payment (`supplierPaidCny`, deposit paid),
+  never `advanceCny`. Allocation (`settleAdvance`) already treats it as paid, so a new order draws only what its
+  deposits leave to pay.
+- **Available is the ledger's alone.** A deposit is recorded and applied at once, so it never changes
+  `availableCny`, and `advanceTotals` (allocation, ORD-2 `advanceAvailable`, ORD-4) does not read it.
+- **Read side.** `advanceSummary` (DEP-1 `advances`, and through `advanceAccount` ADV-1, ADV-2, SD-1, RPT-5D and the
+  order report) adds `depositsCny` per supplier and currency and counts its orders in `orders`. `advanceAccount` adds
+  `deposits[]` (`id` = the payment's, `po`, `paidOn`, `currency`, `amount`, `exchangeRate`, `amountInr`, `mode`,
+  `reference`, `notes`, `recordedAt`, `recordedBy`, `balance` = the available advance at the end of its day).
+- **Figures** (frontend): advance recorded = received + deposits; applied (net) = allocated − reversed + deposits;
+  available = the ledger's. Recorded − applied (net) = available.
+- **Deleting** the payment (PAY-3) takes it out of the account; its order then owes that amount again (ADV-4 can apply
+  added advance to it). Agent deposits, Balance payments and supplier deposits (0008) are not supplier advance.
+- A deposit counts for what it settled of its order; any part beyond the order's value is an **excess payment** (below).
+
+## Excess payments (0016, owner rule 2026-11-18)
+
+Supplier money paid on an order beyond its value is the supplier's **available advance**, never a negative balance:
+
+- **Order settlement first.** An order's paid supplier payments (deposits and balance payments) settle it up to its
+  value. `settleAdvance` keeps the order's excess at exactly `max(0, paid - value)` (`syncExcess`) before it touches the
+  order's own allocations, in every call (ORD-3, ORD-5 with lines, PAY-2, PAY-3, ADV-4), under the supplier's lock.
+- **Ledger.** An increase writes `excess` lots, newest payment first, one per payment, each with that payment's day,
+  mode, reference and rate (`payment_id` links it). A lot is drawn like a receipt (oldest first) by new orders and by
+  ADV-4. A decrease (a payment deleted, PAY-3; the order's value raised, ORD-5) writes `excess_return` from the order's
+  newest lots, out of what is still free; when other orders already drew on a lot, their allocations are given back
+  first (`reversal`, newest first) and those orders owe that amount again.
+- **Available** = receipts + excess − allocations + reversals − excess returns, per supplier and currency.
+- **Counted once.** `orderMoney.paidCny`, `paidInr`, `supplierPaidCny` and `supplierPaidInr` leave the order's excess out
+  (`excessCny`, `excessInr` at each payment's rate), so every balance, payment status, report total and landed cost
+  counts the money on the order that uses it. `balanceOf` never goes below 0. Payment rows themselves are unchanged.
+- **Account figures:** recorded = received + excess + order deposits (settled part); applied (net) = allocated −
+  reversed + order deposits; available = recorded − applied.
+- **Unchanged:** ORD-5 still refuses an order total below what was paid; agent payments and supplier deposits (0008) are
+  never excess.
+- **Before 0016:** orders already overpaid have no excess lots. A reviewed, separate script creates them; nothing does
+  it automatically.
 
 ## Known limits
 

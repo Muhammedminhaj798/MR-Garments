@@ -27,10 +27,19 @@ const sumInr = (where: SQL) =>
 // The supplier advance applied to the order (docs/supplier-advance.md): its allocations less their reversals, each at
 // the rate of the advance it came from. Never a payment: the balance, payment status and the deposit against what the
 // supplier asked for count it beside the supplier payments, once.
-const advanceOfOrder = sql`${advances.orderId} = ${orders.id} and ${advances.kind} <> 'receipt'`;
+const advanceOfOrder = sql`${advances.orderId} = ${orders.id} and ${advances.kind} in ('allocation', 'reversal')`;
 const appliedSign = sql`case when ${advances.kind} = 'allocation' then 1 else -1 end`;
 const advanceCny = sql<number>`(select coalesce(sum(${appliedSign} * ${advances.amount}), 0) from ${advances} where ${advanceOfOrder})`.mapWith(Number);
 const advanceInr = sql<number>`(select coalesce(sum(${appliedSign} * round(${advances.amount} * ${advances.exchangeRate}, 2)), 0) from ${advances} where ${advanceOfOrder})`.mapWith(Number);
+
+// The order's excess (0016, docs/supplier-advance.md): its paid supplier payments beyond its value, moved to the
+// supplier's available advance (excess lots less their returns), at each payment's own rate. It is taken off every
+// "paid" figure below, so the money counts once: on this order up to its value, and as advance wherever it is applied.
+const excessOfOrder = sql`${advances.orderId} = ${orders.id} and ${advances.kind} in ('excess', 'excess_return')`;
+const excessSign = sql`case when ${advances.kind} = 'excess' then 1 else -1 end`;
+const excessCny = sql<number>`(select coalesce(sum(${excessSign} * ${advances.amount}), 0) from ${advances} where ${excessOfOrder})`.mapWith(Number);
+const excessInr = sql<number>`(select coalesce(sum(${excessSign} * round(${advances.amount} * ${advances.exchangeRate}, 2)), 0) from ${advances} where ${excessOfOrder})`.mapWith(Number);
+const less = (figure: SQL, minus: SQL) => sql<number>`(${figure} - ${minus})`.mapWith(Number);
 
 // Each correlation is its own fragment, nested: drizzle keeps a nested fragment's table names, but drops them from a
 // single-table select's top-level columns (so an inlined `orders.id` would become the subquery's own `id`).
@@ -38,12 +47,15 @@ const linesOfOrder = sql`${orderLines.orderId} = ${orders.id}`;
 
 export const orderMoney = {
   orderValueCny: sql<number>`(select round(coalesce(sum(${orderLines.quantity} * ${orderLines.rateCny}), 0), 2) from ${orderLines} where ${linesOfOrder})`.mapWith(Number),
-  /** Every paid payment, agents included. */
-  paidCny: sumCny(paid),
-  paidInr: sumInr(paid),
-  /** Paid to the supplier only: the order's balance, payment status and deposit figures read these. */
-  supplierPaidCny: sumCny(paidToSupplier),
-  supplierPaidInr: sumInr(paidToSupplier),
+  /** Every paid payment, agents included, less the order's excess (paid toward this order). */
+  paidCny: less(sumCny(paid), excessCny),
+  paidInr: less(sumInr(paid), excessInr),
+  /** Paid to the supplier toward this order (less its excess): the order's balance, payment status and deposit figures read these. */
+  supplierPaidCny: less(sumCny(paidToSupplier), excessCny),
+  supplierPaidInr: less(sumInr(paidToSupplier), excessInr),
+  /** Supplier payments beyond the order's value, moved to the supplier's available advance (0016), and their INR. */
+  excessCny,
+  excessInr,
   /** The supplier advance applied to the order (not a payment), and its INR at each advance's own rate. */
   advanceCny,
   advanceInr,
@@ -60,10 +72,15 @@ export const supplierMoney = {
   paidInr: orderMoney.supplierPaidInr,
   advanceCny: orderMoney.advanceCny,
   advanceInr: orderMoney.advanceInr,
+  excessCny: orderMoney.excessCny,
+  excessInr: orderMoney.excessInr,
 };
 
-/** What the supplier is still owed: the order value less direct supplier payments and the advance applied (one rule, every screen). */
-export const balanceOf = (row: { orderValueCny: number; paidCny: number; advanceCny: number }) => round2(row.orderValueCny - row.paidCny - row.advanceCny);
+/**
+ * What the supplier is still owed: the order value less supplier payments toward it and the advance applied (one rule,
+ * every screen); never below 0, as anything paid beyond the value is the supplier's advance (0016).
+ */
+export const balanceOf = (row: { orderValueCny: number; paidCny: number; advanceCny: number }) => Math.max(0, round2(row.orderValueCny - row.paidCny - row.advanceCny));
 
 export const DEPOSIT_STATUSES = ["none", "due", "partly", "paid"] as const;
 export type DepositStatus = (typeof DEPOSIT_STATUSES)[number];

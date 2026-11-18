@@ -110,6 +110,8 @@ describe("ORD-4 GET /orders/:po", () => {
       terms: "CNF",
       advanceCny: 0,
       advanceInr: 0,
+      excessCny: 0,
+      excessInr: 0,
       advanceStatus: "none",
       advanceEntries: [],
       advanceAvailableCny: 0,

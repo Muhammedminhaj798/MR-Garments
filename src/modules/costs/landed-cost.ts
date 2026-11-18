@@ -193,8 +193,9 @@ export async function loadLandedCosts(db: Pick<Database, "select">, orderIds?: s
       .select({
         orderId: sql<string>`${supplierAdvanceEntries.orderId}`,
         payeeRole: sql<string>`'supplier'`,
-        amountCny: sql<number>`case when ${supplierAdvanceEntries.kind} = 'allocation' then ${supplierAdvanceEntries.amount} else -${supplierAdvanceEntries.amount} end`.mapWith(Number),
-        inr: sql<number>`(case when ${supplierAdvanceEntries.kind} = 'allocation' then 1 else -1 end) * round(${supplierAdvanceEntries.amount} * ${supplierAdvanceEntries.exchangeRate}, 2)`.mapWith(Number),
+        // + an allocation or an excess return (money back on this order); - a reversal or an excess (money moved off it, 0016).
+        amountCny: sql<number>`case when ${supplierAdvanceEntries.kind} in ('allocation', 'excess_return') then ${supplierAdvanceEntries.amount} else -${supplierAdvanceEntries.amount} end`.mapWith(Number),
+        inr: sql<number>`(case when ${supplierAdvanceEntries.kind} in ('allocation', 'excess_return') then 1 else -1 end) * round(${supplierAdvanceEntries.amount} * ${supplierAdvanceEntries.exchangeRate}, 2)`.mapWith(Number),
       })
       .from(supplierAdvanceEntries)
       .where(and(isNotNull(supplierAdvanceEntries.orderId), of(supplierAdvanceEntries.orderId))),

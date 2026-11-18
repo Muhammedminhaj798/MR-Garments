@@ -9,7 +9,7 @@ import { DEPOSIT_DIRECTIONS, orders, payments, supplierDeposits, supplierDeposit
 import { conflict, notFound, validationFailed } from "../../http/errors";
 import { parse } from "../../http/validate";
 import type { RouteContext } from "../context";
-import { advanceAccount, advanceTotals } from "../advances/advances";
+import { advanceAccount, advanceSummary } from "../advances/advances";
 import { money } from "../notifications/notify";
 import { depositState, orderMoney, round2 } from "../orders/money";
 import { isUuid, todayInIndia } from "../stages/common";
@@ -192,7 +192,7 @@ export function depositsRoutes({ db }: RouteContext) {
         .orderBy(desc(orders.orderDate), desc(orders.poNumber)),
       depositRows(db, sql`true`),
       db.select({ id: suppliers.id, name: suppliers.name }).from(suppliers).where(eq(suppliers.status, "Active")),
-      advanceTotals(db),
+      advanceSummary(db),
     ]);
     const supplierDepositList = supplierRows.map(toRow);
     const orderObligations = requirementRows.map(({ required, paid, advance, ...row }) => {

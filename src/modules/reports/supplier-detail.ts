@@ -114,7 +114,8 @@ export async function supplierPaymentDetail(db: Database, supplierId: string, q:
         depositsCny: sumOf(perOrder.depositsCny),
         advanceCny: sumOf(perOrder.advanceCny),
         // Less direct supplier payments and the supplier advance applied (docs/supplier-advance.md), each counted once.
-        balanceCny: sql<number>`coalesce(sum(${perOrder.orderValueCny}) - sum(${perOrder.paidCny}) - sum(${perOrder.advanceCny}), 0)`.mapWith(Number),
+        // Summed per order, each never below 0 (0016): an overpaid order never lowers what other orders still owe.
+        balanceCny: sql<number>`coalesce(sum(greatest(0, round(${perOrder.orderValueCny} - ${perOrder.paidCny} - ${perOrder.advanceCny}, 2))), 0)`.mapWith(Number),
       })
       .from(perOrder)
       .groupBy(perOrder.currency),

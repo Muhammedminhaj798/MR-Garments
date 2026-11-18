@@ -242,11 +242,11 @@ export async function paymentsPerSupplier(db: Database, f: Filters, today: strin
   ]);
   // ponytail: grouped in memory over the open orders; a GROUP BY over pre-aggregated payments when orders reach thousands.
   // `advanceCny`: the supplier advance applied to these orders (docs/supplier-advance.md), apart from paid; the balance counts both.
-  type Row = { supplierId: string; supplier: string; currency: Currency; orders: string[]; orderValueCny: number; paidCny: number; paidInr: number; advanceCny: number };
+  type Row = { supplierId: string; supplier: string; currency: Currency; orders: string[]; orderValueCny: number; paidCny: number; paidInr: number; advanceCny: number; balanceCny: number };
   const bySupplier = new Map<string, Row>();
   for (const order of open) {
     const key = `${order.supplierId} ${order.currency}`;
-    const row = bySupplier.get(key) ?? { supplierId: order.supplierId, supplier: order.supplier, currency: order.currency, orders: [], orderValueCny: 0, paidCny: 0, paidInr: 0, advanceCny: 0 };
+    const row = bySupplier.get(key) ?? { supplierId: order.supplierId, supplier: order.supplier, currency: order.currency, orders: [], orderValueCny: 0, paidCny: 0, paidInr: 0, advanceCny: 0, balanceCny: 0 };
     bySupplier.set(key, {
       ...row,
       orders: [...row.orders, order.po],
@@ -254,6 +254,8 @@ export async function paymentsPerSupplier(db: Database, f: Filters, today: strin
       paidCny: row.paidCny + order.paidCny,
       paidInr: row.paidInr + order.paidInr,
       advanceCny: row.advanceCny + order.advanceCny,
+      // Each order's balance, never below 0 (0016): an overpaid order never lowers what other orders still owe.
+      balanceCny: row.balanceCny + balanceOf(order),
     });
   }
   const rows = [...bySupplier.values()]
@@ -263,7 +265,7 @@ export async function paymentsPerSupplier(db: Database, f: Filters, today: strin
       paidCny: round2(row.paidCny),
       paidInr: round2(row.paidInr),
       advanceCny: round2(row.advanceCny),
-      balanceCny: balanceOf(row),
+      balanceCny: round2(row.balanceCny),
     }))
     .sort((a, b) => compareCurrencies(a.currency, b.currency) || b.orderValueCny - a.orderValueCny || a.supplier.localeCompare(b.supplier));
   const totalsOf = (list: typeof rows) => {

@@ -126,6 +126,8 @@ export async function orderReport(db: Database, po: string, user: CurrentUser) {
           paidInr: supplierMoney.paidInr,
           advanceCny: supplierMoney.advanceCny,
           advanceInr: supplierMoney.advanceInr,
+          excessCny: supplierMoney.excessCny,
+          excessInr: supplierMoney.excessInr,
           depositsPaidCny: sql<number>`(select coalesce(sum(${payments.amountCny}), 0) from ${payments}
             where ${toSupplier} and ${payments.status} = 'paid' and ${payments.kind} = 'Deposit')`.mapWith(Number),
           dueCny: sql<number>`(select coalesce(sum(${payments.amountCny}), 0) from ${payments} where ${toSupplier} and ${payments.status} = 'due')`.mapWith(Number),
@@ -526,6 +528,9 @@ export async function orderReport(db: Database, po: string, user: CurrentUser) {
           advanceInr: header!.advanceInr,
           advanceStatus: advanceStatus(header!.advanceCny, balanceOf({ orderValueCny: row.orderValueCny, paidCny: header!.paidCny, advanceCny: header!.advanceCny })),
           advanceEntries: advanceList ?? [],
+          // Supplier payments beyond the order's value, moved to the supplier's available advance (0016).
+          excessCny: header!.excessCny,
+          excessInr: header!.excessInr,
           balanceCny: balanceOf({ orderValueCny: row.orderValueCny, paidCny: header!.paidCny, advanceCny: header!.advanceCny }),
           depositsPaidCny: header!.depositsPaidCny,
           dueCny: header!.dueCny,

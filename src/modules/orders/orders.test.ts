@@ -100,7 +100,7 @@ describe("ORD-3 POST /orders and ORD-1 GET /orders", () => {
     const first = await create(orderBody());
     expect(first.status).toBe(201);
     // No supplier advance: nothing applied, the order owes its value less the supplier deposit (docs/supplier-advance.md).
-    expect(first.body).toEqual({ order: { id: expect.any(String), po: "PO-2050" }, advance: { appliedCny: 0, changeCny: 0, availableCny: 0, balanceCny: 13740.44, status: "none" } });
+    expect(first.body).toEqual({ order: { id: expect.any(String), po: "PO-2050" }, advance: { appliedCny: 0, changeCny: 0, availableCny: 0, balanceCny: 13740.44, excessCny: 0, status: "none" } });
     const second = await create(orderBody({ orderDate: "2026-10-20", lines: [{ itemId: ids.fabric, quantity: 50, rateCny: 3 }], deposits: [] }));
     expect(second.body.order.po).toBe("PO-2051");
     expect((await get("/orders/options")).body.nextPo).toBe("PO-2052");
@@ -416,7 +416,8 @@ describe("currencies (migration 0006): CNY, USD and INR orders", () => {
     expect(inr.status).toBe(201);
     const rows = await ctx.db.select({ rateInr: payments.rateInr }).from(payments).where(eq(payments.orderId, inr.body.order.id));
     expect(rows).toEqual([{ rateInr: 1 }, { rateInr: 1 }]);
-    expect((await get("/orders")).body[0]).toMatchObject({ currency: "INR", paidCny: 51000, paidInr: 51000 });
+    // Deposits of 51,000 on a 14,975 order: 14,975 toward it, the rest is the supplier's advance (excess, 0016).
+    expect((await get("/orders")).body[0]).toMatchObject({ currency: "INR", paidCny: 14975, paidInr: 14975 });
   });
 
   it("refuses a rate on an INR deposit, a missing rate otherwise, another currency, and a currency not the supplier's, storing nothing", async () => {

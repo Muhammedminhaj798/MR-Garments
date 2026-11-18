@@ -145,17 +145,22 @@ export function paymentsRoutes({ db }: RouteContext) {
     const deleted = await db.transaction(async (tx) => {
       const found = (await tx.select({ orderId: payments.orderId }).from(payments).where(eq(payments.id, id)))[0];
       if (!found) throw notFound("Payment");
-      const order = (await tx.select({ po: orders.poNumber, currency: orders.currency }).from(orders).where(eq(orders.id, found.orderId)).for("update"))[0]!;
+      const order = (
+        await tx.select({ po: orders.poNumber, currency: orders.currency, supplierId: orders.supplierId }).from(orders).where(eq(orders.id, found.orderId)).for("update")
+      )[0]!;
       // Read again under the lock: a delete of the same payment that got there first leaves nothing (404).
       const row = (
         await tx
-          .select({ kind: payments.kind, status: payments.status, payee: payments.payee, amountCny: payments.amountCny })
+          .select({ kind: payments.kind, status: payments.status, payee: payments.payee, payeeRole: payments.payeeRole, amountCny: payments.amountCny })
           .from(payments)
           .where(eq(payments.id, id))
           .for("update")
       )[0];
       if (!row) throw notFound("Payment");
       await tx.delete(payments).where(eq(payments.id, id));
+      // A supplier payment may have been partly the supplier's advance (excess, 0016): bring the order's excess back to
+      // what the remaining payments leave, in this transaction. Never draws advance by itself (cap); ADV-4 applies it.
+      if (row.payeeRole === "supplier") await settleAdvance(tx, { id: found.orderId, po: order.po, supplierId: order.supplierId, currency: order.currency }, req.user!.id, "cap");
       return { ...row, ...order };
     });
     // ponytail: the server log is the deletion record; an audit table needs a migration, add one when audits are asked for.
