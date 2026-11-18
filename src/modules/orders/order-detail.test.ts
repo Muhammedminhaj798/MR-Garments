@@ -106,6 +106,8 @@ describe("ORD-4 GET /orders/:po", () => {
       paidInr: 26562.25, // 1234.56 * 11.8765 = 14662.25 (rounded) + 1000 * 11.9
       supplierPaidCny: 1234.56,
       supplierPaidInr: 14662.25,
+      // Taken from its first container (sent CNF before 0015's order terms existed): docs/order-container-terms.md.
+      terms: "CNF",
       advanceCny: 0,
       advanceInr: 0,
       advanceStatus: "none",

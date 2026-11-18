@@ -1,4 +1,4 @@
-import { and, asc, desc, eq, inArray, sql } from "drizzle-orm";
+import { and, asc, desc, eq, inArray, isNull, sql } from "drizzle-orm";
 import { alias } from "drizzle-orm/pg-core";
 import { Router } from "express";
 import { z } from "zod";
@@ -58,6 +58,11 @@ export const MESSAGES = {
   unknownLine: "Choose lines from the list.",
   notLoadable: (po: string) => `${po} can't be loaded: only orders being received or loaded.`,
   overLoad: (item: string, po: string, left: number, unit: string) => `${item} (${po}): only ${left} ${unit} left to load.`,
+  // A container takes its orders' container terms (0015, docs/order-container-terms.md).
+  termsMissing: (pos: string[]) => `Set the container terms on ${joined(pos)} (Edit order) before loading ${pos.length === 1 ? "it" : "them"}.`,
+  mixedTerms: (fob: string[], cnf: string[]) =>
+    `${joined(fob)} ${fob.length === 1 ? "is" : "are"} FOB and ${joined(cnf)} ${cnf.length === 1 ? "is" : "are"} CNF: one container holds orders with the same container terms.`,
+  termsDiffer: (terms: string) => `These orders are ${terms}, so the container is ${terms}.`,
   // Proposed wording (REC-4).
   receiptLoaded: (goods: string[], numbers: string[]) =>
     numbers.length === 1
@@ -95,7 +100,11 @@ const newReceipt = z.strictObject({
 const newContainer = z.strictObject({
   number: z.string({ error: MESSAGES.number }).trim().min(1, MESSAGES.number),
   shippingAgentId: z.uuid({ error: MESSAGES.agent }),
-  terms: z.enum(TERMS, { error: MESSAGES.terms }),
+  /**
+   * The container's terms are its orders' (0015): left out, they come from the orders; sent, they must match them, and
+   * an order without terms (from before 0015) takes them.
+   */
+  terms: z.enum(TERMS, { error: MESSAGES.terms }).optional(),
   portOfLoading: text,
   portOfArrival: text,
   loadedOn: date(MESSAGES.loadedOn),
@@ -443,6 +452,8 @@ export function stockRoutes({ db }: RouteContext) {
         orderLineId: orderLines.id,
         orderId: orders.id,
         po: orders.poNumber,
+        /** The order's container terms (0015): the container loading it takes them; null until set. */
+        terms: orders.terms,
         item: items.name,
         unit: unitSymbol,
         received,
@@ -472,7 +483,7 @@ export function stockRoutes({ db }: RouteContext) {
       const owners = await tx.selectDistinct({ orderId: orderLines.orderId }).from(orderLines).where(inArray(orderLines.id, lineIds));
       const locked = owners.length
         ? await tx
-            .select({ id: orders.id, stage: orders.stage })
+            .select({ id: orders.id, stage: orders.stage, po: orders.poNumber, terms: orders.terms })
             .from(orders)
             .where(
               inArray(
@@ -508,18 +519,42 @@ export function stockRoutes({ db }: RouteContext) {
           problems.lines ??= MESSAGES.overLoad(line.item, line.po, line.received - line.loaded, line.unit);
         }
       }
+      // The container's terms are its orders' (read under their row locks): one FOB/CNF for all, never merged. An order
+      // without terms (from before 0015) takes the ones sent, if any; without them it must be set on Edit order first.
+      const byPo = [...locked].sort((a, b) => a.po.localeCompare(b.po));
+      const withTerms = (terms: string) => byPo.filter((order) => order.terms === terms).map((order) => order.po);
+      const unset = byPo.filter((order) => order.terms === null);
+      const set = [...new Set(byPo.flatMap((order) => (order.terms ? [order.terms] : [])))];
+      const terms = set.length === 1 ? set[0]! : set.length === 0 ? input.terms : undefined;
+      if (set.length > 1) problems.lines ??= MESSAGES.mixedTerms(withTerms("FOB"), withTerms("CNF"));
+      else if (set.length === 1 && input.terms !== undefined && input.terms !== set[0]) problems.terms = MESSAGES.termsDiffer(set[0]!);
+      else if (unset.length > 0 && input.terms === undefined) problems.lines ??= MESSAGES.termsMissing(unset.map((order) => order.po));
       if (Object.keys(problems).length > 0) throw validationFailed(problems);
 
       // The unique index on upper(number) decides duplicates, so two simultaneous adds can't both succeed.
       const { lines: bodyLines, ...values } = input;
       const created = await tx
         .insert(containers)
-        .values({ ...values, status: "loading", createdBy: req.user!.id })
+        .values({ ...values, terms: terms!, status: "loading", createdBy: req.user!.id })
         .onConflictDoNothing()
         .returning({ id: containers.id });
       if (!created[0]) throw conflict("container_exists", MESSAGES.numberTaken, { number: MESSAGES.numberTaken });
       const containerId = created[0].id;
       await tx.insert(containerLines).values(bodyLines.map((line) => ({ ...line, containerId })));
+      // Orders from before 0015 take the container's terms (sent by the client), so every loaded order has them.
+      if (unset.length > 0)
+        await tx
+          .update(orders)
+          .set({ terms: terms! })
+          .where(
+            and(
+              inArray(
+                orders.id,
+                unset.map((order) => order.id),
+              ),
+              isNull(orders.terms),
+            ),
+          );
       await tx
         .update(orders)
         .set({ stage: 3 })

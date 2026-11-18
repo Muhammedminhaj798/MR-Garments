@@ -17,6 +17,7 @@ import {
   receipts,
   shippingAgents,
   supplierAdvanceEntries,
+  TERMS,
   suppliers,
   users,
   warehouseReceiptLines,
@@ -40,6 +41,8 @@ const EDIT = {
   lineChanged: "A line on this order changed. Reload the order and try again.",
   /** In the order's currency (phase 2 final fixes, 5): the figure is what the supplier was paid. */
   belowPaid: (paid: number, currency: Currency) => `The order total can't be less than the ${money(paid, currency)} already paid to the supplier.`,
+  /** Its containers have its terms (CON-3), so they are fixed once it is loaded (unless never set: an older order). */
+  termsLoaded: "This order is already loaded in a container, so its container terms can't change.",
 };
 const orderEdit = z.strictObject({
   /**
@@ -47,6 +50,11 @@ const orderEdit = z.strictObject({
    * unique in any letter case. Only the number changes: the order keeps its id, so everything linked to it follows.
    */
   po: z.string({ error: M.po }).trim().min(1, M.po).max(PO_MAX_LENGTH, M.poTooLong).optional(),
+  /**
+   * The container terms (0015, docs/order-container-terms.md) at stages 1-5 while no container holds the order; an
+   * older order without terms may set them once even when loaded.
+   */
+  terms: z.enum(TERMS, { error: M.terms }).optional(),
   orderDate: z.iso.date({ error: M.orderDate }).optional(),
   deliveryDate: z.iso.date({ error: M.deliveryDate }).optional(),
   lines: lineList(line.extend({ id: z.uuid({ error: EDIT.lineChanged }).optional() })).optional(),
@@ -217,6 +225,8 @@ export function orderDetailRoutes({ db }: RouteContext) {
       supplier: { id: row.supplierId, name: row.supplierName, ...supplier[0]! },
       currency: row.currency,
       exchangeRate: row.exchangeRate,
+      /** The order's container terms (0015); null until set. */
+      terms: row.terms,
       item: row.item,
       quantity: row.quantity,
       unit: row.unit,
@@ -278,6 +288,15 @@ export function orderDetailRoutes({ db }: RouteContext) {
       const newPo = input.po !== undefined && input.po !== row.poNumber ? input.po : undefined;
       if (newPo && (await tx.select({ id: orders.id }).from(orders).where(and(byPo(newPo), sql`${orders.id} <> ${row.id}`))).length > 0) problems.po = M.poTaken;
       if ((input.deliveryDate ?? row.deliveryDate) < (input.orderDate ?? row.orderDate)) problems.deliveryDate = M.deliveryBeforeOrder;
+      // New terms: refused once a container holds the order (the container has its terms); the same ones are no change.
+      const newTerms = input.terms !== undefined && input.terms !== row.terms ? input.terms : undefined;
+      if (newTerms && row.terms !== null) {
+        const loadedLines = await tx
+          .select({ n: count() })
+          .from(containerLines)
+          .where(inArray(containerLines.orderLineId, tx.select({ id: orderLines.id }).from(orderLines).where(eq(orderLines.orderId, row.id))));
+        if (loadedLines[0]!.n > 0) problems.terms = EDIT.termsLoaded;
+      }
       const kept = (input.lines ?? []).flatMap((entry) => (entry.id ? [entry.id] : []));
       if (input.lines) {
         const saved = await tx.select({ id: orderLines.id, itemId: orderLines.itemId }).from(orderLines).where(eq(orderLines.orderId, row.id));
@@ -318,9 +337,9 @@ export function orderDetailRoutes({ db }: RouteContext) {
       const advance = input.lines ? await settleAdvance(tx, { id: row.id, po: newPo ?? row.poNumber, supplierId: row.supplierId, currency: row.currency }, req.user!.id) : null;
       const updated = await tx
         .update(orders)
-        .set({ poNumber: newPo, orderDate: input.orderDate, deliveryDate: input.deliveryDate, depositRequiredCny: input.depositRequiredCny, updatedAt: new Date() })
+        .set({ poNumber: newPo, terms: newTerms, orderDate: input.orderDate, deliveryDate: input.deliveryDate, depositRequiredCny: input.depositRequiredCny, updatedAt: new Date() })
         .where(eq(orders.id, row.id))
-        .returning({ id: orders.id, po: orders.poNumber, stage: orders.stage, orderDate: orders.orderDate, deliveryDate: orders.deliveryDate });
+        .returning({ id: orders.id, po: orders.poNumber, stage: orders.stage, orderDate: orders.orderDate, deliveryDate: orders.deliveryDate, terms: orders.terms });
       if (newPo) {
         // Everything else links to the order by id. Notifications store a link to the order's pages by its number, so
         // those links follow the new number; their titles keep the number the event happened under (a record of it).

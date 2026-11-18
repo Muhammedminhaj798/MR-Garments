@@ -78,8 +78,8 @@ describe("CON-3 POST /containers and CON-1 GET /containers", () => {
     expect(await stageOf(a.id)).toBe(3);
     expect(await stageOf(b.id)).toBe(3);
 
-    // A stage 3 order can be loaded again; it stays at 3.
-    const second = await post(body([{ orderLineId: a.lineIds[1]!, bundles: 1, quantity: 20 }], { sailedOn: indiaDay(0), terms: "CNF" }));
+    // A stage 3 order can be loaded again; it stays at 3. Its terms (FOB, from the first container) go with it.
+    const second = await post(body([{ orderLineId: a.lineIds[1]!, bundles: 1, quantity: 20 }], { sailedOn: indiaDay(0), terms: "FOB" }));
     expect(second.status).toBe(201);
     expect(await stageOf(a.id)).toBe(3);
 
@@ -90,7 +90,7 @@ describe("CON-3 POST /containers and CON-1 GET /containers", () => {
         id: second.body.container.id,
         number: expect.any(String),
         agent: { id: sino, name: "Sino Freight" },
-        terms: "CNF",
+        terms: "FOB",
         loadedOn: indiaDay(-1),
         sailedOn: indiaDay(0),
         eta: indiaDay(20),
@@ -187,7 +187,8 @@ describe("CON-2 GET /containers/options", () => {
     expect(res.status).toBe(200);
     expect(res.body.agents).toEqual([{ id: sino, name: "Sino Freight" }]);
     const mine = res.body.lines.filter((line: { orderId: string }) => [order.id, notReceived.id, cleared.id].includes(line.orderId));
-    expect(mine).toEqual([{ orderLineId: order.lineIds[1], orderId: order.id, po: order.po, item: "Cotton fabric", unit: "m", received: 200, loaded: 50 }]);
+    // With its order's container terms (taken from its first container, FOB): docs/order-container-terms.md.
+    expect(mine).toEqual([{ orderLineId: order.lineIds[1], orderId: order.id, po: order.po, terms: "FOB", item: "Cotton fabric", unit: "m", received: 200, loaded: 50 }]);
     for (const line of res.body.lines) expect(line.received).toBeGreaterThan(line.loaded);
   });
 });

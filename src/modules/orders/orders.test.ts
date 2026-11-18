@@ -142,6 +142,7 @@ describe("ORD-3 POST /orders and ORD-1 GET /orders", () => {
       paidInr: 26562.25, // 1234.56 * 11.8765 = 14662.25 (rounded) + 1000 * 11.9
       supplierPaidCny: 1234.56, // the ¥1,000 agent deposit is sea freight
       supplierPaidInr: 14662.25,
+      terms: null, // no container terms chosen (docs/order-container-terms.md)
       advanceCny: 0,
       advanceInr: 0,
       depositRequiredCny: null,

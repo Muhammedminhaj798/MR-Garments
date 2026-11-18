@@ -41,6 +41,12 @@ export const orders = pgTable(
      * deposits count against it; nothing is stored for the pending part (docs/phase2-fixes.md).
      */
     depositRequiredCny: money("deposit_required_cny"),
+    /**
+     * The order's container terms (0015, docs/order-container-terms.md): FOB or CNF, chosen on the order. A container
+     * takes the terms of the orders loaded into it (CON-3), which must all agree. Null for an order from before 0015
+     * that no container settles (never loaded, or loaded into containers with different terms).
+     */
+    terms: text("terms").$type<(typeof TERMS)[number]>(),
     ...timestamps,
     createdBy: uuid("created_by"),
   },
@@ -52,6 +58,8 @@ export const orders = pgTable(
     check("orders_stage_check", sql`stage between 1 and 6`),
     check("orders_dates_check", sql`delivery_date >= order_date`),
     check("orders_deposit_required_check", sql`deposit_required_cny is null or deposit_required_cny > 0`),
+    // Null passes (not yet set); anything else is FOB or CNF, as on containers.
+    check("orders_terms_check", inList("terms", TERMS)),
   ],
 );
 

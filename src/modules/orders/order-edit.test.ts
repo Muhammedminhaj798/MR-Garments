@@ -122,7 +122,7 @@ describe("ORD-5 PATCH /orders/:po", () => {
     expect(res.status, JSON.stringify(res.body)).toBe(200);
     // A lines edit also answers with the supplier advance re-settled (docs/supplier-advance.md); none here.
     expect(res.body).toEqual({
-      order: { id: order.id, po: order.po, stage: 1, orderDate: "2026-10-22", deliveryDate: "2026-12-15" },
+      order: { id: order.id, po: order.po, stage: 1, orderDate: "2026-10-22", deliveryDate: "2026-12-15", terms: null },
       advance: { appliedCny: 0, changeCny: 0, availableCny: 0, balanceCny: 11800, status: "none" },
     });
     const lines = await linesOf(order.id);

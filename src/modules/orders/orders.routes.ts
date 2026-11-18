@@ -16,6 +16,7 @@ import {
   receiptLines,
   shippingAgents,
   suppliers,
+  TERMS,
   units,
   warehouseReceiptLines,
   warehouseReceipts,
@@ -58,6 +59,8 @@ export const MESSAGES = {
   depositRequired: "Enter the deposit the supplier asked for: above 0, with at most 2 decimals.",
   referenceTooLong: "Use 100 characters or fewer for the reference.",
   notesTooLong: "Use 1,000 characters or fewer for the notes.",
+  /** The order's container terms (0015, docs/order-container-terms.md). */
+  terms: "Choose the container terms: FOB or CNF.",
 };
 const M = MESSAGES;
 /** The PO number column is text; this keeps a typed one readable in lists and URLs. */
@@ -101,6 +104,8 @@ const newOrder = z.strictObject({
   deposits: z.array(deposit).max(10, M.tooManyDeposits).default([]),
   // The deposit the supplier asked for (0009), in the order's currency; left out, none was agreed.
   depositRequiredCny: depositRequired.optional(),
+  // The container terms (0015): FOB or CNF; containers loading this order take them (CON-3). Left out: not set yet.
+  terms: z.enum(TERMS, { error: M.terms }).optional(),
 });
 type NewOrder = z.infer<typeof newOrder>;
 
@@ -195,6 +200,8 @@ export const orderColumns = {
   ...orderMoney,
   /** The deposit the supplier asked for (0009); null when none. depositState() turns it and depositPaidCny into the status. */
   depositRequiredCny: orders.depositRequiredCny,
+  /** The order's container terms (0015): FOB or CNF; null until set (orders from before 0015). */
+  terms: orders.terms,
 };
 // A typed PO without a number sorts after the numbered ones of its day, then by its text.
 export const newestFirst = [desc(orders.orderDate), sql`${poValue} desc nulls last`, desc(orders.poNumber)];
@@ -227,6 +234,7 @@ export function ordersRoutes({ db }: RouteContext) {
         supplier: { id: row.supplierId, name: row.supplierName },
         currency: row.currency,
         exchangeRate: row.exchangeRate,
+        terms: row.terms,
         item: row.item,
         quantity: row.quantity,
         unit: row.unit,
@@ -340,6 +348,7 @@ export function ordersRoutes({ db }: RouteContext) {
               currency: supplier.currency,
               exchangeRate: supplier.currency === "INR" ? 1 : supplier.exchangeRate,
               depositRequiredCny: input.depositRequiredCny ?? null,
+              terms: input.terms ?? null,
               createdBy: userId,
             })
             .returning({ id: orders.id, po: orders.poNumber });

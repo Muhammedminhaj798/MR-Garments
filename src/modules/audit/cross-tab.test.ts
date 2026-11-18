@@ -311,10 +311,11 @@ describe("one order across all five tabs", () => {
   });
 
   it("CON-3: duplicate numbers (any case) are refused, the rest loads on a second container", async () => {
-    const dup = await post("/containers", { number: winnerNumber.toLowerCase(), shippingAgentId: ids.sino, terms: "CNF", portOfLoading: "", portOfArrival: "", loadedOn: indiaDay(0), sailedOn: null, eta: indiaDay(20), lines: [{ orderLineId: order.lines[0], bundles: 1, quantity: 20 }] });
+    const dup = await post("/containers", { number: winnerNumber.toLowerCase(), shippingAgentId: ids.sino, terms: "FOB", portOfLoading: "", portOfArrival: "", loadedOn: indiaDay(0), sailedOn: null, eta: indiaDay(20), lines: [{ orderLineId: order.lines[0], bundles: 1, quantity: 20 }] });
     expect(dup.status).toBe(409);
     expect(dup.body.error.code).toBe("container_exists");
-    const rest = await post("/containers", { number: "MSCU1000003", shippingAgentId: ids.sino, terms: "CNF", portOfLoading: "Nansha", portOfArrival: "Kochi", loadedOn: indiaDay(0), sailedOn: indiaDay(0), eta: indiaDay(20), lines: [{ orderLineId: order.lines[0], bundles: 1, quantity: 20 }, { orderLineId: order.lines[1], bundles: 1, quantity: 20 }] });
+    // The order's terms (FOB, docs/order-container-terms.md) in every container it is split across.
+    const rest = await post("/containers", { number: "MSCU1000003", shippingAgentId: ids.sino, terms: "FOB", portOfLoading: "Nansha", portOfArrival: "Kochi", loadedOn: indiaDay(0), sailedOn: indiaDay(0), eta: indiaDay(20), lines: [{ orderLineId: order.lines[0], bundles: 1, quantity: 20 }, { orderLineId: order.lines[1], bundles: 1, quantity: 20 }] });
     expect(rest.status).toBe(201);
     containerIds.push(rest.body.container.id);
     state.loaded = [60, 50];

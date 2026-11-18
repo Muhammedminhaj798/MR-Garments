@@ -134,7 +134,8 @@ ORD-1 to ORD-4 are in `docs/live-screens-contracts.md`. Both routes are in `src/
   containers, clearing, transport, warehouse lines, landed cost and reports follow; the response's `po` is the new one
   and the old number answers 404. Notification links to `/orders/<old>/...` are rewritten to the new number (titles keep
   the number they were raised under); supplier advance entries keep the stored number but show the order's current
-  one; a server log line records the change. stages 2-5 with `orderDate` or `lines`: 409
+  one; a server log line records the change. `terms?` (FOB/CNF, migration 0015) follows docs/order-container-terms.md.
+  stages 2-5 with `orderDate` or `lines`: 409
   `order_locked` "Goods have been received for this order, so only the delivery date can change.". 422 on
   `deliveryDate` for BR-09 (saved values for keys not sent); on `lines` for an inactive or unknown item (a line keeping
   its saved item is not re-checked), an `id` that isn't one of this order's lines (or repeated) ("A line on this order
