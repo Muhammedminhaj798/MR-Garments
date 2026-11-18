@@ -75,6 +75,27 @@ describe("access (payments: Management Full, Accounts Enter, Procurement View, s
     expect((await http.delete(`/supplier-advances/${id}`).set("Cookie", management)).status).toBe(204);
   });
 
+  it("ADV-5 lists the active suppliers (id, name, currency, rate only) to payments Enter, with no order access needed", async () => {
+    expect((await http.get("/supplier-advances/suppliers")).status).toBe(401);
+    const chen = await signInAs(ctx, SEEDED.chinaStaff);
+    expect((await get("/supplier-advances/suppliers", chen)).status).toBe(403);
+    // Procurement views payments only: it can't record an advance, so it gets no list.
+    expect((await get("/supplier-advances/suppliers", procurement)).status).toBe(403);
+    await ctx.db.update(suppliers).set({ currency: "USD", exchangeRate: 84.25 }).where(eq(suppliers.id, guangzhou));
+    await ctx.db.update(suppliers).set({ status: "Inactive" }).where(eq(suppliers.id, hangzhou));
+    const res = await get("/supplier-advances/suppliers", accounts);
+    expect(res.status).toBe(200);
+    const list = res.body.suppliers as { id: string; name: string }[];
+    const active = await ctx.db.select({ id: suppliers.id, name: suppliers.name }).from(suppliers).where(eq(suppliers.status, "Active"));
+    expect(list.map((s) => s.id).toSorted()).toEqual(active.map((s) => s.id).toSorted());
+    expect(list.map((s) => s.name)).toEqual(list.map((s) => s.name).toSorted((a, b) => a.localeCompare(b)));
+    expect(list.some((s) => s.id === hangzhou)).toBe(false);
+    expect(list.find((s) => s.id === guangzhou)).toEqual({ id: guangzhou, name: "Guangzhou Textile Co.", currency: "USD", exchangeRate: 84.25 });
+    for (const supplier of list) expect(Object.keys(supplier).toSorted()).toEqual(["currency", "exchangeRate", "id", "name"]);
+    // Only reads: nothing about orders, balances or contacts, and the advance it leads to is ADV-2 as before.
+    expect((await get("/supplier-advances/suppliers", management)).body).toEqual(res.body);
+  });
+
   it("an order created by Procurement (payments View only) still draws the advance: allocation is the system's", async () => {
     await added(guangzhou);
     expect((await order(2000, {}, guangzhou, procurement)).advance.appliedCny).toBe(2000);

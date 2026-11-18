@@ -15,7 +15,8 @@ import { isUuid, todayInIndia } from "../stages/common";
 import { advanceAccount, lockAdvances, settleAdvance } from "./advances";
 
 // Owner: supplier advance (docs/supplier-advance.md). ADV-1 GET /suppliers/:supplierId/advances, ADV-2 POST
-// /suppliers/:supplierId/advances, ADV-3 DELETE /supplier-advances/:id, ADV-4 POST /orders/:po/advance. An advance is
+// /suppliers/:supplierId/advances, ADV-3 DELETE /supplier-advances/:id, ADV-4 POST /orders/:po/advance, ADV-5 GET
+// /supplier-advances/suppliers. An advance is
 // money the client already paid the supplier before any order; it is recorded here, never moved. New orders draw on it
 // by themselves (ORD-3, ORD-5, ORD-6, PAY-2 through settleAdvance); an existing order draws when ADV-4 is asked to.
 // Nothing here touches `payments` or the supplier deposits.
@@ -81,6 +82,17 @@ export function advancesRoutes({ db }: RouteContext) {
     ]);
     const openOrders = owing.map((row) => ({ ...row, balanceCny: balanceOf(row) })).filter((row) => row.balanceCny > 0);
     res.json({ supplier, ...account, openOrders });
+  });
+
+  // ADV-5. The active suppliers an advance can be recorded for (Record payment's "Supplier advance (no order)"), by
+  // name: id, name, currency and rate now, nothing else. payments Enter, as ADV-2; no order access is needed.
+  router.get("/supplier-advances/suppliers", requirePermission("payments", "Enter"), async (_req, res) => {
+    const list = await db
+      .select({ id: suppliers.id, name: suppliers.name, currency: suppliers.currency, exchangeRate: suppliers.exchangeRate })
+      .from(suppliers)
+      .where(eq(suppliers.status, "Active"))
+      .orderBy(asc(suppliers.name));
+    res.json({ suppliers: list });
   });
 
   // ADV-2. A receipt in the supplier's currency (another is 422), at the rate typed. Any known supplier, as SD-2: money
