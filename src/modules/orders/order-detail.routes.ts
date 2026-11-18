@@ -9,6 +9,7 @@ import {
   containers,
   items,
   locations,
+  notifications,
   orderLines,
   orders,
   payments,
@@ -28,7 +29,7 @@ import { containerOrders } from "../stages/common";
 import { money } from "../notifications/notify";
 import { advanceStatus, advanceTotals, orderAdvanceEntries, settleAdvance } from "../advances/advances";
 import { balanceOf, depositState } from "./money";
-import { byPo, depositRequired, line, lineList, MESSAGES as M, orderRows, round2, unitSymbol } from "./orders.routes";
+import { byPo, depositRequired, isPoTaken, line, lineList, MESSAGES as M, orderRows, PO_MAX_LENGTH, round2, unitSymbol } from "./orders.routes";
 
 // Owner: BE-orders. ORD-4 GET /orders/:po (docs/live-screens-contracts.md, "Five-tab completion"); ORD-5 PATCH and
 // ORD-6 DELETE /orders/:po (docs/contracts.md, "Orders: edit and delete").
@@ -41,6 +42,11 @@ const EDIT = {
   belowPaid: (paid: number, currency: Currency) => `The order total can't be less than the ${money(paid, currency)} already paid to the supplier.`,
 };
 const orderEdit = z.strictObject({
+  /**
+   * The order's new PO number (docs/contracts.md ORD-5), as ORD-3 takes one: any format, trimmed, 1-50 characters,
+   * unique in any letter case. Only the number changes: the order keeps its id, so everything linked to it follows.
+   */
+  po: z.string({ error: M.po }).trim().min(1, M.po).max(PO_MAX_LENGTH, M.poTooLong).optional(),
   orderDate: z.iso.date({ error: M.orderDate }).optional(),
   deliveryDate: z.iso.date({ error: M.deliveryDate }).optional(),
   lines: lineList(line.extend({ id: z.uuid({ error: EDIT.lineChanged }).optional() })).optional(),
@@ -267,6 +273,10 @@ export function orderDetailRoutes({ db }: RouteContext) {
       }
 
       const problems: Record<string, string> = {};
+      // A new PO number (the same one, as saved, is no change). Taken by another order in any letter case: 422 here;
+      // one taken by a concurrent edit or create after this check is caught by the unique index below.
+      const newPo = input.po !== undefined && input.po !== row.poNumber ? input.po : undefined;
+      if (newPo && (await tx.select({ id: orders.id }).from(orders).where(and(byPo(newPo), sql`${orders.id} <> ${row.id}`))).length > 0) problems.po = M.poTaken;
       if ((input.deliveryDate ?? row.deliveryDate) < (input.orderDate ?? row.orderDate)) problems.deliveryDate = M.deliveryBeforeOrder;
       const kept = (input.lines ?? []).flatMap((entry) => (entry.id ? [entry.id] : []));
       if (input.lines) {
@@ -305,15 +315,31 @@ export function orderDetailRoutes({ db }: RouteContext) {
       }
       // A new total re-settles the supplier advance (docs/supplier-advance.md): more is applied when the order grows and
       // advance is available, the excess goes back when it shrinks. Never left at an amount the order no longer owes.
-      const advance = input.lines ? await settleAdvance(tx, { id: row.id, po: row.poNumber, supplierId: row.supplierId, currency: row.currency }, req.user!.id) : null;
+      const advance = input.lines ? await settleAdvance(tx, { id: row.id, po: newPo ?? row.poNumber, supplierId: row.supplierId, currency: row.currency }, req.user!.id) : null;
       const updated = await tx
         .update(orders)
-        .set({ orderDate: input.orderDate, deliveryDate: input.deliveryDate, depositRequiredCny: input.depositRequiredCny, updatedAt: new Date() })
+        .set({ poNumber: newPo, orderDate: input.orderDate, deliveryDate: input.deliveryDate, depositRequiredCny: input.depositRequiredCny, updatedAt: new Date() })
         .where(eq(orders.id, row.id))
         .returning({ id: orders.id, po: orders.poNumber, stage: orders.stage, orderDate: orders.orderDate, deliveryDate: orders.deliveryDate });
-      return { order: updated[0]!, advance };
+      if (newPo) {
+        // Everything else links to the order by id. Notifications store a link to the order's pages by its number, so
+        // those links follow the new number; their titles keep the number the event happened under (a record of it).
+        const from = `/orders/${encodeURIComponent(row.poNumber)}`;
+        const to = `/orders/${encodeURIComponent(newPo)}`;
+        await tx
+          .update(notifications)
+          .set({ href: sql`${to} || substr(${notifications.href}, ${from.length + 1}::int)` })
+          .where(or(eq(notifications.href, from), sql`left(${notifications.href}, ${from.length + 1}::int) = ${`${from}/`}`));
+      }
+      return { order: updated[0]!, advance, renamedFrom: newPo ? row.poNumber : null };
+    }).catch((error: unknown) => {
+      // Another order took the number between the check above and this edit (a concurrent edit or create).
+      if (isPoTaken(error)) throw validationFailed({ po: M.poTaken });
+      throw error;
     });
-    res.json(order.advance ? order : { order: order.order });
+    // ponytail: the server log is the record of a renumbering, as of deletions; an audit table needs a migration.
+    if (order.renamedFrom) console.info(`Order ${order.renamedFrom} renumbered to ${order.order.po} (order ${order.order.id}) by user ${req.user!.id}.`);
+    res.json(order.advance ? { order: order.order, advance: order.advance } : { order: order.order });
   });
 
   // ORD-6. Only an order nothing depends on is deleted, with its own lines (the order_lines cascade). The order and its

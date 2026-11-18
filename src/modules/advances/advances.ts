@@ -3,7 +3,7 @@ import { alias } from "drizzle-orm/pg-core";
 
 import { compareCurrencies } from "../../currencies";
 import type { Database } from "../../db/client";
-import { orderLines, payments, supplierAdvanceEntries as a, users } from "../../db/schema";
+import { orderLines, orders, payments, supplierAdvanceEntries as a, users } from "../../db/schema";
 import { todayInIndia } from "../stages/common";
 
 // The supplier advance account (docs/supplier-advance.md, migration 0014): the one place that writes allocations and
@@ -155,9 +155,13 @@ const entryColumns = {
   advancePaidOn: receiptOf.entryDate,
   advanceReference: receiptOf.reference,
   reversalOf: a.reversalOf,
-  /** Null once the order was deleted; `po` keeps its number. */
+  /** Null once the order was deleted. */
   orderId: a.orderId,
-  po: a.poNumber,
+  /**
+   * The order's PO number as it is now (ORD-5 may renumber an order); a deleted order's, as it was when the entry was
+   * written. The stored po_number is never rewritten: it is the record of the number at the time.
+   */
+  po: sql<string>`coalesce(${orders.poNumber}, ${a.poNumber})`,
   mode: a.mode,
   reference: a.reference,
   notes: a.notes,
@@ -180,6 +184,7 @@ export function orderAdvanceEntries(db: Pick<Database, "select">, orderId: strin
     .select(entryColumns)
     .from(a)
     .leftJoin(receiptOf, eq(receiptOf.id, a.advanceId))
+    .leftJoin(orders, eq(orders.id, a.orderId))
     .leftJoin(users, eq(users.id, a.createdBy))
     .where(eq(a.orderId, orderId))
     .orderBy(...inLedgerOrder(false));
@@ -197,6 +202,7 @@ export async function advanceAccount(db: Pick<Database, "select">, supplierId: s
       .select(entryColumns)
       .from(a)
       .leftJoin(receiptOf, eq(receiptOf.id, a.advanceId))
+      .leftJoin(orders, eq(orders.id, a.orderId))
       .leftJoin(users, eq(users.id, a.createdBy))
       .where(eq(a.supplierId, supplierId))
       .orderBy(...inLedgerOrder(true)),

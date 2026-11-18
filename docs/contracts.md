@@ -127,7 +127,14 @@ ORD-1 to ORD-4 are in `docs/live-screens-contracts.md`. Both routes are in `src/
   `lines? {id?, itemId, quantity, rateCny}[]` (1-50, ORD-3 limits and messages). `lines` replaces the list in array
   order: a line with `id` updates that line, one without is added, a saved line not sent is removed; `position` is
   the array index. 200 `{ order: { id, po, stage, orderDate, deliveryDate } }`. Stage 6: 409 `order_locked` "This
-  order has reached the warehouse, so it can't be changed."; stages 2-5 with `orderDate` or `lines`: 409
+  order has reached the warehouse, so it can't be changed."; `po?` renumbers the order at stages 1-5 (same rules and
+  messages as ORD-3's `po`: trimmed, 1-50 characters, any format; 422 `po` "This PO number is already used by another
+  order." in any letter case, also when a concurrent edit or create takes it first through the unique index; the same
+  number as saved is no change). The order keeps its id, so its lines, payments, deposits, advance entries, receipts,
+  containers, clearing, transport, warehouse lines, landed cost and reports follow; the response's `po` is the new one
+  and the old number answers 404. Notification links to `/orders/<old>/...` are rewritten to the new number (titles keep
+  the number they were raised under); supplier advance entries keep the stored number but show the order's current
+  one; a server log line records the change. stages 2-5 with `orderDate` or `lines`: 409
   `order_locked` "Goods have been received for this order, so only the delivery date can change.". 422 on
   `deliveryDate` for BR-09 (saved values for keys not sent); on `lines` for an inactive or unknown item (a line keeping
   its saved item is not re-checked), an `id` that isn't one of this order's lines (or repeated) ("A line on this order

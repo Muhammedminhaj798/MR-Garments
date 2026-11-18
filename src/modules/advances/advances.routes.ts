@@ -133,7 +133,8 @@ export function advancesRoutes({ db }: RouteContext) {
       const row = (await tx.select({ kind: a.kind, amount: a.amount, currency: a.currency, entryDate: a.entryDate, supplier: suppliers.name }).from(a).innerJoin(suppliers, eq(suppliers.id, a.supplierId)).where(eq(a.id, id)))[0];
       if (!row) throw notFound("Advance");
       if (row.kind !== "receipt") throw conflict("order_entry", M.orderEntry);
-      const n = (await tx.select({ n: countDistinct(sql`lower(${a.poNumber})`) }).from(a).where(and(eq(a.advanceId, id), eq(a.kind, "allocation"))))[0]!.n;
+      // Orders by id (a renumbered order's entries may carry two numbers); a deleted one by its stored number.
+      const n = (await tx.select({ n: countDistinct(sql`coalesce(${a.orderId}::text, 'deleted ' || lower(${a.poNumber}))`) }).from(a).where(and(eq(a.advanceId, id), eq(a.kind, "allocation"))))[0]!.n;
       if (n > 0) throw conflict("in_use", M.applied(n));
       await tx.delete(a).where(eq(a.id, id));
       return row;

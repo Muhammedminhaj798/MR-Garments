@@ -128,8 +128,11 @@ async function nextPo(db: Pick<Database, "select">) {
   return `PO-${Math.max(rows[0]?.highest ?? 0, FIRST_PO - 1) + 1}`;
 }
 
-/** Two simultaneous creates can pick the same number; the unique index refuses the second, which then retries. */
-function isPoTaken(error: unknown) {
+/**
+ * Two simultaneous creates can pick the same number; the unique index refuses the second, which then retries. ORD-5
+ * renumbering an order meets the same index, so two edits to one number can't both land.
+ */
+export function isPoTaken(error: unknown) {
   type PgError = { code?: string; constraint?: string; cause?: PgError };
   const pg = (error as PgError)?.cause ?? (error as PgError);
   return pg?.code === "23505" && pg.constraint === "orders_po_number_unique";
