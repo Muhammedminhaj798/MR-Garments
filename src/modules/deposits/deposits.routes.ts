@@ -37,6 +37,11 @@ export const MESSAGES = {
   /** SD-3: the amount is more than what is left on the deposit (pending in the deposit's currency, "¥1,234.50"). */
   overSettled: (pending: string) => `Only ${pending} left to settle.`,
   inUse: (n: number) => `This deposit has ${n} transaction${n === 1 ? "" : "s"}, so it can't be deleted.`,
+  /** SD-2: the typed rate (INR per 1 unit), when given. */
+  rateInr: "Enter the exchange rate: a number above 0 with at most 4 decimals.",
+  /** SD-2: a supplier without a saved rate (it is optional on the supplier) needs one typed for the deposit. */
+  rateMissing: (currency: string) => `This supplier has no exchange rate yet: enter the rate for this deposit (1 ${currency} = ? INR), or set it on the supplier.`,
+  rateForInr: "An INR deposit takes no exchange rate (it is 1).",
 };
 const M = MESSAGES;
 
@@ -58,6 +63,16 @@ const newDeposit = z.strictObject({
   openedOn: notAfterToday(M.openedOn),
   reference,
   notes,
+  /**
+   * INR per 1 unit, for a supplier with no saved rate (the rate is optional on the supplier): required then, as the
+   * deposit keeps its rate. A supplier with a saved rate has it snapshotted, as before; left out, nothing changes.
+   */
+  rateInr: z
+    .number({ error: M.rateInr })
+    .min(0.0001, M.rateInr)
+    .max(99_999_999.9999, M.rateInr)
+    .refine((value) => Number(value.toFixed(4)) === value, M.rateInr)
+    .optional(),
 });
 const newTransaction = z.strictObject({
   paidOn: notAfterToday(M.paidOn),
@@ -88,6 +103,8 @@ export function depositRows(db: Pick<Database, "select">, where: SQL) {
       /** INR per 1 of `currency` when the deposit was opened (the supplier's rate then); null before 0012 or without a rate. */
       exchangeRate: supplierDeposits.exchangeRate,
       amount: supplierDeposits.amount,
+      /** The amount in INR at the deposit's own rate, rounded to 2 decimals as every INR figure; null without a rate. */
+      amountInr: sql<number | null>`round(${supplierDeposits.amount} * ${supplierDeposits.exchangeRate}, 2)`.mapWith((value) => (value === null ? null : Number(value))),
       settled,
       openedOn: supplierDeposits.openedOn,
       reference: supplierDeposits.reference,
@@ -230,6 +247,8 @@ export function depositsRoutes({ db }: RouteContext) {
         phone: suppliers.phone,
         city: suppliers.city,
         currency: suppliers.currency,
+        /** The supplier's rate now (null while not set): New deposit asks for one when there is none. */
+        exchangeRate: suppliers.exchangeRate,
         status: suppliers.status,
       })
       .from(suppliers)
@@ -272,14 +291,19 @@ export function depositsRoutes({ db }: RouteContext) {
         .for("share");
       if (!supplier) throw notFound("Supplier");
       if (input.currency !== undefined && input.currency !== supplier.currency) throw validationFailed({ currency: M.supplierCurrency(supplier.currency) });
+      // The deposit's rate: 1 for INR; the supplier's saved rate; else the one typed. Never a guessed 0 or 1.
+      const { rateInr, ...fields } = input;
+      if (supplier.currency === "INR" && rateInr !== undefined && rateInr !== 1) throw validationFailed({ rateInr: M.rateForInr });
+      const exchangeRate = supplier.currency === "INR" ? 1 : (supplier.exchangeRate ?? rateInr ?? null);
+      if (exchangeRate === null) throw validationFailed({ rateInr: M.rateMissing(supplier.currency) });
       const created = (
         await tx
           .insert(supplierDeposits)
           .values({
-            ...input,
+            ...fields,
             supplierId,
             currency: supplier.currency,
-            exchangeRate: supplier.currency === "INR" ? 1 : supplier.exchangeRate,
+            exchangeRate,
             createdBy: req.user!.id,
           })
           .returning({ id: supplierDeposits.id })

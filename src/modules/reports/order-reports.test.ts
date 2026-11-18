@@ -349,6 +349,8 @@ describe("RPT-O1 GET /orders/:po/report", () => {
         currency: "CNY",
         exchangeRate: null,
         amount: 1000,
+        // No rate on this fixture deposit (written directly): no INR figure, never a guessed one.
+        amountInr: null,
         settled: 400,
         pending: 600,
         status: "partly settled",

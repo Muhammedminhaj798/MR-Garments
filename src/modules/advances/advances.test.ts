@@ -326,7 +326,7 @@ describe("existing money stays right and nothing is counted twice", () => {
 
   it("17-18. supplier deposits and their settlements leave the advance account alone, and the reverse", async () => {
     await added(guangzhou);
-    const deposit = await http.post(`/suppliers/${guangzhou}/deposits`).set("Cookie", accounts).send({ direction: "give", amount: 1000, openedOn: indiaDay(-3) });
+    const deposit = await http.post(`/suppliers/${guangzhou}/deposits`).set("Cookie", accounts).send({ direction: "give", amount: 1000, openedOn: indiaDay(-3), rateInr: 12 });
     expect(deposit.status).toBe(201);
     const settle = await http
       .post(`/supplier-deposits/${deposit.body.deposit.id}/transactions`)

@@ -198,6 +198,8 @@ async function syncExcess(tx: Tx, order: AdvanceOrder, money: { valueCny: number
       .orderBy(desc(payments.paidOn), desc(payments.createdAt), desc(payments.id));
     let left = target - current;
     for (const payment of paidRows) {
+      // A paid payment always has its typed rate (payments_status_fields_check): never a guessed one here.
+      if (payment.rate === null) throw new Error(`Paid payment ${payment.id} has no rate`);
       const already = mine.filter((lot) => lot.paymentId === payment.id).reduce((sum, lot) => sum + cents(lot.net), 0);
       const take = Math.min(left, cents(payment.amount) - already);
       if (take > 0)
@@ -205,7 +207,7 @@ async function syncExcess(tx: Tx, order: AdvanceOrder, money: { valueCny: number
           ...base,
           kind: "excess",
           amount: fromCents(take),
-          exchangeRate: payment.rate ?? 1,
+          exchangeRate: payment.rate,
           entryDate: payment.paidOn ?? todayInIndia(),
           mode: payment.mode ?? "",
           reference: payment.reference,

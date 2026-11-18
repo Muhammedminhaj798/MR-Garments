@@ -29,7 +29,8 @@ beforeEach(async () => {
   hangzhou = await idOf(ctx, suppliers, "Hangzhou Knits");
 });
 
-const give = (overrides: object = {}) => ({ direction: "give", amount: 1000, openedOn: "2026-10-20", ...overrides });
+// The seeded suppliers have no saved rate (it is optional), so each deposit types its own (SD-2 asks for it then).
+const give = (overrides: object = {}) => ({ direction: "give", amount: 1000, openedOn: "2026-10-20", rateInr: 12, ...overrides });
 const settlement = (overrides: object = {}) => ({ paidOn: "2026-10-25", amount: 300, mode: "Bank transfer", ...overrides });
 const open = (supplierId: string, body: object, cookie = accounts) => http.post(`/suppliers/${supplierId}/deposits`, body).set("Cookie", cookie);
 const settle = (depositId: string, body: object, cookie = accounts) => http.post(`/supplier-deposits/${depositId}/transactions`, body).set("Cookie", cookie);
@@ -55,8 +56,10 @@ const OPEN_ROW = {
   supplier: "Guangzhou Textile Co.",
   direction: "give",
   currency: "CNY",
-  exchangeRate: null,
+  // Typed on the deposit: the seeded supplier has no saved rate. INR at that rate: 1,000 x 12.
+  exchangeRate: 12,
   amount: 1000,
+  amountInr: 12000,
   settled: 0,
   pending: 1000,
   status: "open",
@@ -135,7 +138,7 @@ describe("SD-2 POST /suppliers/:supplierId/deposits", () => {
 
   it("takes a deposit for an inactive supplier (a deposit to get back is still a record); SD-1 shows the supplier Inactive", async () => {
     await ctx.db.update(suppliers).set({ status: "Inactive" }).where(eq(suppliers.id, hangzhou));
-    const res = await open(hangzhou, { direction: "receive", amount: 300, openedOn: "2026-10-20" });
+    const res = await open(hangzhou, { direction: "receive", amount: 300, openedOn: "2026-10-20", rateInr: 12 });
     expect(res.status).toBe(201);
     expect(res.body.deposit).toMatchObject({ supplier: "Hangzhou Knits", direction: "receive", currency: "CNY", pending: 300 });
     const statement = await get(`/suppliers/${hangzhou}/deposits`);
@@ -208,7 +211,7 @@ describe("SD-3 POST /supplier-deposits/:id/transactions", () => {
 
   it("a receipt against a deposit to receive works the same, in the deposit's currency", async () => {
     await ctx.db.update(suppliers).set({ currency: "USD", exchangeRate: 88 }).where(eq(suppliers.id, hangzhou));
-    const deposit = await opened(hangzhou, { direction: "receive", amount: 500, currency: "USD", openedOn: "2026-10-01" });
+    const deposit = await opened(hangzhou, { direction: "receive", amount: 500, currency: "USD", openedOn: "2026-10-01", rateInr: 84 });
     const res = await settled(deposit.id, settlement({ amount: 120 }));
     expect(res.deposit).toMatchObject({ direction: "receive", currency: "USD", settled: 120, pending: 380, status: "partly settled" });
     expect((await settle(deposit.id, settlement({ amount: 380.01 }))).body.error.fields).toEqual({ amount: "Only $380 left to settle." });
@@ -254,7 +257,7 @@ describe("SD-1 GET /suppliers/:supplierId/deposits", () => {
   it("shows the supplier, a summary per currency and direction that never nets give against receive, and each deposit's transactions", async () => {
     const toGive = await opened(guangzhou, give({ openedOn: "2026-10-01" }));
     await settled(toGive.id, settlement({ amount: 300, paidOn: "2026-10-05" }));
-    const toReceive = await opened(guangzhou, { direction: "receive", amount: 500, openedOn: "2026-10-10", reference: "Mould" });
+    const toReceive = await opened(guangzhou, { direction: "receive", amount: 500, openedOn: "2026-10-10", reference: "Mould", rateInr: 12 });
     await settled(toReceive.id, settlement({ amount: 60, paidOn: "2026-10-12", mode: "Cash" }));
     await settled(toReceive.id, settlement({ amount: 40, paidOn: "2026-10-20", mode: "Cash" }));
     // Guangzhou was paid in USD for a while: the deposit from then keeps its currency after the switch back to CNY.
@@ -272,6 +275,7 @@ describe("SD-1 GET /suppliers/:supplierId/deposits", () => {
       phone: "+86 138 0013 2244",
       city: "Guangzhou",
       currency: "CNY",
+      exchangeRate: null,
       status: "Active",
     });
     expect(res.body.summary).toEqual([
