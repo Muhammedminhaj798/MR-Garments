@@ -86,12 +86,13 @@ export function advancesRoutes({ db }: RouteContext) {
 
   // ADV-5. The active suppliers an advance can be recorded for (Record payment's "Supplier advance (no order)"), by
   // name: id, name, currency and rate now, nothing else. payments Enter, as ADV-2; no order access is needed.
+  // lower(name): the production collation (C.UTF-8) would put a lowercase name after Z. Names are unique in any case.
   router.get("/supplier-advances/suppliers", requirePermission("payments", "Enter"), async (_req, res) => {
     const list = await db
       .select({ id: suppliers.id, name: suppliers.name, currency: suppliers.currency, exchangeRate: suppliers.exchangeRate })
       .from(suppliers)
       .where(eq(suppliers.status, "Active"))
-      .orderBy(asc(suppliers.name));
+      .orderBy(sql`lower(${suppliers.name})`);
     res.json({ suppliers: list });
   });
 

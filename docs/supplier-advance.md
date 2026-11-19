@@ -68,7 +68,7 @@ supplier reallocation exists.
 | ADV-2 | `POST /suppliers/:supplierId/advances` | payments Enter | `{ amount, paidOn, rateInr?, mode, reference?, notes?, currency? }`; currency must be the supplier's (422); no order; 201 with the new entry and the account |
 | ADV-3 | `DELETE /supplier-advances/:id` | payments Full | only a receipt nothing was drawn from (409 `in_use`); allocations/reversals 409 `order_entry`; server log line |
 | ADV-4 | `POST /orders/:po/advance` | payments Enter | applies the available advance to an existing order (`settle`); 404 unknown PO |
-| ADV-5 | `GET /supplier-advances/suppliers` | payments Enter | `{ suppliers[] }`: active suppliers only, by name, `{ id, name, currency, exchangeRate }` (rate null while not set); the supplier list of Record payment's "Supplier advance (no order)", so recording an advance needs no order access |
+| ADV-5 | `GET /supplier-advances/suppliers` | payments Enter | `{ suppliers[] }`: active suppliers only, by name in any letter case (`lower(name)`), `{ id, name, currency, exchangeRate }` (rate null while not set); the supplier list of Record payment's "Supplier advance (no order)", so recording an advance needs no order access |
 
 Also: DEP-1 gains `advances` (per supplier and currency) and lists suppliers with an advance account; its obligations
 gain `advanceCny`. SD-1 gains `advance` (the account). ORD-2 suppliers gain `advanceAvailable`. ORD-4 gains

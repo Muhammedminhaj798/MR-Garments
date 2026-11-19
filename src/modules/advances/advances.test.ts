@@ -96,6 +96,13 @@ describe("access (payments: Management Full, Accounts Enter, Procurement View, s
     expect((await get("/supplier-advances/suppliers", management)).body).toEqual(res.body);
   });
 
+  it("ADV-5 sorts names in any letter case alphabetically (a lowercase name is not put after Z)", async () => {
+    await ctx.db.insert(suppliers).values([{ name: "Zhejiang Silk" }, { name: "tango Fabrics" }, { name: "apex Trims" }]);
+    const names = ((await get("/supplier-advances/suppliers", accounts)).body.suppliers as { name: string }[]).map((s) => s.name);
+    expect(names.filter((name) => ["Zhejiang Silk", "tango Fabrics", "apex Trims"].includes(name))).toEqual(["apex Trims", "tango Fabrics", "Zhejiang Silk"]);
+    expect(names).toEqual(names.toSorted((a, b) => (a.toLowerCase() < b.toLowerCase() ? -1 : 1)));
+  });
+
   it("an order created by Procurement (payments View only) still draws the advance: allocation is the system's", async () => {
     await added(guangzhou);
     expect((await order(2000, {}, guangzhou, procurement)).advance.appliedCny).toBe(2000);
