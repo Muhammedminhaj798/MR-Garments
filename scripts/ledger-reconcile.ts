@@ -5,7 +5,7 @@ import { eq } from "drizzle-orm";
 import { config } from "../src/config";
 import { createDatabase, databaseName } from "../src/db/client";
 import { ledgerState } from "../src/db/schema";
-import { DEFAULT_HOLDS, legacyDifferences, legacyFingerprints, reconcileLedger } from "../src/modules/ledger/backfill";
+import { DEFAULT_HOLDS, DEFAULT_RECEIPT_EXCLUSIONS, legacyDifferences, legacyFingerprints, reconcileLedger } from "../src/modules/ledger/backfill";
 
 // Plan 4.6 / 4.7 / 9.4 (docs/unified-ledger.md): checks every invariant and is the only way to open the ledger.
 //
@@ -48,7 +48,7 @@ try {
     writeFileSync(value("--write-baseline")!, JSON.stringify(fingerprints, null, 2));
     console.info(JSON.stringify({ database: name, baseline: value("--write-baseline"), fingerprints }, null, 2));
   } else {
-    const result = await reconcileLedger(db, DEFAULT_HOLDS);
+    const result = await reconcileLedger(db, DEFAULT_HOLDS, DEFAULT_RECEIPT_EXCLUSIONS);
     const fingerprints = await legacyFingerprints(db);
     const report: Record<string, unknown> = { database: name, ok: result.ok, checks: result.checks, fingerprints };
     let ok = result.ok;

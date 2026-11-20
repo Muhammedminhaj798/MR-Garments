@@ -21,7 +21,7 @@ import { parse } from "../../http/validate";
 import type { RouteContext } from "../context";
 import { money } from "../notifications/notify";
 import { isUuid, todayInIndia } from "../stages/common";
-import { reconcileLedger } from "./backfill";
+import { DEFAULT_RECEIPT_EXCLUSIONS, reconcileLedger } from "./backfill";
 import { accountFields, assertLedgerLive, cents, depositMilestone, fromCents, inrOf, isHeld, type Ledger, loadLedger, MESSAGES as LEDGER, postLedgerEntry, settlementFields } from "./ledger";
 
 // Owner: the unified supplier ledger (docs/unified-ledger.md). LED-1 GET /suppliers/:supplierId/ledger, LED-2 GET
@@ -374,7 +374,8 @@ export function ledgerRoutes({ db }: RouteContext) {
 
   // LED-4. admin Full: the reconciliation invariants (plan 4.6), read-only. The release script is the same function.
   router.get("/supplier-ledger/reconciliation", requirePermission("admin", "Full"), async (_req, res) => {
-    res.json(await reconcileLedger(db));
+    // The owner's excluded receipts are never credited; without the list they would read as missing credits forever.
+    res.json(await reconcileLedger(db, [], DEFAULT_RECEIPT_EXCLUSIONS));
   });
 
   return router;

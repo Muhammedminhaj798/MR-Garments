@@ -66,6 +66,24 @@ the backend implements and the frontend consumes. Where an older doc (supplier-a
   - an ORD-6 delete.
 - In reads, a held account and its orders carry `held: true` and null figures.
 
+### Excluded receipts (owner decision, 2026-11-20)
+
+- `DEFAULT_RECEIPT_EXCLUSIONS` (`src/modules/ledger/backfill.ts`) lists single legacy advance receipts the owner ruled
+  invalid. The backfill never posts them; their `supplier_advance_entries` rows stay unchanged. The archive (ADV-1, the
+  supplier ledger's "Legacy advance history" tab and its download) still lists them, marked "Excluded from ledger" with
+  the reason. Everything else in their account is posted as usual.
+
+  | Receipt (advance entry id) | Account | Amount | Entered (UTC) | Reason |
+  |---|---|---|---|---|
+  | `f2b7966a-0937-485b-94a6-e6a536bfeedc` | SUP-004 USD | 25,000 CASH | 2026-11-19 14:34:51 | duplicate of `547ef798…` (14:03:06, genuine, posted) |
+  | `6ab149cc-bd00-4ef9-90f3-dc6bac5ccb47` | SUP-009 CNY | 1,212 Cash | 2026-11-20 04:54:34 | test entry |
+
+- Backfill `--apply` is refused while a listed id is unknown, is not a receipt, or has money applied from it (an
+  allocation); the dry run reports each problem.
+- Reconciliation (the script and LED-4) leaves the listed receipts out of the "receipts" check and adds the
+  "excluded-receipts" check: no listed receipt has a posting.
+- A new invalid receipt needs a code change to this list and the owner's confirmation; never delete or edit the legacy row.
+
 ### FIFO settlement projection (read-only, never stored)
 
 - Per account, the pool is payments − voids ± adjustments.
@@ -241,8 +259,9 @@ one, ordered CNY, USD, INR, then the rest.
 ### Archive and retired
 
 - **ADV-1 `GET /suppliers/:supplierId/advances`.** Payments View. Read-only archive:
-  `{ supplier: {id, name, currency}, entries: [{ id, kind, amount, currency, exchangeRate, amountInr, entryDate, po, paymentId, advanceId, mode, reference, notes, recordedAt, recordedBy }] }`,
-  oldest first. No summary and no open orders.
+  `{ supplier: {id, name, currency}, entries: [{ id, kind, amount, currency, exchangeRate, amountInr, entryDate, po, paymentId, advanceId, mode, reference, notes, recordedAt, recordedBy, exclusionReason }] }`,
+  oldest first. No summary and no open orders. `exclusionReason` is the reason of a receipt on the owner's exclusion
+  list (`DEFAULT_RECEIPT_EXCLUSIONS`, never posted), null on every other entry.
 - **ADV-5 `GET /supplier-advances/suppliers`** (the Record payment supplier list). Payments Enter. Active suppliers by
   `lower(name)`: `{ suppliers: [{ id, name, currency, exchangeRate, held, currencyOptions: string[], balances: [{ currency, balanceCny }] }] }`.
 - **ADV-2, ADV-3, ADV-4, SD-2, SD-3, SD-4, SD-5** answer **410** `{ error: { code: "gone", message } }`:
@@ -304,12 +323,12 @@ one, ordered CNY, USD, INR, then the rest.
 
 - **`scripts/ledger-backfill.ts`.** `[--preflight] [--apply --database <name>]`.
   - A dry run by default. Idempotent.
-  - Holds SUP-010 CNY.
+  - Holds SUP-010 CNY and leaves out the excluded receipts (`DEFAULT_RECEIPT_EXCLUSIONS`).
 - **`scripts/ledger-reconcile.ts`.** `[--write-baseline f] [--baseline f] [--compare-legacy --expect PO…] [--open "note" | --close "reason"] [--database <name>]`.
   - `--open` is refused unless `--baseline` and `--compare-legacy` are given and every check passes.
   - The checks include the exclusion list (every DEFAULT_HOLDS entry must name a supplier and be held) and "no supplier
     deposit exists" (D8: they are never posted, so any one needs an owner decision).
-- **Backfill `--apply`** is refused while any hold on the list names no supplier.
+- **Backfill `--apply`** is refused while any hold on the list names no supplier, or any excluded receipt is unresolved.
 - **If reconciliation reports order drift** (an old-backend line edit or delete between the migration and the new
   backend): stop, keep the guard in maintenance, and investigate. No application write exists yet, so the rehearsed
   rollback is still allowed.

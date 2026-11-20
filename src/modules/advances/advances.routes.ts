@@ -5,6 +5,7 @@ import { requirePermission } from "../../auth/current-user";
 import { orders, supplierAdvanceEntries as a, suppliers, users } from "../../db/schema";
 import { HttpError, notFound } from "../../http/errors";
 import type { RouteContext } from "../context";
+import { DEFAULT_RECEIPT_EXCLUSIONS } from "../ledger/backfill";
 import { balancesOf, loadLedger } from "../ledger/ledger";
 import { currencyOptions } from "../ledger/ledger.routes";
 import { isUuid } from "../stages/common";
@@ -17,11 +18,15 @@ export const MESSAGES = {
   gone: "Supplier advances are recorded as supplier payments in the supplier ledger now.",
 };
 
+/** The owner's excluded receipts (the backfill's own list): ADV-1 shows each one's reason. */
+const EXCLUSION_REASONS = new Map(DEFAULT_RECEIPT_EXCLUSIONS.map((row) => [row.advanceEntryId, row.reason]));
+
 export function advancesRoutes({ db }: RouteContext) {
   const router = Router();
 
   // ADV-1. The supplier and every legacy advance entry, oldest first (day, then recorded). Receipts are posted to the
-  // ledger by link; allocations, reversals, excess and excess returns are history only.
+  // ledger by link, except a receipt on the owner's exclusion list (`exclusionReason` set; null on every other entry);
+  // allocations, reversals, excess and excess returns are history only.
   router.get("/suppliers/:supplierId/advances", requirePermission("payments", "View"), async (req, res) => {
     const id = String(req.params.supplierId);
     if (!isUuid(id)) throw notFound("Supplier");
@@ -51,7 +56,7 @@ export function advancesRoutes({ db }: RouteContext) {
       .leftJoin(users, eq(users.id, a.createdBy))
       .where(eq(a.supplierId, id))
       .orderBy(asc(a.entryDate), asc(a.createdAt), asc(a.id));
-    res.json({ supplier, entries });
+    res.json({ supplier, entries: entries.map((entry) => ({ ...entry, exclusionReason: EXCLUSION_REASONS.get(entry.id) ?? null })) });
   });
 
   // ADV-5. The active suppliers Record payment offers, by name: currency and rate now, whether the current currency's

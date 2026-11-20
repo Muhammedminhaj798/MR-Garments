@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 
-import { eq, sql } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import { afterAll, beforeEach, describe, expect, it } from "vitest";
 
 import { items, orderLines, orders, payments, supplierAdvanceEntries, supplierLedgerEntries, supplierLedgerHolds, suppliers, users } from "../../db/schema";
@@ -268,6 +268,54 @@ describe("backfill and reconciliation (plan 9)", () => {
     const result = await reconcileLedger(ctx.db);
     const failed = Object.fromEntries(result.checks.filter((check) => !check.ok).map((check) => [check.id, check.problems.length]));
     expect(failed).toMatchObject({ orders: 1, payments: 1, held: 1 });
+    expect(result.ok).toBe(false);
+  });
+});
+
+describe("the owner's receipt exclusion list", () => {
+  it("never posts a listed receipt and keeps its legacy row; its unlisted twin is posted once; reconciles only with the list", async () => {
+    await legacyOrder(hangzhou, "H-1", 30_000, "2026-09-30");
+    const genuine = await legacyAdvance(hangzhou, { amount: 25_000, entryDate: "2026-10-01", mode: "CASH" });
+    const duplicate = await legacyAdvance(hangzhou, { amount: 25_000, entryDate: "2026-10-01", mode: "CASH" });
+    const list = [{ advanceEntryId: duplicate.id, reason: "test duplicate" }];
+    const before = await legacyFingerprints(ctx.db, []);
+    const run = (apply: boolean) => backfillLedger(ctx.db, { apply, holds: [], excludedReceipts: list });
+
+    expect(await run(false)).toMatchObject({ written: 2, unresolvedExclusions: [], excludedReceipts: [{ advanceEntryId: duplicate.id, currency: "CNY", amount: 25_000 }] });
+    expect((await run(true)).written).toBe(2); // H-1's debit + the genuine receipt
+    expect((await run(true)).written).toBe(0);
+    const credits = await ctx.db.select({ advanceEntryId: supplierLedgerEntries.advanceEntryId }).from(supplierLedgerEntries).where(eq(supplierLedgerEntries.entryType, "payment"));
+    expect(credits).toEqual([{ advanceEntryId: genuine.id }]);
+    expect((await loadLedger(ctx.db)).account(hangzhou, "CNY")).toMatchObject({ balanceCny: -5_000, outstandingCny: 5_000 });
+
+    const listed = await reconcileLedger(ctx.db, [], list);
+    expect(listed.ok).toBe(true);
+    expect(listed.checks.find((check) => check.id === "excluded-receipts")).toMatchObject({ ok: true });
+    // Without the list the same journal fails: the duplicate has no credit.
+    const unlisted = await reconcileLedger(ctx.db);
+    expect(unlisted.checks.find((check) => check.id === "receipts")).toMatchObject({ ok: false, problems: [expect.stringContaining(duplicate.id)] });
+    expect(await legacyFingerprints(ctx.db, [])).toEqual(before); // every legacy row, the duplicate's included, is untouched
+  });
+
+  it("refuses to apply when a listed id is unknown, not a receipt or drawn from; flags a listed receipt that was posted", async () => {
+    await seedLegacy();
+    const kindOf = async (kind: "receipt" | "excess") =>
+      (await ctx.db.select({ id: supplierAdvanceEntries.id }).from(supplierAdvanceEntries).where(and(eq(supplierAdvanceEntries.supplierId, guangzhou), eq(supplierAdvanceEntries.kind, kind))))[0]!.id;
+    const drawn = await kindOf("receipt"); // ¥40,000, allocated to A-1 and B-1
+    const excess = await kindOf("excess");
+    const unknown = randomUUID();
+    const list = [drawn, excess, unknown].map((advanceEntryId) => ({ advanceEntryId, reason: "test" }));
+    const holds = holdFoshan.map((hold) => ({ ...hold, supplierId: foshan }));
+
+    const dry = await backfillLedger(ctx.db, { apply: false, holds, excludedReceipts: list });
+    expect(dry.unresolvedExclusions).toEqual([`${drawn}: money was applied from it`, `${excess}: excess row, not a receipt`, `${unknown}: no such advance entry`]);
+    await expect(backfillLedger(ctx.db, { apply: true, holds, excludedReceipts: list })).rejects.toThrow(/unresolved receipt exclusion/);
+    expect(await ctx.db.select().from(supplierLedgerEntries)).toHaveLength(0);
+
+    // A listed receipt posted anyway (a run without the list) fails the reconciliation that has the list.
+    await backfill(true);
+    const result = await reconcileLedger(ctx.db, [], [{ advanceEntryId: drawn, reason: "test" }]);
+    expect(result.checks.find((check) => check.id === "excluded-receipts")).toMatchObject({ ok: false, problems: [`excluded receipt ${drawn}: 1 posting(s)`] });
     expect(result.ok).toBe(false);
   });
 });

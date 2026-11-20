@@ -6,7 +6,7 @@ import { cents, fromCents, loadLedger } from "./ledger";
 
 // The ledger backfill and reconciliation (docs/unified-ledger.md, plan section 9.4). History is posted exactly once with
 // origin 'backfill': every live order's debit, every paid supplier payment's credit and every legacy advance receipt's
-// credit. Allocation, reversal, excess and excess-return rows are never posted (they are internal transfers that cancel
+// credit, except the receipts on the owner's exclusion list (DEFAULT_RECEIPT_EXCLUSIONS). Allocation, reversal, excess and excess-return rows are never posted (they are internal transfers that cancel
 // out), and neither are shipping-agent payments, due rows or anything in a held account. Every insert is set-based with
 // `on conflict (idempotency_key) do nothing`, so a second run writes 0 rows. Legacy rows are only read, never changed.
 
@@ -21,6 +21,26 @@ export const DEFAULT_HOLDS: Hold[] = [
   },
 ];
 
+/** One legacy advance receipt the owner ruled invalid (a duplicate, a test entry): never posted; its row stays as it is. */
+export type ReceiptExclusion = { advanceEntryId: string; reason: string };
+
+/**
+ * The owner's receipt exclusion list (confirmed 2026-11-20 on the production snapshot of that day; docs/unified-ledger.md).
+ * Production ids: the release scripts and LED-4 pass this list; the functions default to none (tests).
+ */
+export const DEFAULT_RECEIPT_EXCLUSIONS: ReceiptExclusion[] = [
+  {
+    advanceEntryId: "f2b7966a-0937-485b-94a6-e6a536bfeedc",
+    reason: "Duplicate: SUP-004 USD 25,000 CASH receipt entered 2026-11-19 14:34Z, a second entry of receipt 547ef798 (14:03Z).",
+  },
+  {
+    advanceEntryId: "6ab149cc-bd00-4ef9-90f3-dc6bac5ccb47",
+    reason: "Test entry: SUP-009 CNY 1,212 Cash receipt entered 2026-11-20 04:54Z.",
+  },
+];
+
+const excludedIds = (list: ReceiptExclusion[]) => sql`array[${sql.join(list.map((row) => sql`${row.advanceEntryId}`), sql`, `)}]::text[]`;
+
 const notHeld = (supplier: string, currency: string) =>
   sql.raw(`not exists (select 1 from supplier_ledger_holds h where h.supplier_id = ${supplier} and h.currency = ${currency})`);
 
@@ -32,10 +52,33 @@ class DryRun extends Error {}
  * Writes the holds (when their supplier exists), then the postings, in one transaction. Without `apply` the same
  * statements run and the transaction is rolled back, so the dry run reports exactly what an apply would write.
  */
-export async function backfillLedger(db: Database, options: { apply: boolean; holds?: Hold[] }) {
-  const report = { holds: [] as { supplierId: string; code: string | null; currency: string; created: boolean }[], skippedHolds: [] as string[], rows: [] as Written[] };
+export async function backfillLedger(db: Database, options: { apply: boolean; holds?: Hold[]; excludedReceipts?: ReceiptExclusion[] }) {
+  const excluded = options.excludedReceipts ?? [];
+  const report = {
+    holds: [] as { supplierId: string; code: string | null; currency: string; created: boolean }[],
+    skippedHolds: [] as string[],
+    excludedReceipts: [] as { advanceEntryId: string; code: string | null; currency: string | null; amount: number | null; problem?: string }[],
+    unresolvedExclusions: [] as string[],
+    rows: [] as Written[],
+  };
   try {
     await db.transaction(async (tx) => {
+      // Each listed receipt must exist, be a receipt and have nothing drawn from it (no allocation): a typo would post the
+      // receipt it meant to exclude, and a drawn one would leave its allocations' orders settled in the legacy figures only.
+      if (excluded.length > 0) {
+        const found = await tx.execute<{ id: string; code: string | null; currency: string | null; amount: string | null; kind: string | null; drawn: boolean }>(sql`
+          select x.id, s.code, a.currency, a.amount::text as amount, a.kind,
+                 exists (select 1 from supplier_advance_entries d where d.advance_id = a.id) as drawn
+          from unnest(${excludedIds(excluded)}) with ordinality as x(id, n)
+          left join supplier_advance_entries a on a.id::text = x.id
+          left join suppliers s on s.id = a.supplier_id
+          order by x.n`);
+        for (const row of found.rows) {
+          const problem = row.kind === null ? "no such advance entry" : row.kind !== "receipt" ? `${row.kind} row, not a receipt` : row.drawn ? "money was applied from it" : undefined;
+          report.excludedReceipts.push({ advanceEntryId: row.id, code: row.code, currency: row.currency, amount: row.amount === null ? null : Number(row.amount), ...(problem ? { problem } : {}) });
+          if (problem) report.unresolvedExclusions.push(`${row.id}: ${problem}`);
+        }
+      }
       for (const hold of options.holds ?? DEFAULT_HOLDS) {
         const [supplier] = await tx
           .select({ id: suppliers.id, code: suppliers.code })
@@ -72,13 +115,16 @@ export async function backfillLedger(db: Database, options: { apply: boolean; ho
         insert into supplier_ledger_entries (supplier_id, currency, entry_type, amount, exchange_rate, entry_date, origin, advance_entry_id, idempotency_key)
         select a.supplier_id, a.currency, 'payment', a.amount, a.exchange_rate, a.entry_date, 'backfill', a.id, 'advance:' || a.id
         from supplier_advance_entries a
-        where a.kind = 'receipt' and ${notHeld("a.supplier_id", "a.currency")}
+        where a.kind = 'receipt' and not (a.id::text = any(${excludedIds(excluded)})) and ${notHeld("a.supplier_id", "a.currency")}
         order by a.entry_date, a.created_at, a.id
         on conflict (idempotency_key) do nothing
         returning supplier_id, currency, entry_type, amount`);
       report.rows = [...debits.rows, ...credits.rows, ...receipts.rows];
       // A hold that names no supplier would post the account it meant to hold: never apply then (D4).
       if (options.apply && report.skippedHolds.length > 0) throw new Error(`Refusing to apply: unresolved hold(s): ${report.skippedHolds.join("; ")}`);
+      if (options.apply && report.unresolvedExclusions.length > 0) {
+        throw new Error(`Refusing to apply: unresolved receipt exclusion(s): ${report.unresolvedExclusions.join("; ")}`);
+      }
       if (!options.apply) throw new DryRun();
     });
   } catch (error) {
@@ -93,11 +139,19 @@ export async function backfillLedger(db: Database, options: { apply: boolean; ho
     line.amount = fromCents(cents(line.amount) + cents(Number(row.amount)));
     byAccount.set(key, line);
   }
-  return { applied: options.apply, holds: report.holds, skippedHolds: report.skippedHolds, written: report.rows.length, accounts: [...byAccount.values()] };
+  return {
+    applied: options.apply,
+    holds: report.holds,
+    skippedHolds: report.skippedHolds,
+    excludedReceipts: report.excludedReceipts,
+    unresolvedExclusions: report.unresolvedExclusions,
+    written: report.rows.length,
+    accounts: [...byAccount.values()],
+  };
 }
 
 /** Plan 9.4 step 0: rate coverage per supplier and currency (read-only). NULLs are posted as NULL, never invented. */
-export async function rateCoverage(db: Database) {
+export async function rateCoverage(db: Database, excludedReceipts: ReceiptExclusion[] = []) {
   const [paymentRows, receiptRows, orderRows] = await Promise.all([
     db.execute(sql`
       select s.code, coalesce(p.currency, o.currency) as currency, p.payee_role, p.status, count(*)::int as rows, count(*) filter (where p.rate_inr is null)::int as null_rates
@@ -105,7 +159,8 @@ export async function rateCoverage(db: Database) {
       group by 1, 2, 3, 4 order by 1, 2, 3, 4`),
     db.execute(sql`
       select s.code, a.currency, count(*)::int as rows, count(*) filter (where a.exchange_rate is null)::int as null_rates
-      from supplier_advance_entries a join suppliers s on s.id = a.supplier_id where a.kind = 'receipt' group by 1, 2 order by 1, 2`),
+      from supplier_advance_entries a join suppliers s on s.id = a.supplier_id
+      where a.kind = 'receipt' and not (a.id::text = any(${excludedIds(excludedReceipts)})) group by 1, 2 order by 1, 2`),
     db.execute(sql`
       select s.code, o.currency, count(*)::int as rows, count(*) filter (where o.exchange_rate is null)::int as null_rates
       from orders o join suppliers s on s.id = o.supplier_id group by 1, 2 order by 1, 2`),
@@ -120,8 +175,13 @@ const held = (supplier: string, currency: string) => sql.raw(`exists (select 1 f
 /**
  * Plan 4.6, invariants 1-6 and 8 (7, the legacy fingerprints, needs a baseline: `legacyFingerprints`). Read-only.
  * `expectedHolds` (the release script passes DEFAULT_HOLDS): each must name a supplier and exist as a hold row.
+ * `excludedReceipts` (the release script and LED-4 pass DEFAULT_RECEIPT_EXCLUSIONS): never credited, and none may be.
  */
-export async function reconcileLedger(db: Pick<Database, "execute">, expectedHolds: Hold[] = []): Promise<{ ok: boolean; checks: Check[] }> {
+export async function reconcileLedger(
+  db: Pick<Database, "execute">,
+  expectedHolds: Hold[] = [],
+  excludedReceipts: ReceiptExclusion[] = [],
+): Promise<{ ok: boolean; checks: Check[] }> {
   const problems = async (query: ReturnType<typeof sql>) => (await db.execute<{ problem: string }>(query)).rows.map((row) => row.problem).slice(0, 50);
   const checks: Check[] = [];
   const add = async (id: string, title: string, query: ReturnType<typeof sql>) => {
@@ -184,14 +244,24 @@ export async function reconcileLedger(db: Pick<Database, "execute">, expectedHol
   );
   await add(
     "receipts",
-    "Every legacy advance receipt outside a held account has exactly one credit with its amount, currency and supplier",
+    "Every legacy advance receipt outside a held account and the exclusion list has exactly one credit with its amount, currency and supplier",
     sql`select 'advance receipt ' || a.id || ': ' || count(e.id) || ' credit(s)' as problem
         from supplier_advance_entries a
         left join supplier_ledger_entries e on e.advance_entry_id = a.id and e.entry_type = 'payment'
-        where a.kind = 'receipt' and not ${held("a.supplier_id", "a.currency")}
+        where a.kind = 'receipt' and not ${held("a.supplier_id", "a.currency")} and not (a.id::text = any(${excludedIds(excludedReceipts)}))
         group by a.id, a.amount, a.currency, a.supplier_id
         having count(e.id) <> 1 or bool_or(e.amount <> a.amount or e.currency <> a.currency or e.supplier_id <> a.supplier_id)`,
   );
+  if (excludedReceipts.length > 0) {
+    await add(
+      "excluded-receipts",
+      "No receipt on the owner's exclusion list has a posting",
+      sql`select 'excluded receipt ' || e.advance_entry_id || ': ' || count(*) || ' posting(s)' as problem
+          from supplier_ledger_entries e
+          where e.advance_entry_id::text = any(${excludedIds(excludedReceipts)})
+          group by e.advance_entry_id`,
+    );
+  }
   if (expectedHolds.length > 0) {
     const listed = expectedHolds.map((hold) => `${hold.supplierId ?? hold.supplierCode} ${hold.currency}`);
     await add(

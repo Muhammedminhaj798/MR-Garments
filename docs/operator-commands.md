@@ -66,14 +66,17 @@ BEFORE migration 0017 (data entry paused):
 npx tsx scripts/ledger-reconcile.ts --write-baseline before.json      # legacy fingerprints only (works before 0017)
 ```
 
-Then migrate (the ledger opens in `maintenance`) and deploy the backend, then:
+Then migrate (the ledger opens in `maintenance`) and deploy the backend, then run the commands below. The `--expect`
+list is derived from the 2026-11-20 production snapshot (PO-1134647: the 270.14 excess; 6422 and 6423: SUP-004's
+genuine 25,000 receipt settles them FIFO). Re-derive it from the cutover snapshot's rehearsal before use: any receipt
+or payment entered since then can change it.
 
 ```sh
 npx tsx scripts/ledger-backfill.ts --preflight                         # rate coverage (read-only)
 npx tsx scripts/ledger-backfill.ts                                     # dry run
 npx tsx scripts/ledger-backfill.ts --apply --database <name>           # post history (idempotent: a rerun writes 0)
-npx tsx scripts/ledger-reconcile.ts --baseline before.json --compare-legacy --expect PO-1134647
-npx tsx scripts/ledger-reconcile.ts --baseline before.json --compare-legacy --expect PO-1134647 --open "who, why" --database <name>
+npx tsx scripts/ledger-reconcile.ts --baseline before.json --compare-legacy --expect PO-1134647 --expect 6422 --expect 6423
+npx tsx scripts/ledger-reconcile.ts --baseline before.json --compare-legacy --expect PO-1134647 --expect 6422 --expect 6423 --open "who, why" --database <name>
 npx tsx scripts/ledger-reconcile.ts --close "reason" --database <name> # incident: writes paused again
 npx tsx scripts/ledger-rollback-check.ts --baseline before.json        # only before any application write
 psql -f scripts/rollback/0017-down.sql                                 # only after the check passes and the owner approves

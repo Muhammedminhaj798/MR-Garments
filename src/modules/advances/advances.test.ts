@@ -3,8 +3,9 @@ import { randomUUID } from "node:crypto";
 import { eq } from "drizzle-orm";
 import { afterAll, beforeEach, describe, expect, it } from "vitest";
 
-import { orders, supplierAdvanceEntries, supplierLedgerHolds, suppliers, users } from "../../db/schema";
+import { orders, supplierAdvanceEntries, supplierLedgerEntries, supplierLedgerHolds, suppliers, users } from "../../db/schema";
 import { api, createTestContext, resetData, SEEDED, signInAs } from "../../test/harness";
+import { backfillLedger, DEFAULT_RECEIPT_EXCLUSIONS } from "../ledger/backfill";
 import { indiaDay, makeOrder } from "../stock/fixtures";
 import { MESSAGES } from "./advances.routes";
 
@@ -80,9 +81,42 @@ describe("ADV-1 GET /suppliers/:supplierId/advances (archive)", () => {
         notes: "Season advance",
         recordedAt: expect.any(String),
         recordedBy: "Anita Joseph",
+        exclusionReason: null,
       },
       expect.objectContaining({ kind: "allocation", amount: 3000, amountInr: 37_500, po: "PO-RENAMED", advanceId: receipt.id, recordedBy: "" }),
       expect.objectContaining({ kind: "allocation", amount: 500, po: "PO-GONE" }),
+    ]);
+  });
+
+  it("marks the owner's two excluded receipts with their reasons; they stay listed as they are and are never ledger credits", async () => {
+    const [duplicate, test] = DEFAULT_RECEIPT_EXCLUSIONS;
+    const usd = { currency: "USD", exchangeRate: 101.6, entryDate: indiaDay(-2), mode: "CASH" };
+    const genuine = await legacy({ ...usd, amount: 25_000 });
+    await legacy({ ...usd, amount: 25_000, id: duplicate!.advanceEntryId });
+    await legacy({ supplierId: hangzhou, id: test!.advanceEntryId, amount: 1212, exchangeRate: 12.2, mode: "Cash" });
+
+    const listed = (await get(`/suppliers/${guangzhou}/advances`)).body.entries;
+    expect(listed.map((row: { id: string; amount: number; exclusionReason: string | null }) => [row.id, row.amount, row.exclusionReason])).toEqual([
+      [genuine.id, 25_000, null],
+      [duplicate!.advanceEntryId, 25_000, duplicate!.reason],
+    ]);
+    expect(duplicate!.reason).toMatch(/^Duplicate: SUP-004 USD 25,000/);
+    const hangzhouRows = (await get(`/suppliers/${hangzhou}/advances`)).body.entries;
+    expect(hangzhouRows).toEqual([expect.objectContaining({ id: test!.advanceEntryId, kind: "receipt", amount: 1212, mode: "Cash", exclusionReason: test!.reason })]);
+    expect(test!.reason).toMatch(/^Test entry: SUP-009 CNY 1,212/);
+
+    // The release backfill: only the genuine receipt becomes a credit; the statement (LED-1) never shows the other two.
+    await backfillLedger(ctx.db, { apply: true, holds: [], excludedReceipts: DEFAULT_RECEIPT_EXCLUSIONS });
+    const credits = await ctx.db.select({ advanceEntryId: supplierLedgerEntries.advanceEntryId }).from(supplierLedgerEntries).where(eq(supplierLedgerEntries.entryType, "payment"));
+    expect(credits).toEqual([{ advanceEntryId: genuine.id }]);
+    const statement = (await get(`/suppliers/${guangzhou}/ledger`)).body;
+    expect(statement.entries.map((row: { amount: number; currency: string }) => [row.amount, row.currency])).toEqual([[25_000, "USD"]]);
+    expect((await get(`/suppliers/${hangzhou}/ledger`)).body.entries).toEqual([]);
+    // The legacy rows themselves are untouched.
+    expect(await ctx.db.select({ id: supplierAdvanceEntries.id, amount: supplierAdvanceEntries.amount }).from(supplierAdvanceEntries).orderBy(supplierAdvanceEntries.createdAt)).toEqual([
+      { id: genuine.id, amount: 25_000 },
+      { id: duplicate!.advanceEntryId, amount: 25_000 },
+      { id: test!.advanceEntryId, amount: 1212 },
     ]);
   });
 });
