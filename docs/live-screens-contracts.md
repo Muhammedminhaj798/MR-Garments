@@ -1,5 +1,7 @@
 # Live screens contracts (Orders, Deposits & Payments, Delivery calendar, Receiving, Containers)
 
+> **Superseded in part (0017, unified supplier ledger):** supplier payments, PAY-2/PAY-3, advances, excess, supplier deposits and every paid / balance / outstanding figure now follow `docs/unified-ledger.md`. Where this file disagrees, that file wins.
+
 Approved 2026-10-27: migration 0003 (`src/db/schema/orders.ts`, `drizzle/0003_orders_receiving_containers.sql`),
 applied to `mr_garments_test` only, and the default business rules below. Coordinator-owned: change this file only
 through the coordinator. Everything in `docs/contracts.md` still applies (Node 22, `/api/v1`, JSON only, error body,

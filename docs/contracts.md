@@ -1,5 +1,8 @@
 # Batch 1 backend contracts
 
+> Supplier money (payments, order debits, voids, deposits, advances) follows `docs/unified-ledger.md` (migration 0017);
+> where this file says otherwise, that file wins.
+
 Rules every Batch 1 agent follows. The coordinator owns this file and every file marked coordinator-owned.
 Business rules come from the approved decision sheet (B1-B9, C5, U36, U37, Q7, Q9, Q11), kept word for word in
 `docs/batch1-decisions.md` with the acceptance tests (Part 6), and are never changed here.

@@ -1,17 +1,19 @@
-import { and, count, eq, gte, lte, type SQL, sql } from "drizzle-orm";
+import { and, count, eq, gte, isNull, lte, type SQL, sql } from "drizzle-orm";
 import { z } from "zod";
 
 import { orderedCurrencies } from "../../currencies";
 import type { Database } from "../../db/client";
 import { containerLines, containers, type Currency, orderLines, orders, payments, receipts, suppliers } from "../../db/schema";
+import { type Ledger, loadLedger } from "../ledger/ledger";
 import { orderClosed } from "../orders/closure";
-import { balanceOf as supplierBalance, round2, supplierMoney } from "../orders/money";
+import { orderMoney, round2 } from "../orders/money";
 import { addDays } from "../reports/reports";
 import { creationOrder } from "./list-query";
 
 // The Suppliers page (docs/suppliers.md): the list rows' money (MD-1), the KPI summary (SUP-1) and the performance and
-// analytics figures (SUP-2). Money is the supplier-only money of money.ts, kept per order currency and never added
-// across currencies. Delivery is measured in China: an order is delivered on the day of its first receipt (REC-3).
+// analytics figures (SUP-2). A supplier's balance is its signed ledger balance per currency (docs/unified-ledger.md):
+// + money with the supplier, − payable; held accounts are left out and named in `heldCurrencies`. Amounts are never
+// added across currencies. Delivery is measured in China: an order is delivered on the day of its first receipt (REC-3).
 
 export type MoneyTotal = { currency: Currency; amount: number };
 type Tx = Parameters<Parameters<Database["transaction"]>[0]>[0];
@@ -39,7 +41,7 @@ export async function nextCode(tx: Tx) {
   return `SUP-${String(row?.next ?? 1).padStart(3, "0")}`;
 }
 
-/** Every order in scope with its supplier money and the day China first received it (null until then). */
+/** Every order in scope with its value and the day China first received it (null until then). */
 function orderRows(db: Database, where?: SQL) {
   return db
     .select({
@@ -50,9 +52,7 @@ function orderRows(db: Database, where?: SQL) {
       deliveryDate: orders.deliveryDate,
       stage: orders.stage,
       closed: orderClosed,
-      orderValueCny: supplierMoney.orderValueCny,
-      paidCny: supplierMoney.paidCny,
-      advanceCny: supplierMoney.advanceCny,
+      orderValueCny: orderMoney.orderValueCny,
       receivedOn: sql<string | null>`(select min(${receipts.receivedOn})::text from ${receipts} where ${receipts.orderId} = ${orders.id})`,
     })
     .from(orders)
@@ -61,28 +61,35 @@ function orderRows(db: Database, where?: SQL) {
 }
 type OrderRow = Awaited<ReturnType<typeof orderRows>>[number];
 
-/** Less direct supplier payments and the supplier advance applied (money.ts balanceOf). */
-const balanceOf = (row: OrderRow) => supplierBalance(row);
+/** The supplier's signed ledger balance per currency (held accounts left out) and the held currencies. */
+export function ledgerBalance(ledger: Ledger, supplierId: string) {
+  const accounts = ledger.accountsOf(supplierId);
+  const own = accounts.filter((account) => !account.held).map((account) => ({ currency: account.currency as Currency, balanceCny: account.balanceCny! }));
+  return {
+    balance: byCurrency(own, (account) => account.balanceCny),
+    heldCurrencies: orderedCurrencies(accounts.filter((account) => account.held).map((account) => account.currency)),
+  };
+}
 
-// ponytail: every order is loaded and grouped in memory (a few hundred rows); a GROUP BY over money.ts when orders reach thousands.
-/** Per supplier: this year's order value (orders dated from 1 January) and the balance still owed, per currency. */
+// ponytail: every order is loaded and grouped in memory (a few hundred rows); a GROUP BY when orders reach thousands.
+/** Per supplier: this year's order value (orders dated from 1 January) per currency, and its ledger balance. */
 export async function supplierMoneyRows(db: Database, today: string) {
-  const rows = await orderRows(db);
+  const [rows, ledger] = await Promise.all([orderRows(db), loadLedger(db)]);
   const jan1 = `${today.slice(0, 4)}-01-01`;
+  const ids = distinct([...rows.map((row) => row.supplierId), ...[...ledger.accounts.values()].map((account) => account.supplierId)]);
   return new Map(
-    distinct(rows.map((row) => row.supplierId)).map((supplierId) => {
+    ids.map((supplierId) => {
       const own = rows.filter((row) => row.supplierId === supplierId);
-      return [
-        supplierId,
-        { ytdValue: byCurrency(own.filter((row) => row.orderDate >= jan1), (row) => row.orderValueCny), balance: byCurrency(own, balanceOf) },
-      ];
+      // A held account's orders (D4) add nothing to the value.
+      const counted = own.filter((row) => row.orderDate >= jan1 && !ledger.order(row.id)?.held);
+      return [supplierId, { ytdValue: byCurrency(counted, (row) => row.orderValueCny), ...ledgerBalance(ledger, supplierId) }];
     }),
   );
 }
 
 /** SUP-1: the five KPI cards. Open = not closed (phase 2 §1); in transit = stages 3-5 (left China, not yet stocked). */
 export async function suppliersSummary(db: Database, today: string) {
-  const [[counts], rows, [transit], due] = await Promise.all([
+  const [[counts], rows, [transit], due, ledger] = await Promise.all([
     db.select({ total: count(), active: sql<number>`count(*) filter (where ${suppliers.status} = 'Active')`.mapWith(Number) }).from(suppliers),
     orderRows(db),
     db
@@ -99,21 +106,31 @@ export async function suppliersSummary(db: Database, today: string) {
       .select({ currency: orders.currency, count: count(), amount: sql<number>`coalesce(sum(${payments.amountCny}), 0)`.mapWith(Number) })
       .from(payments)
       .innerJoin(orders, eq(orders.id, payments.orderId))
-      .where(and(eq(payments.payeeRole, "supplier"), eq(payments.status, "due"), gte(payments.dueDate, today), lte(payments.dueDate, addDays(today, 6))))
+      .where(
+        and(
+          eq(payments.payeeRole, "supplier"),
+          eq(payments.status, "due"),
+          isNull(payments.voidedAt),
+          gte(payments.dueDate, today),
+          lte(payments.dueDate, addDays(today, 6)),
+          // A held account (D4) counts in no KPI.
+          sql`not exists (select 1 from supplier_ledger_holds h where h.supplier_id = ${orders.supplierId} and h.currency = ${orders.currency})`,
+        ),
+      )
       .groupBy(orders.currency),
+    loadLedger(db),
   ]);
   const open = rows.filter((row) => !row.closed);
-  // A supplier owes nothing in a currency it has overpaid: only positive balances count as unpaid.
-  const owed = distinct(rows.map((row) => row.supplierId)).flatMap((supplierId) =>
-    byCurrency(rows.filter((row) => row.supplierId === supplierId), balanceOf)
-      .filter((total) => total.amount > 0)
-      .map((total) => ({ ...total, supplierId })),
-  );
+  // Unpaid: the payable (negative) ledger balances, as positive amounts; a held account counts in none.
+  const owed = [...ledger.accounts.values()]
+    .filter((account) => !account.held && account.balanceCny! < 0)
+    .map((account) => ({ currency: account.currency as Currency, amount: -account.balanceCny!, supplierId: account.supplierId }));
   const total = counts?.total ?? 0;
   const active = counts?.active ?? 0;
   return {
     suppliers: { total, active, inactive: total - active },
-    openPos: { count: open.length, value: byCurrency(open, (row) => row.orderValueCny) },
+    // A held account's orders (D4) add nothing to the value.
+    openPos: { count: open.length, value: byCurrency(open.filter((row) => !ledger.order(row.id)?.held), (row) => row.orderValueCny) },
     inTransit: { orders: rows.filter((row) => row.stage >= 3 && row.stage <= 5).length, nextEta: transit?.nextEta ?? null, arrivingNext7: transit?.arrivingNext7 ?? 0 },
     unpaid: { amount: byCurrency(owed, (total) => total.amount), suppliers: distinct(owed.map((total) => total.supplierId)).length },
     upcomingPayments: { windowDays: 7, count: sum(due, (row) => row.count), amount: byCurrency(due, (row) => row.amount) },
@@ -169,7 +186,8 @@ export async function supplierInsights(db: Database, q: InsightsQuery, today: st
     q.supplierId ? eq(orders.supplierId, q.supplierId) : undefined,
   );
   const paidMonth = sql<string>`to_char(${payments.paidOn}, 'YYYY-MM')`;
-  const [rows, supplierRows, paid] = await Promise.all([
+  const paidCurrency = sql<Currency>`coalesce(${payments.currency}, ${orders.currency})`;
+  const [rows, supplierRows, paid, ledger] = await Promise.all([
     orderRows(db, scope),
     db
       .select({ id: suppliers.id, code: suppliers.code, name: suppliers.name, country: suppliers.country, status: suppliers.status })
@@ -178,22 +196,27 @@ export async function supplierInsights(db: Database, q: InsightsQuery, today: st
     db
       .select({
         month: paidMonth,
-        currency: orders.currency,
+        currency: paidCurrency,
         amountCny: sql<number>`coalesce(sum(${payments.amountCny}), 0)`.mapWith(Number),
         amountInr: sql<number>`coalesce(sum(round(${payments.amountCny} * ${payments.rateInr}, 2)), 0)`.mapWith(Number),
       })
       .from(payments)
-      .innerJoin(orders, eq(orders.id, payments.orderId))
+      // Orderless supplier payments (0017) have no order: their own supplier and currency.
+      .leftJoin(orders, eq(orders.id, payments.orderId))
       .where(
         and(
           eq(payments.payeeRole, "supplier"),
           eq(payments.status, "paid"),
+          isNull(payments.voidedAt),
+          // A held account (D4) counts in no total.
+          sql`not exists (select 1 from supplier_ledger_holds h where h.supplier_id = coalesce(${payments.supplierId}, ${orders.supplierId}) and h.currency = coalesce(${payments.currency}, ${orders.currency}))`,
           gte(payments.paidOn, q.from ?? `${firstMonth}-01`),
           lte(payments.paidOn, q.to ?? today),
-          q.supplierId ? eq(orders.supplierId, q.supplierId) : undefined,
+          q.supplierId ? sql`coalesce(${payments.supplierId}, ${orders.supplierId}) = ${q.supplierId}` : undefined,
         ),
       )
-      .groupBy(paidMonth, orders.currency),
+      .groupBy(paidMonth, paidCurrency),
+    loadLedger(db, q.supplierId ? { supplierIds: [q.supplierId] } : {}),
   ]);
 
   const byId = new Map(supplierRows.map((supplier) => [supplier.id, supplier]));
@@ -208,7 +231,7 @@ export async function supplierInsights(db: Database, q: InsightsQuery, today: st
         country: supplier.country,
         ...stats(own, today),
         value: byCurrency(own, (row) => row.orderValueCny),
-        balance: byCurrency(own, balanceOf),
+        ...ledgerBalance(ledger, supplierId),
       };
     })
     .sort(byValue);

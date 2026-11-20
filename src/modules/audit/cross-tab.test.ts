@@ -1,3 +1,5 @@
+import { randomUUID } from "node:crypto";
+
 import { eq } from "drizzle-orm";
 import supertest from "supertest";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
@@ -8,6 +10,8 @@ import { idOf, indiaDay } from "../stock/fixtures";
 
 // Agent 7 audit: one order driven through the HTTP API (ORD-3, PAY-2, REC-3, CON-3, CON-5) with every read endpoint
 // (ORD-1, ORD-4, PAY-1, CAL-1, REC-1, REC-2, CON-1, CON-2, CON-4) compared after each step, plus concurrency probes.
+// Supplier money is the unified ledger's (docs/unified-ledger.md): supplier payments are recorded against the supplier
+// and settle the order through the FIFO projection; agent payments stay on the order (sea freight).
 
 const ctx = createTestContext();
 const http = api(ctx);
@@ -31,10 +35,9 @@ const get = (path: string, cookie = boss) => http.get(path).set("Cookie", cookie
 const post = (path: string, body: object, cookie = wang) => http.post(path, body).set("Cookie", cookie);
 const patch = (path: string, body: object, cookie = wang) => http.patch(path, body).set("Cookie", cookie);
 
-const DEPOSITS = [
-  { payee: "Guangzhou Textile Co.", payeeRole: "supplier", amountCny: 100.1, paidOn: indiaDay(-9), rateInr: 11.8765, mode: "Bank transfer" },
-  { payee: "Sino Freight", payeeRole: "agent", amountCny: 50.55, paidOn: indiaDay(-9), rateInr: 11.91, mode: "Cash" },
-];
+/** ORD-3 takes agent deposits only; the supplier's deposit is a PAY-2 supplier payment. */
+const DEPOSITS = [{ payee: "Sino Freight", payeeRole: "agent", amountCny: 50.55, paidOn: indiaDay(-9), rateInr: 11.91, mode: "Cash" }];
+const SUPPLIER_DEPOSIT = { amount: 100.1, paidOn: indiaDay(-9), rateInr: 11.8765, mode: "Bank transfer" };
 const VALUE = 60 * 5.5 + 50 * 4.25; // 542.5
 
 beforeAll(async () => {
@@ -69,25 +72,29 @@ async function expectConsistent(want: Expected) {
   const ord1 = o1.body.find((row: { id: string }) => row.id === order.id);
   const detail = o4.body;
   const pay = p1.body.orders.find((row: { orderId: string }) => row.orderId === order.id);
-  const paidCny = round2(want.payments.reduce((sum, p) => sum + p.amountCny, 0));
-  const paidInr = round2(want.payments.reduce((sum, p) => sum + inr(p.amountCny, p.rateInr), 0));
+  const toAgent = want.payments.filter((p) => p.payeeRole === "agent");
+  const agentPaidCny = round2(toAgent.reduce((sum, p) => sum + p.amountCny, 0));
+  const agentPaidInr = round2(toAgent.reduce((sum, p) => sum + inr(p.amountCny, p.rateInr), 0));
   const toSupplier = want.payments.filter((p) => p.payeeRole === "supplier");
-  const supplierPaidCny = round2(toSupplier.reduce((sum, p) => sum + p.amountCny, 0));
-  const supplierPaidInr = round2(toSupplier.reduce((sum, p) => sum + inr(p.amountCny, p.rateInr), 0));
+  // The supplier's only order here: the FIFO projection settles it with every supplier payment (all below its value).
+  const settledCny = round2(toSupplier.reduce((sum, p) => sum + p.amountCny, 0));
+  const settledInr = round2(toSupplier.reduce((sum, p) => sum + inr(p.amountCny, p.rateInr), 0));
 
-  // Stage and the money figures: identical in ORD-1, ORD-4 and PAY-1; the balance is what the supplier is owed
-  // (agent payments are sea freight, docs/phase2-fixes.md 1).
+  // Stage and the money figures: identical in ORD-1, ORD-4 and PAY-1; outstanding is what the supplier is still owed
+  // for the order (agent payments are sea freight, docs/phase2-fixes.md 1).
   expect(ord1.stage).toBe(want.stage);
   expect(detail.stage).toBe(want.stage);
   for (const view of [ord1, detail, pay]) {
     expect(view.orderValueCny).toBe(VALUE);
-    expect(view.paidCny).toBeCloseTo(paidCny, 2);
-    expect(view.paidInr).toBeCloseTo(paidInr, 2);
-    expect(view.supplierPaidCny).toBeCloseTo(supplierPaidCny, 2);
-    expect(view.supplierPaidInr).toBeCloseTo(supplierPaidInr, 2);
+    expect(view.settledCny).toBeCloseTo(settledCny, 2);
+    expect(view.settledInr).toBeCloseTo(settledInr, 2);
+    expect(view.agentPaidCny).toBeCloseTo(agentPaidCny, 2);
+    expect(view.agentPaidInr).toBeCloseTo(agentPaidInr, 2);
+    expect(view.paidInr).toBeCloseTo(round2(settledInr + agentPaidInr), 2);
   }
-  expect(detail.balanceCny).toBeCloseTo(round2(VALUE - supplierPaidCny), 2);
-  expect(pay.balanceCny).toBe(detail.balanceCny);
+  expect(detail.outstandingCny).toBeCloseTo(round2(VALUE - settledCny), 2);
+  expect(pay.outstandingCny).toBe(detail.outstandingCny);
+  expect(detail.supplierAccount.balanceCny).toBeCloseTo(round2(settledCny - VALUE), 2);
   expect(detail.lines.reduce((sum: number, l: { valueCny: number }) => sum + l.valueCny, 0)).toBeCloseTo(VALUE, 2);
 
   // Main line (position 0): ORD-1 and ORD-4 header, CAL-1.
@@ -102,12 +109,15 @@ async function expectConsistent(want: Expected) {
   expect(detail.lines.map((l: { loaded: number }) => l.loaded)).toEqual(want.loaded);
   expect(detail.lines.map((l: { position: number }) => l.position)).toEqual([0, 1]);
 
-  // Payment records: ORD-4 list and PAY-1 list hold the same rows for this order.
+  // Payment records: ORD-4 and PAY-1 hold the same order-linked (agent) rows; PAY-1 also lists the supplier's own.
   const payList = p1.body.payments.filter((p: { orderId: string }) => p.orderId === order.id);
-  expect(payList).toHaveLength(want.payments.length);
-  expect(detail.payments).toHaveLength(want.payments.length);
+  expect(payList).toHaveLength(toAgent.length);
+  expect(detail.payments).toHaveLength(toAgent.length);
   expect(detail.payments.map((p: { id: string }) => p.id).sort()).toEqual(payList.map((p: { id: string }) => p.id).sort());
   expect(payList.every((p: { po: string; status: string }) => p.po === order.po && p.status === "paid")).toBe(true);
+  const supplierList = p1.body.payments.filter((p: { orderId: string | null; supplierId: string }) => p.orderId === null && p.supplierId === ids.supplier);
+  expect(supplierList).toHaveLength(toSupplier.length);
+  expect(detail.slices).toHaveLength(toSupplier.length);
 
   // CAL-1: orders at stage 1-2 only, same received and due date.
   const inCal = cal.body.find((row: { orderId: string }) => row.orderId === order.id);
@@ -132,15 +142,14 @@ async function expectConsistent(want: Expected) {
   const mainReceived = detail.receipts.flatMap((r: { lines: { orderLineId: string; quantity: number }[] }) => r.lines).filter((l: { orderLineId: string }) => l.orderLineId === order.lines[0]);
   expect(mainReceived.reduce((sum: number, l: { quantity: number }) => sum + l.quantity, 0)).toBe(want.received[0]);
 
-  // REC-2: stage 1-2 with something left; per-line receivedEarlier; deposits-only paid total.
+  // REC-2: stage 1-2 with something left; per-line receivedEarlier; what is still owed for the order.
   const opt = r2.body.orders.find((row: { orderId: string }) => row.orderId === order.id);
   const left = [60 - want.received[0], 50 - want.received[1]];
   if (want.stage <= 2 && left.some((n) => n > 0)) {
     expect(opt).toBeDefined();
     expect(opt.orderValueCny).toBe(VALUE);
-    // REC-2 shows the deposits paid to the supplier (an agent deposit is freight), as the order report does.
-    const deposits = round2(want.payments.filter((p) => p.kind === "Deposit" && p.payeeRole === "supplier").reduce((sum, p) => sum + p.amountCny, 0));
-    expect(opt.depositsPaidCny).toBeCloseTo(deposits, 2);
+    // REC-2 shows the order's outstanding (the ledger's projection): an agent payment is freight.
+    expect(opt.outstandingCny).toBeCloseTo(round2(VALUE - settledCny), 2);
     expect(opt.lines.map((l: { orderLineId: string }) => l.orderLineId)).toEqual(order.lines.filter((_, i) => left[i]! > 0));
     for (const l of opt.lines as { orderLineId: string; receivedEarlier: number; ordered: number }[]) {
       const i = order.lines.indexOf(l.orderLineId);
@@ -189,7 +198,7 @@ async function expectConsistent(want: Expected) {
 const state: Expected = { stage: 1, received: [0, 0], loaded: [0, 0], payments: [] };
 
 describe("one order across all five tabs", () => {
-  it("ORD-3 creates the order with two deposits", async () => {
+  it("ORD-3 creates the order with an agent deposit; PAY-2 records the supplier's deposit against the supplier", async () => {
     const options = await get("/orders/options");
     expect(options.body.nextPo).toBe("PO-2050");
     const res = await post(
@@ -212,25 +221,29 @@ describe("one order across all five tabs", () => {
     expect(order.po).toBe("PO-2050");
     const detail = await get(`/orders/${order.po}`);
     order.lines = detail.body.lines.map((l: { id: string }) => l.id);
-    state.payments = DEPOSITS.map((d) => ({ amountCny: d.amountCny, rateInr: d.rateInr, kind: "Deposit", payeeRole: d.payeeRole as "supplier" | "agent" }));
+    state.payments = DEPOSITS.map((d) => ({ amountCny: d.amountCny, rateInr: d.rateInr, kind: "Deposit", payeeRole: "agent" as const }));
+    await expectConsistent(state);
+    const paid = await post("/payments", { supplierId: ids.supplier, ...SUPPLIER_DEPOSIT, clientRequestId: randomUUID() }, accounts);
+    expect(paid.status).toBe(201);
+    state.payments.push({ amountCny: SUPPLIER_DEPOSIT.amount, rateInr: SUPPLIER_DEPOSIT.rateInr, kind: "Payment", payeeRole: "supplier" });
     await expectConsistent(state);
   });
 
   it("PAY-2 records a balance payment to the agent", async () => {
-    const bad = await post("/payments", { orderId: order.id, kind: "Balance", payeeRole: "agent", agentId: null, amountCny: 20.2, paidOn: indiaDay(-1), rateInr: 11.5, mode: "UPI" }, accounts);
+    const bad = await post("/payments", { orderId: order.id, kind: "Balance", payeeRole: "agent", agentId: null, amountCny: 20.2, paidOn: indiaDay(-1), rateInr: 11.5, mode: "UPI", clientRequestId: randomUUID() }, accounts);
     expect(bad.status).toBe(422);
     expect(bad.body.error.fields.agentId).toBeDefined();
-    const res = await post("/payments", { orderId: order.id, kind: "Balance", payeeRole: "agent", agentId: ids.sino, amountCny: 20.2, paidOn: indiaDay(-1), rateInr: 11.5, mode: " UPI " }, accounts);
+    const res = await post("/payments", { orderId: order.id, kind: "Balance", payeeRole: "agent", agentId: ids.sino, amountCny: 20.2, paidOn: indiaDay(-1), rateInr: 11.5, mode: " UPI ", clientRequestId: randomUUID() }, accounts);
     expect(res.status).toBe(201);
     state.payments.push({ amountCny: 20.2, rateInr: 11.5, kind: "Balance", payeeRole: "agent" });
     const { detail } = await expectConsistent(state);
     const added = detail.payments.find((p: { id: string }) => p.id === res.body.payment.id);
     expect(added).toMatchObject({ kind: "Balance", payee: "Sino Freight", payeeRole: "agent", mode: "UPI", status: "paid", dueDate: null, rateInr: 11.5 });
-    const supplierPay = await post("/payments", { orderId: order.id, kind: "Balance", payeeRole: "supplier", agentId: null, amountCny: 0.01, paidOn: indiaDay(0), rateInr: 0.0001, mode: "x" }, accounts);
+    const supplierPay = await post("/payments", { supplierId: ids.supplier, amount: 0.01, paidOn: indiaDay(0), rateInr: 0.0001, mode: "x", clientRequestId: randomUUID() }, accounts);
     expect(supplierPay.status).toBe(201);
-    state.payments.push({ amountCny: 0.01, rateInr: 0.0001, kind: "Balance", payeeRole: "supplier" });
-    const { detail: d2 } = await expectConsistent(state);
-    expect(d2.payments.find((p: { id: string }) => p.id === supplierPay.body.payment.id).payee).toBe("Guangzhou Textile Co.");
+    expect(supplierPay.body.payment.payee).toBe("Guangzhou Textile Co.");
+    state.payments.push({ amountCny: 0.01, rateInr: 0.0001, kind: "Payment", payeeRole: "supplier" });
+    await expectConsistent(state);
   });
 
   it("REC-3: a short receipt needs a remark, then is saved and moves the order 1 -> 2", async () => {
@@ -366,11 +379,12 @@ describe("access, validation and error handling", () => {
   it("ORD-4 hides sections the role can't view and 404s bad ids", async () => {
     const acc = await get(`/orders/${order.po}`, accounts); // payments Enter; receiving, containers None
     expect(acc.status).toBe(200);
-    expect(acc.body.payments).toHaveLength(4);
+    expect(acc.body.payments).toHaveLength(2); // the order's agent payments; the supplier's are against the supplier
+    expect(acc.body.slices).toHaveLength(2);
     expect(acc.body.receipts).toBeNull();
     expect(acc.body.containers).toBeNull();
     const proc = await get(`/orders/${order.po}`, procurement); // payments View, receiving View, containers None
-    expect(proc.body.payments).toHaveLength(4);
+    expect(proc.body.payments).toHaveLength(2);
     expect(proc.body.receipts).toHaveLength(6);
     expect(proc.body.containers).toBeNull();
     expect((await get(`/orders/${order.po}`, wang)).status).toBe(403); // staff have no Orders access, so never reach ORD-4
@@ -409,14 +423,16 @@ describe("access, validation and error handling", () => {
     expect(empty.status).toBe(400); // body shape is checked before the container is read
   });
 
-  it("PAY-2 validation: future date (India), unknown order, extra key", async () => {
-    const base = { orderId: order.id, kind: "Deposit", payeeRole: "supplier", agentId: null, amountCny: 5, paidOn: indiaDay(0), rateInr: 11, mode: "Cash" };
+  it("PAY-2 validation: future date (India), unknown supplier, extra key, the old order-linked supplier body", async () => {
+    const base = { supplierId: ids.supplier, amount: 5, paidOn: indiaDay(0), rateInr: 11, mode: "Cash", clientRequestId: randomUUID() };
     expect((await post("/payments", { ...base, paidOn: indiaDay(1) }, accounts)).body.error.fields.paidOn).toBeDefined();
-    expect((await post("/payments", { ...base, orderId: UNKNOWN }, accounts)).body.error.fields.orderId).toBeDefined();
-    expect((await post("/payments", { ...base, orderId: "nope" }, accounts)).status).toBe(422);
+    expect((await post("/payments", { ...base, supplierId: UNKNOWN }, accounts)).body.error.fields.supplierId).toBeDefined();
+    expect((await post("/payments", { ...base, supplierId: "nope" }, accounts)).status).toBe(422);
     expect((await post("/payments", { ...base, extra: 1 }, accounts)).status).toBe(400);
     expect((await post("/payments", { ...base, mode: "x".repeat(101) }, accounts)).body.error.fields.mode).toBeDefined();
-    expect((await post("/payments", { ...base, amountCny: 0.004 }, accounts)).status).toBe(422);
+    expect((await post("/payments", { ...base, amount: 0.004 }, accounts)).status).toBe(422);
+    const old = { orderId: order.id, kind: "Deposit", payeeRole: "supplier", agentId: null, amountCny: 5, paidOn: indiaDay(0), rateInr: 11, mode: "Cash" };
+    expect((await post("/payments", old, accounts)).body.error.fields).toEqual({ payeeRole: "Supplier payments are now recorded against the supplier. Reload the page." });
   });
 
   // Was audit M1 (a burst of creates got 500s); fixed with an advisory lock around the PO number in ORD-3.
@@ -452,7 +468,8 @@ describe("known defects (it.fails)", () => {
         orderDate: indiaDay(0),
         deliveryDate: indiaDay(5),
         lines: [{ itemId: ids.pants, quantity: 5, rateCny: 1 }],
-        deposits: [{ payee: "Guangzhou Textile Co.", payeeRole: "supplier", amountCny: 1, paidOn: indiaDay(30), rateInr: 11, mode: "Cash" }],
+        // An agent deposit (ORD-3 takes no supplier deposits since the ledger, docs/unified-ledger.md).
+        deposits: [{ payee: "Sino Freight", payeeRole: "agent", amountCny: 1, paidOn: indiaDay(30), rateInr: 11, mode: "Cash" }],
       },
       boss,
     );

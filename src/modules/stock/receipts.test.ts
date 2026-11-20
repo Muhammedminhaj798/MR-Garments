@@ -3,7 +3,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import { locations, orders, payments, receipts, users, userStageGrants } from "../../db/schema";
 import { api, createTestContext, resetData, SEEDED, signInAs } from "../../test/harness";
-import { idOf, indiaDay, makeOrder } from "./fixtures";
+import { idOf, indiaDay, makeOrder, postLegacy } from "./fixtures";
 import { MESSAGES } from "./stock.routes";
 
 const ctx = createTestContext();
@@ -250,6 +250,10 @@ describe("REC-2 GET /receipts/options", () => {
       { orderId: open.id, kind: "Deposit", payee: "Guangzhou Textile Co.", payeeRole: "supplier", amountCny: 300, status: "paid", paidOn: indiaDay(-20), rateInr: 11.8, mode: "Bank transfer" },
       { orderId: open.id, kind: "Deposit", payee: "Guangzhou Textile Co.", payeeRole: "supplier", amountCny: 50, status: "due", dueDate: indiaDay(5) },
     ]);
+    // A legacy order-linked payment: posted to the ledger, whose FIFO projection settles the oldest order first; this one
+    // is dated before the file's other orders of the supplier.
+    await ctx.db.update(orders).set({ orderDate: indiaDay(-400) }).where(eq(orders.id, open.id));
+    await postLegacy(ctx);
     expect((await post(chen, body(open.id, [{ orderLineId: main, quantity: 100 }, { orderLineId: fabric, quantity: 120 }]))).status).toBe(201);
     expect((await post(chen, body(done.id, [{ orderLineId: done.lineIds[0]!, quantity: 10 }]))).status).toBe(201);
 
@@ -265,7 +269,7 @@ describe("REC-2 GET /receipts/options", () => {
       supplier: "Guangzhou Textile Co.",
       currency: "CNY", // not money: China staff get it too
       orderValueCny: 2750,
-      depositsPaidCny: 300,
+      outstandingCny: 2450, // the ledger's projection: ¥2,750 less the ¥300 paid (the due row is not money paid)
       lines: [{ orderLineId: fabric, item: "Cotton fabric", unit: "m", ordered: 500, receivedEarlier: 120, unitPriceCny: 3 }],
     };
     expect(res.body.orders.find((order: { orderId: string }) => order.orderId === open.id)).toEqual(row);
@@ -276,7 +280,7 @@ describe("REC-2 GET /receipts/options", () => {
     expect(staff.body.orders.find((order: { orderId: string }) => order.orderId === open.id)).toEqual({
       ...row,
       orderValueCny: null,
-      depositsPaidCny: null,
+      outstandingCny: null,
       lines: [{ ...row.lines[0], unitPriceCny: null }],
     });
   });

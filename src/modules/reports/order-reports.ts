@@ -5,14 +5,15 @@ import { isCurrency, orderedCurrencies } from "../../currencies";
 import type { Database } from "../../db/client";
 import { items, locations, orderLines, orders, suppliers, warehouseReceiptLines, warehouseReceipts } from "../../db/schema";
 import { loadLandedCosts } from "../costs/landed-cost";
+import { cents, fromCents, loadLedger } from "../ledger/ledger";
 import { main, newestFirst, orderColumns, PO_MAX_LENGTH, round2, unitSymbol } from "../orders/orders.routes";
-import { balanceOf } from "../orders/money";
-import { orderFilter, supplierMoney } from "./reports";
+import { orderSettlement } from "../orders/money";
+import { orderFilter } from "./reports";
 
 // Owner: Agent R. RPT-O2 GET /reports/orders (docs/phase2-contracts.md section 4.2; shape in 8.R; the comprehensive
-// report's additions in docs/order-report.md): every order with its payments, closure and landed cost, filtered. The
-// ORD-1 figures, with paid and balance counting supplier payments only (13.5 `supplierMoney`; agent payments are sea
-// freight), so value - paid = balance on every row.
+// report's additions in docs/order-report.md; money per docs/unified-ledger.md): every order with its settlement,
+// closure and landed cost, filtered. Settled, outstanding and payment status are the ledger's FIFO projection, so
+// value - settled = outstanding on every row (never negative); agent payments are sea freight, apart.
 
 export const ORDER_STATES = ["pending", "active", "closed"] as const;
 export const PAYMENT_STATES = ["unpaid", "partly", "paid"] as const;
@@ -41,17 +42,13 @@ type Query = z.infer<typeof orderReportsQuery>;
 
 /** Pending: not yet received (stage 1); closed: section 1's rule (ORD-1 `closed`); active: the rest. */
 const stateOf = (row: { stage: number; closed: boolean }) => (row.stage === 1 ? "pending" : row.closed ? "closed" : "active");
-/** Supplier payments against the order value: nothing paid, part of it, or all of it (an overpayment counts as paid). */
-/** Supplier payments and the supplier advance applied together (docs/supplier-advance.md): unpaid, partly or paid. */
-const paymentStateOf = (row: { paidCny: number; advanceCny: number; orderValueCny: number }) => {
-  const covered = round2(row.paidCny + row.advanceCny);
-  return covered <= 0 ? "unpaid" : covered >= row.orderValueCny ? "paid" : "partly";
-};
 const sum = <T>(rows: T[], pick: (row: T) => number) => rows.reduce((total, row) => total + pick(row), 0);
+/** RPT-O2 rows carry the agent's INR only (docs/unified-ledger.md). */
+const withoutAgentCny = <T extends { agentPaidCny: unknown }>({ agentPaidCny: _agentPaidCny, ...rest }: T) => rest;
 /** `%`, `_` and `\` typed in the PO filter match themselves (LIKE's default escape is `\`). */
 const escapeLike = (value: string) => value.replace(/[\\%_]/g, "\\$&");
 
-/** The filtered orders, their summary, the filter echo (names) and the page's select options. Six queries, plus loadLandedCosts. */
+/** The filtered orders, their summary, the filter echo (names) and the page's select options. Seven queries, plus loadLandedCosts. */
 export async function orderReports(db: Database, q: Query) {
   const po = q.po || undefined;
   const supplierText = q.supplier || undefined;
@@ -62,9 +59,9 @@ export async function orderReports(db: Database, q: Query) {
     where ${orderLines.orderId} = ${orders.id} and ${warehouseReceipts.locationId} = ${q.warehouseId})`;
   const nameOf = (table: typeof suppliers | typeof locations, id?: string) => (id ? db.select({ name: table.name }).from(table).where(eq(table.id, id)) : []);
 
-  const [rows, supplierOptions, warehouseOptions, supplier, warehouse] = await Promise.all([
+  const [rows, supplierOptions, warehouseOptions, supplier, warehouse, ledger] = await Promise.all([
     db
-      .select({ ...orderColumns, supplierCode: suppliers.code, paidCny: supplierMoney.paidCny, paidInr: supplierMoney.paidInr })
+      .select({ ...orderColumns, supplierCode: suppliers.code })
       .from(orders)
       .innerJoin(suppliers, eq(suppliers.id, orders.supplierId))
       .innerJoin(main, and(eq(main.orderId, orders.id), eq(main.position, 0)))
@@ -92,12 +89,14 @@ export async function orderReports(db: Database, q: Query) {
       .orderBy(asc(locations.createdAt), asc(locations.name)),
     nameOf(suppliers, q.supplierId),
     nameOf(locations, q.warehouseId),
+    loadLedger(db),
   ]);
-  // Status and payment status come from the row's own figures, so they are applied here rather than repeated in SQL.
-  const kept = rows.filter((row) => (!q.status || stateOf(row) === q.status) && (!q.paymentStatus || paymentStateOf(row) === q.paymentStatus));
+  // Status and payment status come from the row's own figures and the projection, so they are applied here. A held or
+  // unposted order has no payment status, so it matches none.
+  const kept = rows.filter((row) => (!q.status || stateOf(row) === q.status) && (!q.paymentStatus || ledger.order(row.id)?.paymentStatus === q.paymentStatus));
   const ids = kept.map((row) => row.id);
   const [costs, lineTotals] = await Promise.all([
-    loadLandedCosts(db, ids),
+    loadLandedCosts(db, ids, ledger),
     // Every line of the kept orders, per unit: how many items and how much was ordered (never added across units).
     ids.length
       ? db
@@ -133,13 +132,7 @@ export async function orderReports(db: Database, q: Query) {
       closed: row.closed,
       closedOn: row.closedOn,
       orderValueCny: row.orderValueCny,
-      paidCny: row.paidCny,
-      paidInr: row.paidInr,
-      /** The supplier advance applied (not a payment); the balance counts it once. */
-      advanceCny: row.advanceCny,
-      advanceInr: row.advanceInr,
-      balanceCny: balanceOf(row),
-      paymentStatus: paymentStateOf(row),
+      ...withoutAgentCny(orderSettlement(ledger.order(row.id), row)),
       /** null until the order has any cost (as the Landed Cost list hides costless orders). */
       landedCostInr: cost.totalInr > 0 ? cost.totalInr : null,
       perPieceInr: cost.totalInr > 0 ? cost.perPieceInr : null,
@@ -150,16 +143,16 @@ export async function orderReports(db: Database, q: Query) {
     summary: {
       orders: list.length,
       byCurrency: orderedCurrencies(list.map((row) => row.currency)).map((currency) => {
-        const inCurrency = list.filter((row) => row.currency === currency);
+        // A held account's orders (D4) are listed but count in no total.
+        const inCurrency = list.filter((row) => row.currency === currency && !row.held);
         return {
           currency,
           orderValueCny: round2(sum(inCurrency, (row) => row.orderValueCny)),
-          paidCny: round2(sum(inCurrency, (row) => row.paidCny)),
-          advanceCny: round2(sum(inCurrency, (row) => row.advanceCny)),
-          balanceCny: round2(sum(inCurrency, (row) => row.balanceCny)),
+          settledCny: fromCents(sum(inCurrency, (row) => cents(row.settledCny ?? 0))),
+          outstandingCny: fromCents(sum(inCurrency, (row) => cents(row.outstandingCny ?? 0))),
         };
       }),
-      paidInr: round2(sum(list, (row) => row.paidInr)),
+      paidInr: fromCents(sum(list, (row) => cents(row.paidInr ?? 0))),
       landedCostInr: round2(sum(list, (row) => row.landedCostInr ?? 0)),
     },
     filter: {

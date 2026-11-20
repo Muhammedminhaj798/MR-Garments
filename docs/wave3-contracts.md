@@ -1,5 +1,7 @@
 # Wave 3 contracts: Settings CRUD, Clearing, Transport, Warehouse, Landed Cost, Reports
 
+> **Superseded in part (0017, unified supplier ledger):** supplier payments, PAY-2/PAY-3, advances, excess, supplier deposits and every paid / balance / outstanding figure now follow `docs/unified-ledger.md`. Where this file disagrees, that file wins.
+
 Written 2026-10-28 by the integration lead (Agent 7). Everything in `docs/contracts.md` and
 `docs/live-screens-contracts.md` still applies: Node 22, `/api/v1`, JSON only, the one error body, strict Zod bodies
 through `parse()`, the same-site check, `requirePermission`, dates `YYYY-MM-DD`, "today" in India

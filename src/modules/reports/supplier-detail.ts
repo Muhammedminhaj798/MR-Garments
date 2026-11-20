@@ -1,18 +1,20 @@
-import { and, asc, desc, eq, gte, lte, type SQL, sql } from "drizzle-orm";
+import { and, asc, eq, gte, isNull, lte, or, sql } from "drizzle-orm";
 import { z } from "zod";
 
-import { compareCurrencies } from "../../currencies";
+import { orderedCurrencies } from "../../currencies";
 import type { Database } from "../../db/client";
-import { items, orderLines, orders, payments, suppliers } from "../../db/schema";
+import { type Currency, items, orderLines, orders, payments, suppliers } from "../../db/schema";
 import { notFound } from "../../http/errors";
-import { advanceAccount } from "../advances/advances";
+import { accountsView, cents, fromCents, loadLedger, newestPaymentsFirst, paymentQuery, paymentRow, settlementFields } from "../ledger/ledger";
+import { supplierStatement } from "../ledger/ledger.routes";
 import { orderClosed } from "../orders/closure";
-import { balanceOf } from "../orders/money";
+import { orderMoney } from "../orders/money";
 import { main, newestFirst, orderColumns, unitSymbol } from "../orders/orders.routes";
-import { orderFilter, supplierMoney, toSupplier } from "./reports";
+import { orderFilter } from "./reports";
 
-// GET /reports/payments-per-supplier/:supplierId (docs/supplier-payment-detail-contract.md): one supplier's orders,
-// supplier payments and order lines with the report's money rules (13.5), each list paged by 10.
+// GET /reports/payments-per-supplier/:supplierId (docs/supplier-payment-detail-contract.md; money per
+// docs/unified-ledger.md RPT-5D): one supplier's orders (with the ledger's FIFO projection), its payments (orderless
+// ones included, voided flagged) and order lines, each list paged by 10, with its ledger accounts and statement.
 
 const PAGE_SIZE = 10;
 const date = z.iso.date().optional();
@@ -36,12 +38,11 @@ export const detailQuery = z
 type DetailQuery = z.infer<typeof detailQuery>;
 
 const count = sql<number>`count(*)`.mapWith(Number);
-const sumOf = (column: SQL.Aliased<number>) => sql<number>`coalesce(sum(${column}), 0)`.mapWith(Number);
 const pageOf = <T>(rows: T[], total: number, page: number) => ({ rows, total, page, pageSize: PAGE_SIZE });
 // ponytail: `all` lists at most this many rows per list; page the download if one supplier ever has more.
 const ALL_ROWS = 100_000;
 
-/** The supplier's detail, or 404 for a malformed or unknown id. Seven queries, none per row. */
+/** The supplier's detail, or 404 for a malformed or unknown id. Nine queries, none per row. */
 export async function supplierPaymentDetail(db: Database, supplierId: string, q: DetailQuery) {
   if (!z.uuid().safeParse(supplierId).success) throw notFound("Supplier");
   const [supplier] = await db
@@ -76,79 +77,36 @@ export async function supplierPaymentDetail(db: Database, supplierId: string, q:
   const limit = q.all ? ALL_ROWS : PAGE_SIZE;
   const paymentDay = sql`coalesce(${payments.paidOn}, ${payments.dueDate})`;
   const inPaymentRange = and(q.paymentFrom ? gte(paymentDay, q.paymentFrom) : undefined, q.paymentTo ? lte(paymentDay, q.paymentTo) : undefined) ?? sql`true`;
-  const ofSupplier = and(scope, eq(payments.payeeRole, "supplier"));
-
-  // Per order: the report's money, deposits (a subset of paid), the stage and whether it is closed, grouped by order
-  // currency below. The join keeps the closure fragment's columns qualified (closure.ts).
-  const perOrder = db
-    .select({
-      currency: orders.currency,
-      stage: orders.stage,
-      closed: orderClosed.as("closed"),
-      orderValueCny: supplierMoney.orderValueCny.as("order_value_cny"),
-      paidCny: supplierMoney.paidCny.as("paid_cny"),
-      paidInr: supplierMoney.paidInr.as("paid_inr"),
-      advanceCny: supplierMoney.advanceCny.as("advance_cny"),
-      depositsCny: sql<number>`(select coalesce(sum(${payments.amountCny}), 0) from ${payments}
-        where ${toSupplier} and ${payments.status} = 'paid' and ${payments.kind} = 'Deposit')`.as("deposits_cny"),
-    })
-    .from(orders)
-    .innerJoin(suppliers, eq(suppliers.id, orders.supplierId))
-    .where(scope)
-    .as("per_order");
+  // The supplier's payments: order-linked ones of its orders in the period, and its orderless ones (no order date).
+  const ofSupplier = and(
+    eq(payments.payeeRole, "supplier"),
+    or(and(isNull(payments.orderId), eq(payments.supplierId, supplierId)), and(scope, sql`${payments.orderId} is not null`)),
+  );
   const quantityIn = (metres: boolean) =>
     sql<number | null>`(select sum(${orderLines.quantity}) from ${orderLines} join ${items} on ${items.id} = ${orderLines.itemId}
       where ${orderLines.orderId} = ${orders.id} and (${items.countedIn} = 'Metres') = ${metres})`.mapWith(Number);
 
-  const [currencies, [paymentCounts], [lineCounts], paymentRows, orderRows, lineRows, advance] = await Promise.all([
+  const [perOrder, [paymentCounts], [lineCounts], paymentList, orderRows, lineRows, ledger, entries] = await Promise.all([
+    // Per order: its value, stage and whether it is closed, grouped by order currency below. The join keeps the
+    // closure fragment's columns qualified (closure.ts).
     db
-      .select({
-        currency: perOrder.currency,
-        orders: count,
-        // Open = not closed (docs/phase2-contracts.md 1), as Payments per supplier counts them.
-        openOrders: sql<number>`count(*) filter (where not ${perOrder.closed})`.mapWith(Number),
-        listed: sql<number>`count(*) filter (where ${q.stage ? sql`${perOrder.stage} = ${q.stage}` : sql`true`})`.mapWith(Number),
-        orderValueCny: sumOf(perOrder.orderValueCny),
-        paidCny: sumOf(perOrder.paidCny),
-        paidInr: sumOf(perOrder.paidInr),
-        depositsCny: sumOf(perOrder.depositsCny),
-        advanceCny: sumOf(perOrder.advanceCny),
-        // Less direct supplier payments and the supplier advance applied (docs/supplier-advance.md), each counted once.
-        // Summed per order, each never below 0 (0016): an overpaid order never lowers what other orders still owe.
-        balanceCny: sql<number>`coalesce(sum(greatest(0, round(${perOrder.orderValueCny} - ${perOrder.paidCny} - ${perOrder.advanceCny}, 2))), 0)`.mapWith(Number),
-      })
-      .from(perOrder)
-      .groupBy(perOrder.currency),
+      .select({ id: orders.id, currency: orders.currency, stage: orders.stage, closed: orderClosed, orderValueCny: orderMoney.orderValueCny })
+      .from(orders)
+      .innerJoin(suppliers, eq(suppliers.id, orders.supplierId))
+      .where(scope),
     db
       .select({ all: count, listed: sql<number>`count(*) filter (where ${inPaymentRange})`.mapWith(Number) })
       .from(payments)
-      .innerJoin(orders, eq(orders.id, payments.orderId))
+      .leftJoin(orders, eq(orders.id, payments.orderId))
       .where(ofSupplier),
     db
       .select({ all: count, products: sql<number>`count(distinct ${orderLines.itemId})`.mapWith(Number) })
       .from(orderLines)
       .innerJoin(orders, eq(orders.id, orderLines.orderId))
       .where(scope),
-    db
-      .select({
-        id: payments.id,
-        orderId: payments.orderId,
-        po: orders.poNumber,
-        currency: orders.currency,
-        kind: payments.kind,
-        status: payments.status,
-        paidOn: payments.paidOn,
-        dueDate: payments.dueDate,
-        amountCny: payments.amountCny,
-        rateInr: payments.rateInr,
-        amountInr: sql<number | null>`case when ${payments.status} = 'paid' then round(${payments.amountCny} * ${payments.rateInr}, 2) end`.mapWith(Number),
-        mode: payments.mode,
-      })
-      .from(payments)
-      .innerJoin(orders, eq(orders.id, payments.orderId))
-      .where(and(ofSupplier, inPaymentRange))
-      // PAY-1's order; the id last keeps pages stable when payments share a timestamp (one insert).
-      .orderBy(desc(paymentDay), desc(payments.createdAt), desc(payments.id))
+    // PAY-1's order; the id last keeps pages stable when payments share a timestamp (one insert).
+    paymentQuery(db, and(ofSupplier, inPaymentRange))
+      .orderBy(...newestPaymentsFirst)
       .limit(limit)
       .offset(offset(pages.payments)),
     db
@@ -164,9 +122,7 @@ export async function supplierPaymentDetail(db: Database, supplierId: string, q:
         quantity: orderColumns.quantity,
         received: orderColumns.received,
         unit: orderColumns.unit,
-        orderValueCny: supplierMoney.orderValueCny,
-        paidCny: supplierMoney.paidCny,
-        advanceCny: supplierMoney.advanceCny,
+        orderValueCny: orderMoney.orderValueCny,
       })
       .from(orders)
       .innerJoin(main, and(eq(main.orderId, orders.id), eq(main.position, 0)))
@@ -195,9 +151,33 @@ export async function supplierPaymentDetail(db: Database, supplierId: string, q:
       .orderBy(...newestFirst, asc(orderLines.position))
       .limit(limit)
       .offset(offset(pages.lines)),
-    advanceAccount(db, supplierId),
+    loadLedger(db, { supplierIds: [supplierId] }),
+    supplierStatement(db, supplierId),
   ]);
 
+  // Per currency of its orders in the period (and, without a period, of its accounts): the orders' value, settled and
+  // outstanding (FIFO projection), and the account's credits, signed balance and payments' INR (whole, never dated).
+  const accounts = accountsView(ledger, supplierId);
+  const accountCurrencies = q.from || q.to ? [] : accounts.map((account) => account.currency as Currency);
+  const currencies = orderedCurrencies<Currency>([...perOrder.map((row) => row.currency), ...accountCurrencies]).map((currency) => {
+    const own = perOrder.filter((row) => row.currency === currency);
+    const account = accounts.find((row) => row.currency === currency);
+    const held = account?.held ?? false;
+    const sumOf = (pick: (row: (typeof own)[number]) => number | null | undefined) => fromCents(own.reduce((total, row) => total + cents(pick(row) ?? 0), 0));
+    return {
+      currency,
+      held,
+      orders: own.length,
+      openOrders: own.filter((row) => !row.closed).length,
+      listed: own.filter((row) => !q.stage || row.stage === q.stage).length,
+      orderValueCny: sumOf((row) => row.orderValueCny),
+      settledCny: held ? null : sumOf((row) => ledger.order(row.id)?.settledCny),
+      outstandingCny: held ? null : sumOf((row) => ledger.order(row.id)?.outstandingCny),
+      creditsCny: held ? null : (account?.creditsCny ?? 0),
+      balanceCny: held ? null : (account?.balanceCny ?? 0),
+      paidInr: held ? null : (account?.paidInr ?? 0),
+    };
+  });
   const total = (pick: (row: (typeof currencies)[number]) => number) => currencies.reduce((sum, row) => sum + pick(row), 0);
   return {
     supplier,
@@ -208,22 +188,11 @@ export async function supplierPaymentDetail(db: Database, supplierId: string, q:
       payments: paymentCounts?.all ?? 0,
       lineItems: lineCounts?.all ?? 0,
       products: lineCounts?.products ?? 0,
-      byCurrency: currencies
-        .sort((a, b) => compareCurrencies(a.currency, b.currency))
-        .map((row) => ({
-          currency: row.currency,
-          orders: row.orders,
-          orderValueCny: row.orderValueCny,
-          paidCny: row.paidCny,
-          paidInr: row.paidInr,
-          depositsCny: row.depositsCny,
-          advanceCny: row.advanceCny,
-          balanceCny: row.balanceCny,
-        })),
+      byCurrency: currencies.map(({ openOrders: _open, listed: _listed, ...row }) => row),
     },
-    // The supplier's advance account (docs/supplier-advance.md), whole: it is not dated by the orders' range.
-    advance,
-    payments: pageOf(paymentRows, paymentCounts?.listed ?? 0, pages.payments),
+    // The supplier's ledger, whole: it is not dated by the orders' range.
+    ledger: { accounts, entries },
+    payments: pageOf(paymentList.map(paymentRow), paymentCounts?.listed ?? 0, pages.payments),
     orders: pageOf(
       orderRows.map(({ pcs, metres, ...row }) => ({
         ...row,
@@ -231,7 +200,7 @@ export async function supplierPaymentDetail(db: Database, supplierId: string, q:
           ...(pcs === null ? [] : [{ unit: "pcs" as const, quantity: pcs }]),
           ...(metres === null ? [] : [{ unit: "m" as const, quantity: metres }]),
         ],
-        balanceCny: balanceOf(row),
+        ...settlementFields(ledger.order(row.id)),
       })),
       total((row) => row.listed),
       pages.orders,

@@ -4,7 +4,7 @@ import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { type Currency, locations, orders, payments, suppliers, teams, warehouseReceiptLines, warehouseReceipts } from "../../db/schema";
 import { api, createTestContext, resetData, SEEDED, signInAs } from "../../test/harness";
 import { loadLandedCosts } from "../costs/landed-cost";
-import { indiaDay, makeOrder } from "../stock/fixtures";
+import { indiaDay, makeOrder, postLegacy } from "../stock/fixtures";
 import { STAGE_MESSAGES } from "./common";
 import { makeContainer, masters, stageOf, stageWriter, UNKNOWN } from "./fixtures";
 import { WAREHOUSE_MESSAGES as M } from "./warehouse.routes";
@@ -53,9 +53,14 @@ const body = (lines: { orderLineId: string; teamId: string; quantity: number }[]
   complete: false,
   ...extra,
 });
-/** An unloaded trip of one order, 100 Denim jeans at ¥10 (CNF), paid in full to the supplier at 12: ₹12,000. */
+/**
+ * An unloaded trip of one order, 100 Denim jeans at ¥10 (CNF), paid in full to the supplier at 12: ₹12,000. The
+ * payment is a legacy order-linked row, posted to the ledger; the order is dated before every other order of the
+ * shared supplier, so the FIFO projection settles it with that money (docs/unified-ledger.md).
+ */
 async function paidTrip() {
   const trip = await write.unloaded();
+  await ctx.db.update(orders).set({ orderDate: indiaDay(-400) }).where(eq(orders.id, trip.orders[0]!.id));
   await ctx.db.insert(payments).values({
     orderId: trip.orders[0]!.id,
     kind: "Balance",
@@ -67,6 +72,7 @@ async function paidTrip() {
     rateInr: 12,
     mode: "Bank transfer",
   });
+  await postLegacy(ctx);
   return trip;
 }
 
@@ -371,14 +377,14 @@ describe("WH-2 previous supplier outstanding", () => {
     return { id: row!.id, name };
   }
   const moveTo = (orderId: string, supplierId: string) => ctx.db.update(orders).set({ supplierId }).where(eq(orders.id, orderId));
-  /** An earlier order of `owner`: `quantity` Denim jeans at `rate`, in `currency`. */
+  /** An earlier order of `owner`: `quantity` Denim jeans at `rate`, in `currency` (posted to its ledger account). */
   async function earlier(owner: { name: string }, quantity: number, rate: number, currency: Currency = "CNY", stage = 1) {
-    const order = await makeOrder(ctx, { supplier: owner.name, stage, lines: [{ item: "Denim jeans", quantity, rateCny: rate }] });
-    if (currency !== "CNY") await ctx.db.update(orders).set({ currency }).where(eq(orders.id, order.id));
+    const order = await makeOrder(ctx, { supplier: owner.name, stage, currency, lines: [{ item: "Denim jeans", quantity, rateCny: rate }] });
     return order.id;
   }
-  const pay = (orderId: string, amountCny: number, extra: Partial<typeof payments.$inferInsert> = {}) =>
-    ctx.db.insert(payments).values({
+  /** A legacy order-linked payment, posted to the ledger as the backfill posts it. */
+  const pay = async (orderId: string, amountCny: number, extra: Partial<typeof payments.$inferInsert> = {}) => {
+    await ctx.db.insert(payments).values({
       orderId,
       kind: "Deposit",
       payee: "supplier",
@@ -390,6 +396,8 @@ describe("WH-2 previous supplier outstanding", () => {
       mode: "Bank transfer",
       ...extra,
     });
+    await postLegacy(ctx);
+  };
   const due = { status: "due", paidOn: null, rateInr: null, mode: null, dueDate: indiaDay(10) } as const;
   const owedOn = async (tripId: string) => (await get(`/warehouse-receipts/${tripId}`, suresh)).body.previousOutstanding;
 
@@ -398,10 +406,10 @@ describe("WH-2 previous supplier outstanding", () => {
     const trip = await write.unloaded();
     await moveTo(trip.orders[0]!.id, owner.id);
     // The trip's own ¥1,000 order is unpaid, but it is this PO, not a previous one.
-    expect(await owedOn(trip.tripId)).toEqual([{ supplierId: owner.id, supplier: owner.name, currency: "USD", orders: 0, byCurrency: [] }]);
+    expect(await owedOn(trip.tripId)).toEqual([{ supplierId: owner.id, supplier: owner.name, currency: "USD", orders: 0, byCurrency: [], ledgerBalance: [] }]);
   });
 
-  it("adds each currency's unpaid balances apart, counting deposits and payments once, and never changes the cost", async () => {
+  it("adds each currency's outstanding apart (the FIFO projection), counting deposits and payments once, and never changes the cost", async () => {
     const owner = await supplier();
     const trip = await write.unloaded();
     await moveTo(trip.orders[0]!.id, owner.id);
@@ -411,7 +419,7 @@ describe("WH-2 previous supplier outstanding", () => {
     const paid = await earlier(owner, 200, 10);
     await pay(paid, 500);
     await pay(paid, 1500, { kind: "Balance" });
-    expect(await owedOn(trip.tripId)).toEqual([{ supplierId: owner.id, supplier: owner.name, currency: "CNY", orders: 0, byCurrency: [] }]);
+    expect(await owedOn(trip.tripId)).toEqual([{ supplierId: owner.id, supplier: owner.name, currency: "CNY", orders: 0, byCurrency: [], ledgerBalance: [{ currency: "CNY", balanceCny: 0 }] }]);
 
     // Partly paid: ¥1,000 - ¥300 deposit = ¥700. A scheduled (due) payment and an agent payment don't reduce it.
     const partly = await earlier(owner, 100, 10);
@@ -442,6 +450,12 @@ describe("WH-2 previous supplier outstanding", () => {
         byCurrency: [
           { currency: "CNY", amount: 1210 },
           { currency: "USD", amount: 200 },
+        ],
+        // The signed ledger balance beside it: the overpaid INR order leaves ₹200 with the supplier.
+        ledgerBalance: [
+          { currency: "CNY", balanceCny: -1210 },
+          { currency: "USD", balanceCny: -200 },
+          { currency: "INR", balanceCny: 200 },
         ],
       },
     ]);
@@ -474,6 +488,11 @@ describe("WH-2 previous supplier outstanding", () => {
           { currency: "CNY", amount: 500 },
           { currency: "USD", amount: 70 },
         ],
+        // The whole account, later orders included.
+        ledgerBalance: [
+          { currency: "CNY", balanceCny: -1500 },
+          { currency: "USD", balanceCny: -2070 },
+        ],
       },
     ]);
   });
@@ -488,8 +507,8 @@ describe("WH-2 previous supplier outstanding", () => {
     await earlier(first, 40, 10);
     await earlier(second, 60, 10, "USD");
     expect(await owedOn(trip.tripId)).toEqual([
-      { supplierId: first.id, supplier: first.name, currency: "CNY", orders: 1, byCurrency: [{ currency: "CNY", amount: 400 }] },
-      { supplierId: second.id, supplier: second.name, currency: "CNY", orders: 1, byCurrency: [{ currency: "USD", amount: 600 }] },
+      { supplierId: first.id, supplier: first.name, currency: "CNY", orders: 1, byCurrency: [{ currency: "CNY", amount: 400 }], ledgerBalance: [{ currency: "CNY", balanceCny: -400 }] },
+      { supplierId: second.id, supplier: second.name, currency: "CNY", orders: 1, byCurrency: [{ currency: "USD", amount: 600 }], ledgerBalance: [{ currency: "USD", balanceCny: -600 }] },
     ]);
     // Warehouse staff see neither the cost nor the supplier's money.
     const staff = await get(`/warehouse-receipts/${trip.tripId}`);

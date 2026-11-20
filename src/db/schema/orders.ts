@@ -1,5 +1,5 @@
 import { sql } from "drizzle-orm";
-import { boolean, check, date, index, integer, numeric, pgTable, primaryKey, smallint, text, uniqueIndex, uuid } from "drizzle-orm/pg-core";
+import { boolean, check, date, index, integer, numeric, pgTable, primaryKey, smallint, text, timestamp, uniqueIndex, uuid } from "drizzle-orm/pg-core";
 
 import { type Currency, CURRENCY_SHAPE, inList, timestamps } from "./columns";
 import { locations, suppliers } from "./core";
@@ -13,7 +13,8 @@ import { items, shippingAgents } from "./master";
 const money = (name: string) => numeric(name, { precision: 14, scale: 2, mode: "number" });
 const rate = (name: string) => numeric(name, { precision: 12, scale: 4, mode: "number" });
 
-export const PAYMENT_KINDS = ["Deposit", "Balance"] as const;
+/** Deposit / Balance: order-linked rows (legacy supplier payments, shipping-agent payments). Payment: an orderless supplier payment (0017). */
+export const PAYMENT_KINDS = ["Deposit", "Balance", "Payment"] as const;
 export const PAYEE_ROLES = ["supplier", "agent"] as const;
 export const PAYMENT_STATUSES = ["paid", "due"] as const;
 export const TERMS = ["FOB", "CNF"] as const;
@@ -85,14 +86,21 @@ export const orderLines = pgTable(
   ],
 );
 
-/** Recorded payments only: nothing here moves money. */
+/**
+ * Recorded payments only: nothing here moves money. The document of every payment (0017, docs/unified-ledger.md): an
+ * order-linked row (a shipping-agent payment, or a supplier payment from before 0017, whose order is kept as a memo), or
+ * an orderless supplier payment (`supplier_id` + `currency`). Supplier money is posted to `supplier_ledger_entries`;
+ * agent payments never are. A row is never deleted: PAY-3 voids it (`voided_at`, reason required).
+ */
 export const payments = pgTable(
   "payments",
   {
     id: uuid("id").primaryKey().defaultRandom(),
-    orderId: uuid("order_id")
-      .notNull()
-      .references(() => orders.id, { onDelete: "cascade" }),
+    /** Null on an orderless supplier payment (0017); RESTRICT, so a payment never disappears with its order. */
+    orderId: uuid("order_id").references(() => orders.id, { onDelete: "restrict" }),
+    /** An orderless supplier payment's supplier and currency (0017); null on order-linked rows (read from the order). */
+    supplierId: uuid("supplier_id").references(() => suppliers.id),
+    currency: text("currency").$type<Currency>(),
     kind: text("kind").notNull(),
     payee: text("payee").notNull(),
     payeeRole: text("payee_role").notNull(),
@@ -105,11 +113,25 @@ export const payments = pgTable(
     /** Transaction or receipt number as the bank or supplier gave it (0008); "" when none. */
     reference: text("reference").notNull().default(""),
     notes: text("notes").notNull().default(""),
+    /** PAY-3 void (0017): when, by whom and why. A voided row stays as history and counts in no total. */
+    voidedAt: timestamp("voided_at", { withTimezone: true }),
+    voidedBy: uuid("voided_by"),
+    voidReason: text("void_reason").notNull().default(""),
+    /** The client's idempotency key for PAY-2 (0017): a resubmit returns this row instead of a second payment. */
+    clientRequestId: uuid("client_request_id"),
     ...timestamps,
     createdBy: uuid("created_by"),
   },
   (t) => [
     index("payments_order_idx").on(t.orderId),
+    index("payments_supplier_idx").on(t.supplierId),
+    uniqueIndex("payments_client_request_unique").on(t.clientRequestId),
+    check(
+      "payments_document_check",
+      sql`(order_id is not null and supplier_id is null and currency is null) or (order_id is null and supplier_id is not null and currency is not null and payee_role = 'supplier')`,
+    ),
+    check("payments_currency_check", CURRENCY_SHAPE),
+    check("payments_void_check", sql`(voided_at is null and voided_by is null and void_reason = '') or (voided_at is not null and btrim(void_reason) <> '')`),
     check("payments_kind_check", inList("kind", PAYMENT_KINDS)),
     check("payments_payee_role_check", inList("payee_role", PAYEE_ROLES)),
     check("payments_status_check", inList("status", PAYMENT_STATUSES)),

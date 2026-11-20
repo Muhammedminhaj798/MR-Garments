@@ -18,7 +18,7 @@ import {
 } from "../../db/schema";
 import type { TestContext } from "../../test/harness";
 import { moveOrdersToStage } from "../stages-shared";
-import { idOf, indiaDay, makeOrder, receive } from "../stock/fixtures";
+import { idOf, indiaDay, makeOrder, postLegacy, receive } from "../stock/fixtures";
 
 // Test-only lifecycle data for the landed cost and reports tests. Clearing, transport and warehouse rows are written
 // straight to the database: their endpoints live in another module (section 5).
@@ -64,6 +64,8 @@ export async function buildLifecycle(ctx: TestContext) {
     { ...paid, orderId: c.id, kind: "Deposit", payee: "Foshan Fabrics", payeeRole: "supplier", amountCny: 1000, rateInr: 12, paidOn: indiaDay(-19) },
     { orderId: c.id, kind: "Balance", payee: "Foshan Fabrics", payeeRole: "supplier", amountCny: 3000, status: "due", dueDate: indiaDay(10) },
   ]);
+  // The supplier payments above are legacy order-linked rows: the ledger posts them as credits (the backfill).
+  await postLegacy(ctx);
 
   const [c1, c2] = await ctx.db
     .insert(containers)

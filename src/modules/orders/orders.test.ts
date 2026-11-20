@@ -1,3 +1,5 @@
+import { randomUUID } from "node:crypto";
+
 import { eq } from "drizzle-orm";
 import supertest from "supertest";
 import { afterAll, beforeEach, describe, expect, it } from "vitest";
@@ -32,12 +34,13 @@ const orderBody = (overrides: object = {}) => ({
     { itemId: ids.jeans, quantity: 1000, rateCny: 12.5 },
     { itemId: ids.fabric, quantity: 300, rateCny: 8.25 },
   ],
-  deposits: [
-    { payee: "Guangzhou Textile Co.", payeeRole: "supplier", amountCny: 1234.56, paidOn: "2026-10-21", rateInr: 11.8765, mode: "Bank transfer" },
-    { payee: "Sino Freight", payeeRole: "agent", amountCny: 1000, paidOn: "2026-10-22", rateInr: 11.9, mode: "Cash" },
-  ],
+  // Agent deposits only (docs/unified-ledger.md): supplier money is recorded with Record payment (PAY-2).
+  deposits: [{ payee: "Sino Freight", payeeRole: "agent", amountCny: 1000, paidOn: "2026-10-22", rateInr: 11.9, mode: "Cash" }],
   ...overrides,
 });
+/** PAY-2: a supplier payment, against the supplier (no order). */
+const paySupplier = (supplierId: string, amount: number, rateInr: number | undefined, paidOn = "2026-10-21") =>
+  http.post("/payments", { supplierId, amount, paidOn, rateInr, mode: "Bank transfer", clientRequestId: randomUUID() }).set("Cookie", management);
 const create = (body: object, cookie = management) => http.post("/orders", body).set("Cookie", cookie);
 const get = (path: string, cookie = management) => http.get(path).set("Cookie", cookie);
 const countOrders = async () => (await ctx.db.select().from(orders)).length;
@@ -87,7 +90,17 @@ describe("ORD-2 GET /orders/options", () => {
     expect(res.status).toBe(200);
     expect(res.body.nextPo).toBe("PO-2050");
     expect(res.body.suppliers.map((row: { name: string }) => row.name)).toEqual(["Guangzhou Textile Co.", "Shenzhen Apparel", "Yiwu Trims Ltd.", "Hangzhou Knits"]);
-    expect(res.body.suppliers[0]).toEqual({ id: ids.supplier, name: "Guangzhou Textile Co.", contactPerson: "Mr. Zhao Lin", phone: "+86 138 0013 2244", city: "Guangzhou", currency: "CNY", exchangeRate: null, advanceAvailable: 0 });
+    expect(res.body.suppliers[0]).toEqual({
+      id: ids.supplier,
+      name: "Guangzhou Textile Co.",
+      contactPerson: "Mr. Zhao Lin",
+      phone: "+86 138 0013 2244",
+      city: "Guangzhou",
+      currency: "CNY",
+      exchangeRate: null,
+      held: false,
+      ledgerBalance: [],
+    });
     expect(res.body.items).toHaveLength(8);
     expect(res.body.items).toContainEqual({ id: ids.jeans, name: "Denim jeans", unit: "pcs", price: null });
     expect(res.body.items).toContainEqual({ id: ids.fabric, name: "Cotton fabric", unit: "m", price: null });
@@ -99,10 +112,14 @@ describe("ORD-3 POST /orders and ORD-1 GET /orders", () => {
   it("creates PO-2050 then PO-2051 with lines and deposits, and lists their figures", async () => {
     const first = await create(orderBody());
     expect(first.status).toBe(201);
-    // No supplier advance: nothing applied, the order owes its value less the supplier deposit (docs/supplier-advance.md).
-    expect(first.body).toEqual({ order: { id: expect.any(String), po: "PO-2050" }, advance: { appliedCny: 0, changeCny: 0, availableCny: 0, balanceCny: 13740.44, excessCny: 0, status: "none" } });
+    // The order's value is debited to the supplier's account (docs/unified-ledger.md): it now owes ¥14,975.
+    expect(first.body).toEqual({
+      order: { id: expect.any(String), po: "PO-2050" },
+      ledger: { supplierId: ids.supplier, currency: "CNY", debitCny: 14975, balanceBefore: 0, balanceAfter: -14975 },
+    });
     const second = await create(orderBody({ orderDate: "2026-10-20", lines: [{ itemId: ids.fabric, quantity: 50, rateCny: 3 }], deposits: [] }));
     expect(second.body.order.po).toBe("PO-2051");
+    expect(second.body.ledger).toMatchObject({ debitCny: 150, balanceBefore: -14975, balanceAfter: -15125 });
     expect((await get("/orders/options")).body.nextPo).toBe("PO-2052");
 
     const id = first.body.order.id;
@@ -114,7 +131,7 @@ describe("ORD-3 POST /orders and ORD-1 GET /orders", () => {
       { itemId: ids.fabric, position: 1, quantity: 300, rateCny: 8.25 },
     ]);
     const deposits = await ctx.db.select().from(payments).where(eq(payments.orderId, id));
-    expect(deposits).toHaveLength(2);
+    expect(deposits).toHaveLength(1);
     for (const row of deposits) expect(row).toMatchObject({ kind: "Deposit", status: "paid", dueDate: null, createdBy: ids.userId });
     expect(deposits).toContainEqual(expect.objectContaining({ payee: "Sino Freight", payeeRole: "agent", amountCny: 1000, paidOn: "2026-10-22", rateInr: 11.9, mode: "Cash" }));
 
@@ -138,19 +155,23 @@ describe("ORD-3 POST /orders and ORD-1 GET /orders", () => {
       closed: false,
       closedOn: null,
       orderValueCny: 14975, // 1000 * 12.5 + 300 * 8.25
-      paidCny: 2234.56,
-      paidInr: 26562.25, // 1234.56 * 11.8765 = 14662.25 (rounded) + 1000 * 11.9
-      supplierPaidCny: 1234.56, // the ¥1,000 agent deposit is sea freight
-      supplierPaidInr: 14662.25,
       terms: null, // no container terms chosen (docs/order-container-terms.md)
-      advanceCny: 0,
-      advanceInr: 0,
+      // Nothing paid to the supplier yet: the ledger's FIFO projection settles none of it.
+      held: false,
+      settledCny: 0,
+      outstandingCny: 14975,
+      paymentStatus: "unpaid",
+      settledInr: 0,
       depositRequiredCny: null,
-      depositPaidCny: 1234.56,
+      depositSettledCny: 0,
       depositPendingCny: null,
       depositStatus: "none",
+      // The ¥1,000 agent deposit is sea freight: paidInr = goods INR (0) + 1000 * 11.9.
+      agentPaidCny: 1000,
+      agentPaidInr: 11900,
+      paidInr: 11900,
     });
-    expect(list.body[0]).toMatchObject({ item: "Cotton fabric", quantity: 50, unit: "m", orderValueCny: 150, paidCny: 0, paidInr: 0 });
+    expect(list.body[0]).toMatchObject({ item: "Cotton fabric", quantity: 50, unit: "m", orderValueCny: 150, settledCny: 0, paidInr: 0 });
   });
 
   it("takes an agent deposit to an active agent in any letter case, and refuses one to an inactive agent", async () => {
@@ -231,8 +252,10 @@ describe("ORD-3 POST /orders and ORD-1 GET /orders", () => {
       [{ po: "   " }, { po: MESSAGES.po }],
       [{ po: "x".repeat(51) }, { po: MESSAGES.poTooLong }],
       [{ po: 2050 }, { po: MESSAGES.po }],
-      [{ deposits: [{ payee: "X", payeeRole: "supplier", amountCny: 0, paidOn: "2026-10-21", rateInr: 11, mode: "Cash" }] }, { deposits: MESSAGES.amount }],
-      [{ deposits: [{ payee: "X", payeeRole: "supplier", amountCny: 5, paidOn: "2026-10-21", rateInr: 11, mode: " " }] }, { deposits: MESSAGES.mode }],
+      [{ deposits: [{ payee: "X", payeeRole: "agent", amountCny: 0, paidOn: "2026-10-21", rateInr: 11, mode: "Cash" }] }, { deposits: MESSAGES.amount }],
+      [{ deposits: [{ payee: "X", payeeRole: "agent", amountCny: 5, paidOn: "2026-10-21", rateInr: 11, mode: " " }] }, { deposits: MESSAGES.mode }],
+      // Supplier money goes through Record payment (docs/unified-ledger.md ORD-3).
+      [{ deposits: [{ payee: "Guangzhou Textile Co.", payeeRole: "supplier", amountCny: 5, paidOn: "2026-10-21", rateInr: 11, mode: "Cash" }] }, { deposits: MESSAGES.supplierDeposit }],
       // An agent deposit keeps the agent's name, so it must be an active agent's (checked inside the transaction).
       [{ deposits: [{ payee: "No Such Agent", payeeRole: "agent", amountCny: 5, paidOn: "2026-10-21", rateInr: 11, mode: "Cash" }] }, { deposits: MESSAGES.payee }],
       [
@@ -302,55 +325,58 @@ describe("CAL-1 GET /deliveries", () => {
 });
 
 describe("PAY-1 GET /payments", () => {
-  it("gives every order's balance and next due date, and every payment record", async () => {
+  it("gives every order's settlement, agent payments and next due date, every payment record and the ledger accounts", async () => {
     const withDeposits = (await create(orderBody())).body.order;
     const bare = (await create(orderBody({ deposits: [] }))).body.order;
     await ctx.db.insert(payments).values([
       { orderId: withDeposits.id, kind: "Balance", payee: "Guangzhou Textile Co.", payeeRole: "supplier", amountCny: 5000, status: "due", dueDate: "2026-12-20" },
       { orderId: withDeposits.id, kind: "Balance", payee: "Guangzhou Textile Co.", payeeRole: "supplier", amountCny: 3000, status: "due", dueDate: "2026-12-05" },
     ]);
+    // ¥1,234.56 to the supplier settles the oldest order first (both are dated 20 Oct: the first created).
+    expect((await paySupplier(ids.supplier, 1234.56, 11.8765)).status).toBe(201);
 
     const res = await get("/payments");
     expect(res.status).toBe(200);
+    const unpaid = { depositRequiredCny: null, depositPendingCny: null, depositStatus: "none" };
     expect(res.body.orders).toEqual([
       {
         orderId: bare.id,
         po: bare.po,
+        supplierId: ids.supplier,
         supplier: "Guangzhou Textile Co.",
         currency: "CNY",
         supplierRate: null,
         orderValueCny: 14975,
-        paidCny: 0,
+        held: false,
+        settledCny: 0,
+        outstandingCny: 14975,
+        paymentStatus: "unpaid",
+        settledInr: 0,
+        ...unpaid,
+        depositSettledCny: 0,
+        agentPaidCny: 0,
+        agentPaidInr: 0,
         paidInr: 0,
-        supplierPaidCny: 0,
-        supplierPaidInr: 0,
-        advanceCny: 0,
-        advanceInr: 0,
-        balanceCny: 14975,
-        depositRequiredCny: null,
-        depositPaidCny: 0,
-        depositPendingCny: null,
-        depositStatus: "none",
         nextDue: null,
       },
       {
         orderId: withDeposits.id,
         po: withDeposits.po,
+        supplierId: ids.supplier,
         supplier: "Guangzhou Textile Co.",
         currency: "CNY",
         supplierRate: null,
         orderValueCny: 14975,
-        paidCny: 2234.56,
+        held: false,
+        settledCny: 1234.56,
+        outstandingCny: 13740.44, // due payments are not paid, the agent deposit is freight
+        paymentStatus: "partly",
+        settledInr: 14662.25, // 1234.56 * 11.8765, rounded
+        ...unpaid,
+        depositSettledCny: 1234.56,
+        agentPaidCny: 1000,
+        agentPaidInr: 11900,
         paidInr: 26562.25,
-        supplierPaidCny: 1234.56,
-        supplierPaidInr: 14662.25,
-        advanceCny: 0,
-        advanceInr: 0,
-        balanceCny: 13740.44, // what the supplier is owed: due payments are not paid, the agent deposit is freight
-        depositRequiredCny: null,
-        depositPaidCny: 1234.56,
-        depositPendingCny: null,
-        depositStatus: "none",
         nextDue: "2026-12-05",
       },
     ]);
@@ -359,6 +385,8 @@ describe("PAY-1 GET /payments", () => {
       id: expect.any(String),
       orderId: withDeposits.id,
       po: withDeposits.po,
+      supplierId: ids.supplier,
+      supplier: "Guangzhou Textile Co.",
       currency: "CNY",
       kind: "Balance",
       payee: "Guangzhou Textile Co.",
@@ -372,8 +400,16 @@ describe("PAY-1 GET /payments", () => {
       reference: "",
       notes: "",
       amountInr: null, // due: no rate yet
+      recordedAt: expect.any(String),
+      voided: false,
+      voidedAt: null,
+      voidedBy: null,
+      voidReason: "",
+      held: false,
     });
-    expect(res.body.payments).toContainEqual(expect.objectContaining({ kind: "Deposit", status: "paid", amountCny: 1234.56, rateInr: 11.8765, paidOn: "2026-10-21", dueDate: null, mode: "Bank transfer" }));
+    expect(res.body.payments).toContainEqual(expect.objectContaining({ orderId: null, po: null, kind: "Payment", status: "paid", amountCny: 1234.56, rateInr: 11.8765, paidOn: "2026-10-21", mode: "Bank transfer" }));
+    expect(res.body.accounts).toEqual([expect.objectContaining({ supplierId: ids.supplier, currency: "CNY", supplier: "Guangzhou Textile Co.", balanceCny: -28715.44, openOrders: 2 })]);
+    expect(res.body.totals).toEqual([{ currency: "CNY", accounts: 1, balanceCny: -28715.44, payableCny: 28715.44, availableCny: 0, outstandingCny: 28715.44 }]);
   });
 });
 
@@ -397,41 +433,45 @@ describe("currencies (migration 0006): CNY, USD and INR orders", () => {
 
   it("stores the order's currency (the supplier's when left out) and returns it on ORD-1, ORD-4 and PAY-1", async () => {
     const shenzhen = await supplierIn("Shenzhen Apparel", "USD", 88.25);
-    const usd = (await create(orderBody({ supplierId: shenzhen, currency: "USD", deposits: [supplierDeposit()] }))).body.order;
+    const usd = (await create(orderBody({ supplierId: shenzhen, currency: "USD", deposits: [] }))).body.order;
     const cny = (await create(orderBody({ deposits: [] }))).body.order;
     const stored = await ctx.db.select({ id: orders.id, currency: orders.currency }).from(orders);
     expect(stored).toEqual(expect.arrayContaining([{ id: usd.id, currency: "USD" }, { id: cny.id, currency: "CNY" }]));
+    expect((await paySupplier(shenzhen, 1000, 88.25)).body.payment).toMatchObject({ currency: "USD", amountInr: 88250 });
 
     const listed = (await get("/orders")).body.find((row: { id: string }) => row.id === usd.id);
-    expect(listed).toMatchObject({ currency: "USD", orderValueCny: 14975, paidCny: 1000, paidInr: 88250 });
-    expect((await get(`/orders/${usd.po}`)).body).toMatchObject({ currency: "USD", balanceCny: 13975 });
+    expect(listed).toMatchObject({ currency: "USD", orderValueCny: 14975, settledCny: 1000, paidInr: 88250 });
+    expect((await get(`/orders/${usd.po}`)).body).toMatchObject({ currency: "USD", outstandingCny: 13975, supplierAccount: { currency: "USD", balanceCny: -13975 } });
     const pay = (await get("/payments")).body;
     expect(pay.orders.find((row: { orderId: string }) => row.orderId === usd.id)).toMatchObject({ currency: "USD", paidInr: 88250 });
-    expect(pay.payments).toEqual([expect.objectContaining({ orderId: usd.id, currency: "USD", amountCny: 1000, rateInr: 88.25 })]);
+    expect(pay.payments).toEqual([expect.objectContaining({ orderId: null, supplierId: shenzhen, currency: "USD", amountCny: 1000, rateInr: 88.25 })]);
   });
 
-  it("an INR order's deposits take no rate: stored as 1, so INR is the amount", async () => {
+  it("an INR order's agent deposits take no rate: stored as 1, so INR is the amount; an INR supplier payment too", async () => {
     const foshan = await supplierIn("Foshan Fabrics", "INR", 1);
-    const inr = await create(orderBody({ supplierId: foshan, currency: "INR", deposits: [supplierDeposit({ rateInr: undefined, amountCny: 50000 }), supplierDeposit({ rateInr: 1 })] }));
+    const agent = (overrides: object) => supplierDeposit({ payee: "Sino Freight", payeeRole: "agent", ...overrides });
+    const inr = await create(orderBody({ supplierId: foshan, currency: "INR", deposits: [agent({ rateInr: undefined, amountCny: 500 }), agent({ rateInr: 1 })] }));
     expect(inr.status).toBe(201);
     const rows = await ctx.db.select({ rateInr: payments.rateInr }).from(payments).where(eq(payments.orderId, inr.body.order.id));
     expect(rows).toEqual([{ rateInr: 1 }, { rateInr: 1 }]);
-    // Deposits of 51,000 on a 14,975 order: 14,975 toward it, the rest is the supplier's advance (excess, 0016).
-    expect((await get("/orders")).body[0]).toMatchObject({ currency: "INR", paidCny: 14975, paidInr: 14975 });
+    // ₹51,000 to the supplier on a ₹14,975 order: settled in full, never more; the rest stays in its account.
+    expect((await paySupplier(foshan, 51000, undefined)).body.ledger).toMatchObject({ currency: "INR", balanceBefore: -14975, balanceAfter: 36025 });
+    expect((await get("/orders")).body[0]).toMatchObject({ currency: "INR", settledCny: 14975, outstandingCny: 0, paymentStatus: "paid", agentPaidInr: 1500, paidInr: 16475 });
   });
 
   it("refuses a rate on an INR deposit, a missing rate otherwise, another currency, and a currency not the supplier's, storing nothing", async () => {
+    const agentDeposit = (overrides: object) => supplierDeposit({ payee: "Sino Freight", payeeRole: "agent", ...overrides });
     const foshan = await supplierIn("Foshan Fabrics", "INR", 1);
     const shenzhen = await supplierIn("Shenzhen Apparel", "USD", 88.25);
     const cases: [object, Record<string, string>][] = [
-      [{ supplierId: foshan, currency: "INR", deposits: [supplierDeposit({ rateInr: 12 })] }, { deposits: MESSAGES.rateForInr }],
-      [{ supplierId: shenzhen, currency: "USD", deposits: [supplierDeposit({ rateInr: undefined })] }, { deposits: MESSAGES.rateInr }],
-      [{ deposits: [supplierDeposit({ rateInr: undefined })] }, { deposits: MESSAGES.rateInr }],
+      [{ supplierId: foshan, currency: "INR", deposits: [agentDeposit({ rateInr: 12 })] }, { deposits: MESSAGES.rateForInr }],
+      [{ supplierId: shenzhen, currency: "USD", deposits: [agentDeposit({ rateInr: undefined })] }, { deposits: MESSAGES.rateInr }],
+      [{ deposits: [agentDeposit({ rateInr: undefined })] }, { deposits: MESSAGES.rateInr }],
       [{ currency: "XAU" }, { currency: MESSAGES.currency }],
       [{ currency: "usd" }, { currency: MESSAGES.currency }],
       // The order's currency is the supplier's (docs/supplier-currency.md): the deposit rule is checked for that currency.
       [{ currency: "USD" }, { currency: MESSAGES.supplierCurrency("CNY") }],
-      [{ supplierId: foshan, currency: "CNY", deposits: [supplierDeposit({ rateInr: 12 })] }, { currency: MESSAGES.supplierCurrency("INR"), deposits: MESSAGES.rateForInr }],
+      [{ supplierId: foshan, currency: "CNY", deposits: [agentDeposit({ rateInr: 12 })] }, { currency: MESSAGES.supplierCurrency("INR"), deposits: MESSAGES.rateForInr }],
     ];
     for (const [overrides, fields] of cases) {
       const res = await create(orderBody(overrides));

@@ -1,4 +1,4 @@
-import { and, eq, inArray, isNotNull, sql } from "drizzle-orm";
+import { and, eq, inArray, isNull, sql } from "drizzle-orm";
 import { alias, type PgColumn } from "drizzle-orm/pg-core";
 
 import type { Database } from "../../db/client";
@@ -10,23 +10,23 @@ import {
   orderLines,
   orders,
   payments,
-  supplierAdvanceEntries,
   transports,
   warehouseReceiptLines,
   warehouseReceipts,
 } from "../../db/schema";
+import { type Ledger, loadLedger } from "../ledger/ledger";
 import { round2 } from "../orders/orders.routes";
 
-// Landed cost per order (docs/wave3-contracts.md sections 6.1-6.2). Coordinator-owned: Agents 3, 5 and 6 call
-// loadLandedCosts and never copy it. All amounts are INR with 2 decimals.
+// Landed cost per order (docs/wave3-contracts.md sections 6.1-6.2; goods per docs/unified-ledger.md). Coordinator-owned:
+// Agents 3, 5 and 6 call loadLandedCosts and never copy it. All amounts are INR with 2 decimals.
 
 export type WaitingFor = "supplier payment" | "duty" | "transport" | "warehouse";
 
 export type OrderLandedCost = {
   orderId: string;
-  /** Paid payments to the supplier, each at its own rateInr, plus the supplier advance applied at each advance's rate. */
+  /** The supplier credits that settled the order (the ledger's FIFO slices), each at its own credit's rate (D12). */
   goodsInr: number;
-  /** Paid payments to an agent (FOB sea freight); 0 when every container carrying the order is CNF. */
+  /** Paid, not voided payments to an agent (FOB sea freight); 0 when every container carrying the order is CNF. */
   seaFreightInr: number;
   /** Allocated clearing charges; null until a container of this order has a clearing. */
   clearingInr: number | null;
@@ -58,8 +58,8 @@ type ContainerFacts = {
 export type LandedCostFacts = {
   orders: { id: string; stage: number; valueCny: number }[];
   /**
-   * Paid payments only, plus one supplier row per advance allocation or reversal (docs/supplier-advance.md; a reversal
-   * negative). `inr` is round2(amountCny * rateInr), rounded in SQL so it matches PAY-1 to the paisa.
+   * Goods: one supplier row per settlement slice of the order (the ledger's FIFO projection), at its credit's rate.
+   * Sea freight: the order's paid, not voided agent payments. `inr` is rounded to the paisa as PAY-1 rounds it.
    */
   payments: { orderId: string; payeeRole: string; amountCny: number; inr: number }[];
   /**
@@ -74,7 +74,7 @@ export type LandedCostFacts = {
 
 type Tally = { goodsInr: number; agentInr: number; supplierCny: number; clearingInr: number | null; transportInr: number | null; carriers: ContainerFacts[]; pieces: number };
 
-/** `balanceCny` is the order value less paid supplier payments: agent payments are sea freight, not goods. */
+/** `balanceCny` is the order value less what the supplier's credits settled of it: agent payments are sea freight, not goods. */
 function waitingFor(balanceCny: number, stage: number, carriers: ContainerFacts[]): WaitingFor | null {
   if (balanceCny > 0) return "supplier payment";
   if (carriers.length === 0 || carriers.some((container) => !container.cleared)) return "duty";
@@ -153,8 +153,11 @@ export function computeLandedCosts(facts: LandedCostFacts): Map<string, OrderLan
   return costs;
 }
 
-/** Landed cost of the given orders (every order when omitted), keyed by order id. Six queries, whatever the count. */
-export async function loadLandedCosts(db: Pick<Database, "select">, orderIds?: string[]): Promise<Map<string, OrderLandedCost>> {
+/**
+ * Landed cost of the given orders (every order when omitted), keyed by order id. Five queries whatever the count, plus
+ * the ledger of the orders' suppliers unless the caller passes the one it already loaded.
+ */
+export async function loadLandedCosts(db: Pick<Database, "select">, orderIds?: string[], given?: Ledger): Promise<Map<string, OrderLandedCost>> {
   if (orderIds?.length === 0) return new Map();
   const of = (column: PgColumn) => (orderIds ? inArray(column, orderIds) : undefined);
   // The containers carrying the orders; every container when no orders are given.
@@ -166,7 +169,14 @@ export async function loadLandedCosts(db: Pick<Database, "select">, orderIds?: s
     .innerJoin(carryingLine, eq(carryingLine.id, carrying.orderLineId))
     .where(of(carryingLine.orderId));
 
-  const [orderRows, paymentRows, advanceRows, loads, containerRows, stocked] = await Promise.all([
+  const ledgerOf = async () => {
+    if (given) return given;
+    if (!orderIds) return loadLedger(db);
+    const owners = await db.select({ id: orders.supplierId }).from(orders).where(inArray(orders.id, orderIds));
+    return loadLedger(db, { supplierIds: [...new Set(owners.map((row) => row.id))] });
+  };
+
+  const [orderRows, agentRows, ledger, loads, containerRows, stocked] = await Promise.all([
     // Joined, not a correlated subquery: Drizzle leaves columns unqualified in a select without joins.
     db
       .select({
@@ -180,25 +190,17 @@ export async function loadLandedCosts(db: Pick<Database, "select">, orderIds?: s
       .groupBy(orders.id),
     db
       .select({
-        orderId: payments.orderId,
+        // Agent payments always name their order (payments_document_check).
+        orderId: sql<string>`${payments.orderId}`,
         payeeRole: payments.payeeRole,
         amountCny: payments.amountCny,
         inr: sql<number>`round(${payments.amountCny} * ${payments.rateInr}, 2)`.mapWith(Number),
       })
       .from(payments)
-      .where(and(eq(payments.status, "paid"), of(payments.orderId))),
-    // The advance applied is the supplier's money for the goods, at the rate it was paid at: goods cost and the
-    // "supplier payment" wait count it like a supplier payment (it is never in `payments`, so never twice).
-    db
-      .select({
-        orderId: sql<string>`${supplierAdvanceEntries.orderId}`,
-        payeeRole: sql<string>`'supplier'`,
-        // + an allocation or an excess return (money back on this order); - a reversal or an excess (money moved off it, 0016).
-        amountCny: sql<number>`case when ${supplierAdvanceEntries.kind} in ('allocation', 'excess_return') then ${supplierAdvanceEntries.amount} else -${supplierAdvanceEntries.amount} end`.mapWith(Number),
-        inr: sql<number>`(case when ${supplierAdvanceEntries.kind} in ('allocation', 'excess_return') then 1 else -1 end) * round(${supplierAdvanceEntries.amount} * ${supplierAdvanceEntries.exchangeRate}, 2)`.mapWith(Number),
-      })
-      .from(supplierAdvanceEntries)
-      .where(and(isNotNull(supplierAdvanceEntries.orderId), of(supplierAdvanceEntries.orderId))),
+      .innerJoin(orders, eq(orders.id, payments.orderId))
+      // A held account's payments (D4) count in no figure: its orders' sea freight leaves them out too.
+      .where(and(eq(payments.status, "paid"), eq(payments.payeeRole, "agent"), isNull(payments.voidedAt), of(payments.orderId), sql`not exists (select 1 from supplier_ledger_holds h where h.supplier_id = ${orders.supplierId} and h.currency = ${orders.currency})`)),
+    ledgerOf(),
     db
       .select({
         containerId: containerLines.containerId,
@@ -237,9 +239,13 @@ export async function loadLandedCosts(db: Pick<Database, "select">, orderIds?: s
       .groupBy(orderLines.orderId),
   ]);
 
+  // ponytail: a slice whose credit has no rate (legacy NULL) adds no INR; the order's settledInr says null for it.
+  const goods = orderRows.flatMap((order) =>
+    (ledger.order(order.id)?.slices ?? []).map((slice) => ({ orderId: order.id, payeeRole: "supplier", amountCny: slice.amount, inr: slice.amountInr ?? 0 })),
+  );
   return computeLandedCosts({
     orders: orderRows,
-    payments: [...paymentRows, ...advanceRows],
+    payments: [...agentRows, ...goods],
     loads,
     containers: containerRows.map(({ clearingStatus, tripStatus, receiptStatus, ...container }) => ({
       ...container,

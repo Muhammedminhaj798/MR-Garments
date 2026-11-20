@@ -1,5 +1,7 @@
 # Phase 2 contracts: order closure, pending/closed lists, deposits, supplier deposits, per-order reports, exports
 
+> **Superseded in part (0017, unified supplier ledger):** supplier payments, PAY-2/PAY-3, advances, excess, supplier deposits and every paid / balance / outstanding figure now follow `docs/unified-ledger.md`. Where this file disagrees, that file wins.
+
 Decided by the coordinator on 2026-11-09 from the inspection of both repositories (backend `feature/units-po` 539f354,
 frontend `feature/units-po` b55e107, which carry Units and free-format PO numbers, migration 0007). Everything below is
 built on `feature/phase-2` in both repositories. Agents read this before writing; a change to a shared contract goes

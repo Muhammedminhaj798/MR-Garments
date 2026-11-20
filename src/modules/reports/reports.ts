@@ -18,12 +18,10 @@ import {
   warehouseReceipts,
 } from "../../db/schema";
 import { loadLandedCosts } from "../costs/landed-cost";
+import { cents, fromCents, type Ledger, loadLedger } from "../ledger/ledger";
 import { orderClosed } from "../orders/closure";
-import { balanceOf, supplierMoney, toSupplier } from "../orders/money";
+import { dueToSupplier, orderMoney } from "../orders/money";
 import { round2, unitSymbol } from "../orders/orders.routes";
-
-// The supplier-only money fragments live in orders/money.ts (docs/phase2-fixes.md 1); re-exported for the report consumers.
-export { supplierMoney, toSupplier };
 
 // The seven reports behind GET /reports/<name> (docs/wave3-contracts.md sections 7 and 8). Each takes the optional
 // filters and today in India, and returns its JSON body. Shapes are recorded in section 8.
@@ -210,23 +208,26 @@ export async function containersTimeline(db: Database, f: Filters, today: string
 }
 
 /**
- * 13.5: open orders (not closed, docs/phase2-contracts.md 1) per supplier. Paid counts payments to the supplier only (agent payments are sea
- * freight, section 6.2); INR at each payment's own rate. `dueNext30Cny`: due supplier payments, today to today + 30.
- * One row per supplier and order currency; `totals` and `dueNext30Cny` are CNY only, `...ByCurrency` has every currency.
+ * 13.5 (docs/unified-ledger.md RPT-5): per supplier and currency, its open orders (not closed, docs/phase2-contracts.md
+ * 1) with their value and their FIFO-settled and outstanding amounts, beside the ledger account (credits, the signed
+ * balance, payments' INR). Without a period, every account with a non-zero balance is listed too. A held
+ * account has `held: true` and null figures, and counts in no total. `dueNext30Cny`: due supplier payments (not voided),
+ * today to today + 30. `totals` and `dueNext30Cny` are CNY only, `...ByCurrency` has every currency.
  */
 export async function paymentsPerSupplier(db: Database, f: Filters, today: string) {
   const where = orderFilter(f);
   const newestFirst = [desc(orders.orderDate), desc(orders.poNumber)];
-  const [open, finished] = await Promise.all([
+  const [open, finished, ledger, names] = await Promise.all([
     db
       .select({
+        id: orders.id,
         supplierId: suppliers.id,
         supplier: suppliers.name,
         po: orders.poNumber,
         currency: orders.currency,
-        ...supplierMoney,
+        orderValueCny: orderMoney.orderValueCny,
         dueNext30Cny: sql<number>`(select coalesce(sum(${payments.amountCny}), 0) from ${payments}
-          where ${toSupplier} and ${payments.status} = 'due' and ${payments.dueDate} between ${today} and ${addDays(today, 30)})`.mapWith(Number),
+          where ${dueToSupplier} and ${payments.dueDate} between ${today} and ${addDays(today, 30)})`.mapWith(Number),
       })
       .from(orders)
       .innerJoin(suppliers, eq(suppliers.id, orders.supplierId))
@@ -239,50 +240,57 @@ export async function paymentsPerSupplier(db: Database, f: Filters, today: strin
       .innerJoin(suppliers, eq(suppliers.id, orders.supplierId))
       .where(and(where, orderClosed))
       .orderBy(...newestFirst),
+    loadLedger(db, f.supplierId ? { supplierIds: [f.supplierId] } : {}),
+    db.select({ id: suppliers.id, name: suppliers.name }).from(suppliers),
   ]);
-  // ponytail: grouped in memory over the open orders; a GROUP BY over pre-aggregated payments when orders reach thousands.
-  // `advanceCny`: the supplier advance applied to these orders (docs/supplier-advance.md), apart from paid; the balance counts both.
-  type Row = { supplierId: string; supplier: string; currency: Currency; orders: string[]; orderValueCny: number; paidCny: number; paidInr: number; advanceCny: number; balanceCny: number };
+  // ponytail: grouped in memory over the open orders and the accounts; a GROUP BY when orders reach thousands.
+  type Row = { supplierId: string; supplier: string; currency: Currency; held: boolean; orders: string[]; orderValueCny: number; settledCny: number | null; outstandingCny: number | null };
   const bySupplier = new Map<string, Row>();
+  const nameOf = new Map(names.map((row) => [row.id, row.name]));
+  const rowOf = (supplierId: string, currency: Currency) => {
+    const key = `${supplierId} ${currency}`;
+    const held = ledger.account(supplierId, currency)?.held ?? false;
+    if (!bySupplier.has(key))
+      bySupplier.set(key, { supplierId, supplier: nameOf.get(supplierId)!, currency, held, orders: [], orderValueCny: 0, settledCny: held ? null : 0, outstandingCny: held ? null : 0 });
+    return bySupplier.get(key)!;
+  };
   for (const order of open) {
-    const key = `${order.supplierId} ${order.currency}`;
-    const row = bySupplier.get(key) ?? { supplierId: order.supplierId, supplier: order.supplier, currency: order.currency, orders: [], orderValueCny: 0, paidCny: 0, paidInr: 0, advanceCny: 0, balanceCny: 0 };
-    bySupplier.set(key, {
-      ...row,
-      orders: [...row.orders, order.po],
-      orderValueCny: row.orderValueCny + order.orderValueCny,
-      paidCny: row.paidCny + order.paidCny,
-      paidInr: row.paidInr + order.paidInr,
-      advanceCny: row.advanceCny + order.advanceCny,
-      // Each order's balance, never below 0 (0016): an overpaid order never lowers what other orders still owe.
-      balanceCny: row.balanceCny + balanceOf(order),
-    });
+    const row = rowOf(order.supplierId, order.currency);
+    const settlement = ledger.order(order.id);
+    row.orders.push(order.po);
+    row.orderValueCny = round2(row.orderValueCny + order.orderValueCny);
+    if (!row.held) {
+      row.settledCny = fromCents(cents(row.settledCny!) + cents(settlement?.settledCny ?? 0));
+      row.outstandingCny = fromCents(cents(row.outstandingCny!) + cents(settlement?.outstandingCny ?? 0));
+    }
   }
+  // Without a period, a supplier with money in its account (either way) but no open order is still listed.
+  if (!f.from && !f.to) for (const account of ledger.accounts.values()) if ((account.balanceCny ?? 0) !== 0) rowOf(account.supplierId, account.currency as Currency);
   const rows = [...bySupplier.values()]
-    .map((row) => ({
-      ...row,
-      orderValueCny: round2(row.orderValueCny),
-      paidCny: round2(row.paidCny),
-      paidInr: round2(row.paidInr),
-      advanceCny: round2(row.advanceCny),
-      balanceCny: round2(row.balanceCny),
-    }))
+    .map((row) => {
+      const account = ledger.account(row.supplierId, row.currency);
+      return { ...row, ...ledgerFigures(account, row.held) };
+    })
     .sort((a, b) => compareCurrencies(a.currency, b.currency) || b.orderValueCny - a.orderValueCny || a.supplier.localeCompare(b.supplier));
   const totalsOf = (list: typeof rows) => {
-    const total = (pick: (row: (typeof rows)[number]) => number) => round2(sum(list, pick));
+    const own = list.filter((row) => !row.held);
+    const total = (pick: (row: (typeof rows)[number]) => number) => fromCents(own.reduce((sum, row) => sum + cents(pick(row)), 0));
     return {
-      orders: sum(list, (r) => r.orders.length),
+      orders: sum(own, (r) => r.orders.length),
       orderValueCny: total((r) => r.orderValueCny),
-      paidCny: total((r) => r.paidCny),
-      paidInr: total((r) => r.paidInr),
-      advanceCny: total((r) => r.advanceCny),
-      balanceCny: total((r) => r.balanceCny),
+      settledCny: total((r) => r.settledCny!),
+      outstandingCny: total((r) => r.outstandingCny!),
+      balanceCny: total((r) => r.balanceCny!),
+      /** Σ of the negative balances, as a positive amount; Σ of the positive ones. */
+      payableCny: total((r) => Math.max(0, -r.balanceCny!)),
+      availableCny: total((r) => Math.max(0, r.balanceCny!)),
+      paidInr: total((r) => r.paidInr!),
     };
   };
   return {
     suppliers: rows,
     totals: totalsOf(inCny(rows)),
-    totalsByCurrency: orderedCurrencies(rows.map((row) => row.currency)).map((currency) => ({
+    totalsByCurrency: orderedCurrencies(rows.filter((row) => !row.held).map((row) => row.currency)).map((currency) => ({
       currency,
       ...totalsOf(rows.filter((row) => row.currency === currency)),
     })),
@@ -290,6 +298,21 @@ export async function paymentsPerSupplier(db: Database, f: Filters, today: strin
     dueNext30ByCurrency: byCurrency(open, (order) => order.dueNext30Cny),
     finishedPos: finished.map((order) => order.po),
   };
+}
+
+/** The ledger account's own figures for RPT-5's rows: null while held; 0 for an account with no posting yet. */
+function ledgerFigures(account: ReturnType<Ledger["account"]>, held: boolean) {
+  if (held) return { creditsCny: null, balanceCny: null, paidInr: null };
+  return { creditsCny: account?.creditsCny ?? 0, balanceCny: account?.balanceCny ?? 0, paidInr: account?.paidInr ?? 0 };
+}
+
+/** Σ of the negative (payable) balances per currency, as positive amounts; held accounts left out. */
+export function payableByCurrency(ledger: Ledger) {
+  const own = [...ledger.accounts.values()].filter((account) => !account.held);
+  return orderedCurrencies(own.map((account) => account.currency as Currency)).map((currency) => ({
+    currency,
+    amount: fromCents(own.filter((account) => account.currency === currency).reduce((total, account) => total + Math.max(0, -cents(account.balanceCny!)), 0)),
+  }));
 }
 
 const nextMonth = (month: string) => {
@@ -336,7 +359,7 @@ export async function landedCostByMonth(db: Database, f: Filters, today: string)
 
 /** The hub's stat strips (32), from the same reports and filters, plus the active suppliers for its filter. */
 export async function summary(db: Database, f: Filters, today: string) {
-  const [status, deliveries, received, timeline, paid, byMonth, supplierOptions] = await Promise.all([
+  const [status, deliveries, received, timeline, paid, byMonth, supplierOptions, ledger] = await Promise.all([
     orderStatus(db, f, today),
     deliveriesPerDay(db, f, today),
     orderedVsReceived(db, f),
@@ -348,6 +371,7 @@ export async function summary(db: Database, f: Filters, today: string) {
       .from(suppliers)
       .where(eq(suppliers.status, "Active"))
       .orderBy(asc(suppliers.createdAt), asc(suppliers.name)),
+    loadLedger(db, f.supplierId ? { supplierIds: [f.supplierId] } : {}),
   ]);
   const short = (inUnit: string) => sum(received.lines, (line) => (line.unit === inUnit ? line.short : 0));
   return {
@@ -356,7 +380,7 @@ export async function summary(db: Database, f: Filters, today: string) {
     deliveries: { dueNext7: deliveries.dueNext7, late: deliveries.late },
     receiving: { shortOrders: received.shortPos.length, shortPcs: short("pcs"), shortM: short("m") },
     containers: { onTheWay: timeline.active, arrivingIn7Days: timeline.arrivingIn7Days.length },
-    payments: { dueNext30Cny: paid.dueNext30Cny, dueNext30ByCurrency: paid.dueNext30ByCurrency },
+    payments: { dueNext30Cny: paid.dueNext30Cny, dueNext30ByCurrency: paid.dueNext30ByCurrency, payableByCurrency: payableByCurrency(ledger) },
     landedCost: { finishedOrders: byMonth.totals.orders, finishedTotalInr: byMonth.totals.landedCostInr },
   };
 }

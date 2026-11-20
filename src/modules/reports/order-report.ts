@@ -31,19 +31,20 @@ import { atLeast, type Capability, effectiveAccess } from "../../permissions/mat
 import { loadLandedCosts } from "../costs/landed-cost";
 import { depositRows, summarise, toRow } from "../deposits/deposits.routes";
 import { byCurrency } from "../master-data/supplier-insights";
+import { accountsView, depositMilestone, loadLedger, oldestPaymentsFirst, paymentQuery, paymentView, settlementFields, sliceDetails } from "../ledger/ledger";
+import { supplierStatement } from "../ledger/ledger.routes";
 import { orderClosed } from "../orders/closure";
-import { advanceAccount, advanceStatus, orderAdvanceEntries } from "../advances/advances";
-import { balanceOf, depositState } from "../orders/money";
+import { dueToSupplier, orderMoney } from "../orders/money";
 import { byPo, orderRows, round2, unitSymbol } from "../orders/orders.routes";
-import { supplierMoney, toSupplier } from "./reports";
 
 // Owner: Agent R. RPT-O1 GET /orders/:po/report (docs/phase2-contracts.md section 4.1; shape in 8.R; the
 // comprehensive report's additions in docs/order-report.md): everything the per-order report page and its Excel, PDF
 // and CSV show. A section the user can't view (effective access below View, as ORD-4 nulls its sections) is null and
-// its queries never run. Money rules are the existing ones: paid and balance count supplier payments only (13.5
-// `supplierMoney`); agent payments are sea freight, listed apart; the allocated cost share is `loadLandedCosts`,
-// unchanged; clearing and trip costs on a container are that container's totals. Supplier deposits (migration 0008)
-// are account-level money with no link to any order, so they are reported beside the order, never as its payments.
+// its queries never run. Supplier money is the unified ledger's (docs/unified-ledger.md): the order's settled,
+// outstanding and status are the FIFO projection of its supplier's account, with the slices that settled it; agent
+// payments are sea freight, listed apart; the allocated cost share is `loadLandedCosts`, unchanged; clearing and trip
+// costs on a container are that container's totals. Supplier deposits (migration 0008) are a read-only archive beside
+// the order, never its payments. Voided payments are listed (flagged) and count in no figure.
 // Nothing here is stored or invented: the timeline has only dates the records hold, with the moment each record was
 // written and the user who wrote it where the record keeps them.
 
@@ -80,7 +81,6 @@ const author = alias(users, "author");
 const editor = alias(users, "editor");
 const authorName = sql<string>`coalesce(${author.name}, '')`;
 const editorName = sql<string>`coalesce(${editor.name}, '')`;
-const paidToAgent = sql`${payments.orderId} = ${orders.id} and ${payments.payeeRole} = 'agent' and ${payments.status} = 'paid'`;
 
 /** One order's report, or 404. About twenty queries whatever the order's size, none per row. */
 export async function orderReport(db: Database, po: string, user: CurrentUser) {
@@ -98,8 +98,10 @@ export async function orderReport(db: Database, po: string, user: CurrentUser) {
     .innerJoin(orderLines, eq(orderLines.id, containerLines.orderLineId))
     .where(eq(orderLines.orderId, orderId));
   const logistics = can("containers");
+  // The supplier's ledger: the payments section's figures and the landed cost's goods both read it.
+  const ledger = can("payments") || can("landedCost") ? await loadLedger(db, { supplierIds: [row.supplierId] }) : null;
 
-  const [[header], lineRows, paymentList, receiptRows, containerList, containerLineRows, clearingRows, tripRows, receiptList, receiptLineRows, costs, account, advanceList] =
+  const [[header], lineRows, paymentList, receiptRows, containerList, containerLineRows, clearingRows, tripRows, receiptList, receiptLineRows, costs, account] =
     await Promise.all([
       db
         .select({
@@ -122,18 +124,10 @@ export async function orderReport(db: Database, po: string, user: CurrentUser) {
           createdAt: orders.createdAt,
           updatedAt: orders.updatedAt,
           createdBy: authorName,
-          paidCny: supplierMoney.paidCny,
-          paidInr: supplierMoney.paidInr,
-          advanceCny: supplierMoney.advanceCny,
-          advanceInr: supplierMoney.advanceInr,
-          excessCny: supplierMoney.excessCny,
-          excessInr: supplierMoney.excessInr,
-          depositsPaidCny: sql<number>`(select coalesce(sum(${payments.amountCny}), 0) from ${payments}
-            where ${toSupplier} and ${payments.status} = 'paid' and ${payments.kind} = 'Deposit')`.mapWith(Number),
-          dueCny: sql<number>`(select coalesce(sum(${payments.amountCny}), 0) from ${payments} where ${toSupplier} and ${payments.status} = 'due')`.mapWith(Number),
-          /** Paid to shipping agents: sea freight (landed cost), never part of the supplier's paid or balance. */
-          agentPaidCny: sql<number>`(select coalesce(sum(${payments.amountCny}), 0) from ${payments} where ${paidToAgent})`.mapWith(Number),
-          agentPaidInr: sql<number>`(select coalesce(sum(round(${payments.amountCny} * ${payments.rateInr}, 2)), 0) from ${payments} where ${paidToAgent})`.mapWith(Number),
+          dueCny: sql<number>`(select coalesce(sum(${payments.amountCny}), 0) from ${payments} where ${dueToSupplier})`.mapWith(Number),
+          /** Paid to shipping agents: sea freight (landed cost), never the supplier's money. */
+          agentPaidCny: orderMoney.agentPaidCny,
+          agentPaidInr: orderMoney.agentPaidInr,
         })
         .from(orders)
         .innerJoin(suppliers, eq(suppliers.id, orders.supplierId))
@@ -157,30 +151,8 @@ export async function orderReport(db: Database, po: string, user: CurrentUser) {
         .innerJoin(items, eq(items.id, orderLines.itemId))
         .where(eq(orderLines.orderId, orderId))
         .orderBy(asc(orderLines.position)),
-      section("payments", () =>
-        db
-          .select({
-            id: payments.id,
-            kind: payments.kind,
-            payee: payments.payee,
-            payeeRole: payments.payeeRole,
-            amountCny: payments.amountCny,
-            amountInr: sql<number | null>`case when ${payments.status} = 'paid' then round(${payments.amountCny} * ${payments.rateInr}, 2) end`.mapWith(Number),
-            status: payments.status,
-            paidOn: payments.paidOn,
-            dueDate: payments.dueDate,
-            rateInr: payments.rateInr,
-            mode: payments.mode,
-            reference: payments.reference,
-            notes: payments.notes,
-            recordedAt: payments.createdAt,
-            recordedBy: authorName,
-          })
-          .from(payments)
-          .leftJoin(author, eq(author.id, payments.createdBy))
-          .where(eq(payments.orderId, orderId))
-          .orderBy(asc(sql`coalesce(${payments.paidOn}, ${payments.dueDate})`), asc(payments.createdAt)),
-      ),
+      // Order-linked rows: legacy supplier payments recorded against this PO (a memo) and its agent payments.
+      section("payments", async () => (await paymentQuery(db, eq(payments.orderId, orderId)).orderBy(...oldestPaymentsFirst)).map(paymentView)),
       // China receipts: the China processing section and the timeline (the Items section carries the received figures).
       when(can("receiving"), () =>
         db
@@ -338,26 +310,21 @@ export async function orderReport(db: Database, po: string, user: CurrentUser) {
           .where(eq(orderLines.orderId, orderId))
           .orderBy(asc(orderLines.position), asc(teams.createdAt), asc(teams.name)),
       ),
-      section("landedCost", () => loadLandedCosts(db, [orderId])),
-      // The supplier's account beside this order (payments View, as the money is): every order's value, paid and
-      // balance per currency, and the supplier-level deposits with their transactions, which no order payment counts.
+      section("landedCost", () => loadLandedCosts(db, [orderId], ledger!)),
+      // The supplier's account beside this order (payments View, as the money is): every order's value, settled and
+      // outstanding per currency (held accounts left out), its ledger accounts and statement, and the supplier deposits
+      // archive with its transactions.
       section("payments", async () => {
-        const [perOrder, deposits, advance] = await Promise.all([
+        const [perOrder, deposits, entries] = await Promise.all([
           db
-            .select({
-              id: orders.id,
-              currency: orders.currency,
-              closed: orderClosed,
-              orderValueCny: supplierMoney.orderValueCny,
-              paidCny: supplierMoney.paidCny,
-              advanceCny: supplierMoney.advanceCny,
-            })
+            .select({ id: orders.id, currency: orders.currency, closed: orderClosed, orderValueCny: orderMoney.orderValueCny })
             .from(orders)
             .innerJoin(suppliers, eq(suppliers.id, orders.supplierId))
             .where(eq(orders.supplierId, row.supplierId)),
           depositRows(db, eq(supplierDeposits.supplierId, row.supplierId)).then((rows) => rows.map(toRow)),
-          advanceAccount(db, row.supplierId),
+          supplierStatement(db, row.supplierId),
         ]);
+        const counted = perOrder.filter((order) => !ledger!.order(order.id)?.held);
         const t = supplierDepositTransactions;
         const transactions = deposits.length
           ? await db
@@ -375,20 +342,18 @@ export async function orderReport(db: Database, po: string, user: CurrentUser) {
         return {
           orders: perOrder.length,
           openOrders: perOrder.filter((order) => !order.closed).length,
-          purchaseValue: byCurrency(perOrder, (order) => order.orderValueCny),
-          paid: byCurrency(perOrder, (order) => order.paidCny),
-          advanceApplied: byCurrency(perOrder, (order) => order.advanceCny),
-          balance: byCurrency(perOrder, balanceOf),
-          // The supplier's advance account per currency: received, applied, given back and available (docs/supplier-advance.md).
-          advance: advance.summary,
+          // Held orders (D4) count in no total, value included.
+          purchaseValue: byCurrency(counted, (order) => order.orderValueCny),
+          settled: byCurrency(counted, (order) => ledger!.order(order.id)?.settledCny ?? 0),
+          outstanding: byCurrency(counted, (order) => ledger!.order(order.id)?.outstandingCny ?? 0),
+          accounts: accountsView(ledger!, row.supplierId),
+          entries,
           deposits: {
             summary: summarise(deposits),
             list: deposits.map(({ supplierId: _supplierId, supplier: _supplier, transactions: _count, ...deposit }) => ({ ...deposit, transactions: byDeposit.get(deposit.id) ?? [] })),
           },
         };
       }),
-      // The order's supplier advance allocations and reversals (docs/supplier-advance.md), as ORD-4 lists them.
-      section("payments", () => orderAdvanceEntries(db, orderId)),
     ]);
 
   const lines = lineRows.map((line) => ({ ...line, excess: Math.max(0, line.received - line.ordered), short: Math.max(0, line.ordered - line.received), pending: Math.max(0, line.ordered - line.received) }));
@@ -449,7 +414,7 @@ export async function orderReport(db: Database, po: string, user: CurrentUser) {
   // Dated steps only, in date order (a tie keeps the workflow order below); each from a section the user may see.
   const steps: TimelineStep[] = [{ step: "created", on: row.orderDate, detail: `Ordered from ${row.supplierName}`, at: iso(header!.createdAt), by: orNull(header!.createdBy) }];
   for (const payment of paymentList ?? []) {
-    if (payment.paidOn) {
+    if (payment.paidOn && !payment.voided) {
       steps.push({ step: payment.kind === "Deposit" ? "deposit" : "payment", on: payment.paidOn, detail: `${money(payment.amountCny, row.currency)} to ${payment.payee}`, at: iso(payment.recordedAt), by: orNull(payment.recordedBy) });
     }
   }
@@ -477,7 +442,9 @@ export async function orderReport(db: Database, po: string, user: CurrentUser) {
   if (row.closedOn) steps.push({ step: "closed", on: row.closedOn, detail: "Every container stocked", at: null, by: null });
   steps.sort((a, b) => a.on.localeCompare(b.on));
 
-  const paymentRows = paymentList?.map(({ recordedAt, recordedBy, ...payment }) => ({ ...payment, recordedAt: iso(recordedAt), recordedBy: orNull(recordedBy) }));
+  const paymentRows = paymentList?.map((payment) => ({ ...payment, recordedBy: orNull(payment.recordedBy) }));
+  const settlement = ledger?.order(orderId);
+  const slices = paymentRows && settlement ? (await sliceDetails(db, settlement.slices))(settlement.slices) : [];
   return {
     order: {
       id: row.id,
@@ -522,25 +489,15 @@ export async function orderReport(db: Database, po: string, user: CurrentUser) {
     lines,
     payments: paymentRows
       ? {
-          paidCny: header!.paidCny,
-          paidInr: header!.paidInr,
-          advanceCny: header!.advanceCny,
-          advanceInr: header!.advanceInr,
-          advanceStatus: advanceStatus(header!.advanceCny, balanceOf({ orderValueCny: row.orderValueCny, paidCny: header!.paidCny, advanceCny: header!.advanceCny })),
-          advanceEntries: advanceList ?? [],
-          // Supplier payments beyond the order's value, moved to the supplier's available advance (0016).
-          excessCny: header!.excessCny,
-          excessInr: header!.excessInr,
-          balanceCny: balanceOf({ orderValueCny: row.orderValueCny, paidCny: header!.paidCny, advanceCny: header!.advanceCny }),
-          depositsPaidCny: header!.depositsPaidCny,
-          dueCny: header!.dueCny,
+          list: paymentRows,
+          // The FIFO projection of the supplier's account and the credits (slices) that settled the order.
+          ...settlementFields(settlement),
+          slices,
           agentPaidCny: header!.agentPaidCny,
           agentPaidInr: header!.agentPaidInr,
-          // The deposit the supplier asked for and what is still pending against it (0009).
-          depositRequiredCny: row.depositRequiredCny,
-          depositPendingCny: depositState(row.depositRequiredCny, row.depositPaidCny).depositPendingCny,
-          depositStatus: depositState(row.depositRequiredCny, row.depositPaidCny).depositStatus,
-          list: paymentRows,
+          dueCny: header!.dueCny,
+          // The Deposit Required milestone (D11): the deposit the supplier asked for against the settled amount.
+          ...depositMilestone(row.depositRequiredCny, settlement),
         }
       : null,
     supplierAccount: account,

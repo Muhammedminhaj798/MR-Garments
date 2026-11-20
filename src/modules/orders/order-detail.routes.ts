@@ -5,7 +5,6 @@ import { z } from "zod";
 import { requirePermission } from "../../auth/current-user";
 import {
   containerLines,
-  type Currency,
   containers,
   items,
   locations,
@@ -16,7 +15,6 @@ import {
   receiptLines,
   receipts,
   shippingAgents,
-  supplierAdvanceEntries,
   TERMS,
   suppliers,
   users,
@@ -28,19 +26,32 @@ import { atLeast, type Capability, effectiveAccess } from "../../permissions/mat
 import type { RouteContext } from "../context";
 import { containerOrders } from "../stages/common";
 import { money } from "../notifications/notify";
-import { advanceStatus, advanceTotals, orderAdvanceEntries, settleAdvance } from "../advances/advances";
-import { balanceOf, depositState } from "./money";
-import { byPo, depositRequired, isPoTaken, line, lineList, MESSAGES as M, orderRows, PO_MAX_LENGTH, round2, unitSymbol } from "./orders.routes";
+import {
+  accountFields,
+  assertLedgerLive,
+  heldAccounts,
+  isHeld,
+  loadLedger,
+  MESSAGES as LEDGER,
+  oldestPaymentsFirst,
+  paymentQuery,
+  paymentRow,
+  postOrderCancel,
+  sliceDetails,
+  syncOrderValue,
+} from "../ledger/ledger";
+import { hiddenSettlement, orderSettlement } from "./money";
+import { byPo, depositRequired, isPoTaken, line, lineList, MESSAGES as M, orderRows, PO_MAX_LENGTH, unitSymbol } from "./orders.routes";
 
 // Owner: BE-orders. ORD-4 GET /orders/:po (docs/live-screens-contracts.md, "Five-tab completion"); ORD-5 PATCH and
-// ORD-6 DELETE /orders/:po (docs/contracts.md, "Orders: edit and delete").
+// ORD-6 DELETE /orders/:po (docs/contracts.md, "Orders: edit and delete"). Supplier money per docs/unified-ledger.md:
+// the order's settlement is the ledger's FIFO projection; a line change posts one order_adjustment, a delete posts
+// the order_cancel.
 
 const EDIT = {
   warehouse: "This order has reached the warehouse, so it can't be changed.",
   received: "Goods have been received for this order, so only the delivery date can change.",
   lineChanged: "A line on this order changed. Reload the order and try again.",
-  /** In the order's currency (phase 2 final fixes, 5): the figure is what the supplier was paid. */
-  belowPaid: (paid: number, currency: Currency) => `The order total can't be less than the ${money(paid, currency)} already paid to the supplier.`,
   /** Its containers have its terms (CON-3), so they are fixed once it is loaded (unless never set: an older order). */
   termsLoaded: "This order is already loaded in a container, so its container terms can't change.",
 };
@@ -79,7 +90,8 @@ export function orderDetailRoutes({ db }: RouteContext) {
     const section = <T>(capability: Capability, query: () => Promise<T>) =>
       atLeast(effectiveAccess(role, stages, capability), "View") ? query() : Promise.resolve(null);
 
-    const [supplier, lines, paymentList, receiptList, containerList, advanceList, advanceAvailable] = await Promise.all([
+    const canPay = atLeast(effectiveAccess(role, stages, "payments"), "View");
+    const [supplier, lines, paymentList, receiptList, containerList, ledger, held] = await Promise.all([
       db
         .select({ contactPerson: suppliers.contactPerson, phone: suppliers.phone, city: suppliers.city })
         .from(suppliers)
@@ -101,28 +113,8 @@ export function orderDetailRoutes({ db }: RouteContext) {
         .innerJoin(items, eq(items.id, orderLines.itemId))
         .where(eq(orderLines.orderId, orderId))
         .orderBy(asc(orderLines.position)),
-      section("payments", () =>
-        db
-          .select({
-            id: payments.id,
-            kind: payments.kind,
-            payee: payments.payee,
-            payeeRole: payments.payeeRole,
-            amountCny: payments.amountCny,
-            status: payments.status,
-            paidOn: payments.paidOn,
-            dueDate: payments.dueDate,
-            rateInr: payments.rateInr,
-            mode: payments.mode,
-            reference: payments.reference,
-            notes: payments.notes,
-            /** INR at the payment's own rate, rounded in SQL as every total is; null while due. */
-            amountInr: sql<number | null>`case when ${payments.status} = 'paid' then round(${payments.amountCny} * ${payments.rateInr}, 2) end`.mapWith(Number),
-          })
-          .from(payments)
-          .where(eq(payments.orderId, orderId))
-          .orderBy(asc(sql`coalesce(${payments.paidOn}, ${payments.dueDate})`), asc(payments.createdAt)),
-      ),
+      // Order-linked rows only: legacy supplier payments recorded against this PO (a memo) and its agent payments.
+      section("payments", async () => (await paymentQuery(db, eq(payments.orderId, orderId)).orderBy(...oldestPaymentsFirst)).map(paymentRow)),
       section("receiving", async () => {
         const [list, lineList] = await Promise.all([
           db
@@ -208,13 +200,13 @@ export function orderDetailRoutes({ db }: RouteContext) {
             .map((line) => ({ orderLineId: line.orderLineId, item: line.item, unit: line.unit, bundles: line.bundles, quantity: line.quantity })),
         }));
       }),
-      // The supplier advance applied to this order (docs/supplier-advance.md): its allocations and reversals, oldest
-      // first, each with the advance it came from. Money, so it follows the payments section's access.
-      section("payments", () => orderAdvanceEntries(db, orderId)),
-      // What the supplier has available in the order's currency: ADV-4 can apply it to this order.
-      section("payments", async () => (await advanceTotals(db, and(eq(supplierAdvanceEntries.supplierId, row.supplierId), eq(supplierAdvanceEntries.currency, row.currency))))[0]?.availableCny ?? 0),
+      // The supplier's ledger (its accounts and the FIFO projection of its orders): money, so the payments section's access.
+      section("payments", () => loadLedger(db, { supplierIds: [row.supplierId] })),
+      canPay ? null : heldAccounts(db),
     ]);
-    const balanceCny = balanceOf({ orderValueCny: row.orderValueCny, paidCny: row.supplierPaidCny, advanceCny: row.advanceCny });
+    const settlement = ledger?.order(orderId);
+    const account = ledger?.account(row.supplierId, row.currency);
+    const slices = settlement ? (await sliceDetails(db, settlement.slices))(settlement.slices) : null;
 
     res.json({
       id: row.id,
@@ -235,39 +227,31 @@ export function orderDetailRoutes({ db }: RouteContext) {
       closed: row.closed,
       closedOn: row.closedOn,
       orderValueCny: row.orderValueCny,
-      paidCny: row.paidCny,
-      paidInr: row.paidInr,
-      supplierPaidCny: row.supplierPaidCny,
-      supplierPaidInr: row.supplierPaidInr,
-      // The supplier advance applied (not a payment) and its INR at each advance's rate (docs/supplier-advance.md).
-      advanceCny: row.advanceCny,
-      advanceInr: row.advanceInr,
-      // Supplier payments beyond the order's value, now the supplier's available advance (0016); paid figures exclude it.
-      excessCny: row.excessCny,
-      excessInr: row.excessInr,
-      advanceStatus: advanceStatus(row.advanceCny, balanceCny),
-      // What the supplier is still owed: agent payments are sea freight, not the goods (docs/phase2-fixes.md 1); the
-      // advance applied counts as the supplier's money already.
-      balanceCny,
-      ...depositState(row.depositRequiredCny, row.depositPaidCny),
+      // The FIFO projection of the supplier's account (settled, outstanding, status, goods INR), the Deposit Required
+      // milestone, the agent payments (sea freight) and paidInr; null without payments View.
+      ...(ledger ? orderSettlement(settlement, row) : hiddenSettlement(held!.has(`${row.supplierId} ${row.currency}`), row.depositRequiredCny)),
+      /** The credits that settled the order, oldest first, each at its own rate. */
+      slices: ledger ? (slices ?? []) : null,
+      /** The supplier's account in the order's currency (signed balance; null figures while held). */
+      supplierAccount: account ? accountFields(account) : null,
       lines: lines.map(({ itemId, itemName, ...line }) => ({ ...line, item: { id: itemId, name: itemName } })),
       payments: paymentList,
-      advanceEntries: advanceList,
-      /** The supplier's advance available in the order's currency (null without payments View). */
-      advanceAvailableCny: advanceAvailable,
       receipts: receiptList,
       containers: containerList,
     });
   });
 
   // ORD-5. One transaction with the order row locked: REC-3 and CON-3 lock it too, and a new payment's foreign key
-  // key-share locks it, so no receipt, load or payment can land between the checks below and the change.
+  // key-share locks it, so no receipt, load or payment can land between the checks below and the change. New lines
+  // are a money change: refused while the ledger is in maintenance (503) or the account is held (409), and the value's
+  // difference is posted as one order_adjustment (nothing when the value is unchanged). Other edits post nothing.
   router.patch("/orders/:po", requirePermission("ordersEdit", "Enter"), async (req, res) => {
     const po = String(req.params.po);
     const input = parse(orderEdit, req.body);
     if (Object.keys(input).length === 0) throw new HttpError(400, "bad_request", GENERIC_MESSAGE);
 
     const order = await db.transaction(async (tx) => {
+      if (input.lines) await assertLedgerLive(tx);
       const row = (await tx.select().from(orders).where(byPo(po)).for("update"))[0];
       if (!row) throw notFound("Order");
       if (row.stage === 6) throw conflict("order_locked", EDIT.warehouse);
@@ -309,20 +293,12 @@ export function orderDetailRoutes({ db }: RouteContext) {
         const active = itemIds.length
           ? await tx.select({ id: items.id }).from(items).where(and(inArray(items.id, itemIds), eq(items.status, "Active")))
           : [];
-        // ponytail: float total rounded like round2 elsewhere; compare as SQL numeric if a cent-edge case ever matters.
-        const total = round2(input.lines.reduce((sum, entry) => sum + entry.quantity * entry.rateCny, 0));
-        // Supplier payments only: an agent's sea freight is not part of the order's value.
-        const paid = (
-          await tx
-            .select({ cny: sql<number>`coalesce(sum(${payments.amountCny}), 0)`.mapWith(Number) })
-            .from(payments)
-            .where(and(eq(payments.orderId, row.id), eq(payments.status, "paid"), eq(payments.payeeRole, "supplier")))
-        )[0]!.cny;
+        // The total may go below what was paid (D9): the supplier's account then simply holds more money.
         if (kept.some((id) => !savedItem.has(id)) || new Set(kept).size < kept.length) problems.lines = EDIT.lineChanged;
         else if (active.length < itemIds.length) problems.lines = M.item;
-        else if (total < paid) problems.lines = EDIT.belowPaid(paid, row.currency);
       }
       if (Object.keys(problems).length > 0) throw validationFailed(problems);
+      if (input.lines && (await isHeld(tx, row.supplierId, row.currency))) throw conflict("account_held", LEDGER.held);
 
       if (input.lines) {
         await tx.delete(orderLines).where(and(eq(orderLines.orderId, row.id), kept.length ? notInArray(orderLines.id, kept) : undefined));
@@ -335,9 +311,12 @@ export function orderDetailRoutes({ db }: RouteContext) {
         }
         if (added.length > 0) await tx.insert(orderLines).values(added);
       }
-      // A new total re-settles the supplier advance (docs/supplier-advance.md): more is applied when the order grows and
-      // advance is available, the excess goes back when it shrinks. Never left at an amount the order no longer owes.
-      const advance = input.lines ? await settleAdvance(tx, { id: row.id, po: newPo ?? row.poNumber, supplierId: row.supplierId, currency: row.currency }, req.user!.id) : null;
+      // The new value against what the journal holds for the order: one order_adjustment for the difference, at the
+      // order's rate snapshot, in this transaction (under the order's row lock, so its key number is its own).
+      const posted = input.lines
+        ? await syncOrderValue(tx, { id: row.id, po: newPo ?? row.poNumber, supplierId: row.supplierId, currency: row.currency, exchangeRate: row.exchangeRate, orderDate: row.orderDate }, req.user!.id)
+        : null;
+      const ledger = posted && { supplierId: row.supplierId, currency: row.currency, changeCny: posted.changeCny, balanceBefore: posted.balanceBefore, balanceAfter: posted.balanceAfter };
       const updated = await tx
         .update(orders)
         .set({ poNumber: newPo, terms: newTerms, orderDate: input.orderDate, deliveryDate: input.deliveryDate, depositRequiredCny: input.depositRequiredCny, updatedAt: new Date() })
@@ -353,7 +332,7 @@ export function orderDetailRoutes({ db }: RouteContext) {
           .set({ href: sql`${to} || substr(${notifications.href}, ${from.length + 1}::int)` })
           .where(or(eq(notifications.href, from), sql`left(${notifications.href}, ${from.length + 1}::int) = ${`${from}/`}`));
       }
-      return { order: updated[0]!, advance, renamedFrom: newPo ? row.poNumber : null };
+      return { order: updated[0]!, ledger, renamedFrom: newPo ? row.poNumber : null };
     }).catch((error: unknown) => {
       // Another order took the number between the check above and this edit (a concurrent edit or create).
       if (isPoTaken(error)) throw validationFailed({ po: M.poTaken });
@@ -361,25 +340,35 @@ export function orderDetailRoutes({ db }: RouteContext) {
     });
     // ponytail: the server log is the record of a renumbering, as of deletions; an audit table needs a migration.
     if (order.renamedFrom) console.info(`Order ${order.renamedFrom} renumbered to ${order.order.po} (order ${order.order.id}) by user ${req.user!.id}.`);
-    res.json(order.advance ? { order: order.order, advance: order.advance } : { order: order.order });
+    // The account's balances are money: only with payments View (ORD-5 itself needs ordersEdit Enter).
+    const canPay = atLeast(effectiveAccess(req.user!.role, req.user!.stages, "payments"), "View");
+    res.json(order.ledger ? { order: order.order, ledger: canPay ? order.ledger : null } : { order: order.order });
   });
 
   // ORD-6. Only an order nothing depends on is deleted, with its own lines (the order_lines cascade). The order and its
   // lines are locked first: REC-3 and CON-3 lock the order, and any new payment, receipt, container or warehouse line
   // key-share locks the row it names, so nothing can start depending on the order between the counts and the delete.
+  // Deleting is cancelling: everything the journal holds for the order is given back (order_cancel) first; its
+  // postings stay with the PO number (order_id set null). Refused in maintenance (503) or for a held account (409).
   router.delete("/orders/:po", requirePermission("admin", "Full"), async (req, res) => {
     const po = String(req.params.po);
     const inUse = (what: string) => conflict("in_use", `This order has ${what}, so it can't be deleted.`);
     const returned = await db
       .transaction(async (tx) => {
+        await assertLedgerLive(tx);
         const row = (
-          await tx.select({ id: orders.id, po: orders.poNumber, supplierId: orders.supplierId, currency: orders.currency }).from(orders).where(byPo(po)).for("update")
+          await tx
+            .select({ id: orders.id, po: orders.poNumber, supplierId: orders.supplierId, currency: orders.currency, exchangeRate: orders.exchangeRate, orderDate: orders.orderDate })
+            .from(orders)
+            .where(byPo(po))
+            .for("update")
         )[0];
         if (!row) throw notFound("Order");
+        if (await isHeld(tx, row.supplierId, row.currency)) throw conflict("account_held", LEDGER.held);
         await tx.select({ id: orderLines.id }).from(orderLines).where(eq(orderLines.orderId, row.id)).for("update");
         const lines = tx.select({ id: orderLines.id }).from(orderLines).where(eq(orderLines.orderId, row.id));
         const receiptsWithLines = tx.select({ id: receiptLines.receiptId }).from(receiptLines).where(inArray(receiptLines.orderLineId, lines));
-        // Every foreign key to orders and order_lines cascades, so each kind of dependent is counted here.
+        // Each kind of dependent is counted here (payments of any payee, voided ones too: a payment never disappears).
         const uses: [string, PromiseLike<{ n: number }[]>][] = [
           ["payment", tx.select({ n: count() }).from(payments).where(eq(payments.orderId, row.id))],
           ["receipt", tx.select({ n: countDistinct(receipts.id) }).from(receipts).where(or(eq(receipts.orderId, row.id), inArray(receipts.id, receiptsWithLines)))],
@@ -395,11 +384,9 @@ export function orderDetailRoutes({ db }: RouteContext) {
           if (n > 0) used.push(`${n} ${what}${n === 1 ? "" : "s"}`);
         }
         if (used.length > 0) throw inUse(joined(used));
-        // Deleting is cancelling (docs/supplier-advance.md): the advance applied goes back to the supplier's account as
-        // reversals first; the allocations and reversals stay in the ledger with the PO number (order_id set null).
-        const advance = await settleAdvance(tx, row, req.user!.id, "release");
+        const cancel = await postOrderCancel(tx, { ...row }, req.user!.id);
         await tx.delete(orders).where(eq(orders.id, row.id));
-        return { ...row, amount: -advance.changeCny };
+        return { ...row, amount: cancel.changeCny };
       })
       .catch((error: unknown) => {
         // A use the counts missed through a NO ACTION foreign key refuses the delete (none exists today).
@@ -407,8 +394,8 @@ export function orderDetailRoutes({ db }: RouteContext) {
         if (((error as PgError)?.cause ?? (error as PgError))?.code === "23503") throw inUse("other records");
         throw error;
       });
-    // The ledger's reversal rows are the record; this line says who cancelled it.
-    if (returned.amount > 0) console.info(`Order ${returned.po} deleted by user ${req.user!.id}: ${money(returned.amount, returned.currency)} supplier advance returned.`);
+    // The order_cancel posting is the record; this line says who cancelled it.
+    console.info(`Order ${returned.po} deleted by user ${req.user!.id}: ${money(returned.amount, returned.currency)} debit cancelled.`);
     res.status(204).end();
   });
 

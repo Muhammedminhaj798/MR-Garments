@@ -21,17 +21,20 @@ import {
   warehouseReceiptLines,
   warehouseReceipts,
 } from "../../db/schema";
-import { validationFailed } from "../../http/errors";
+import { conflict, validationFailed } from "../../http/errors";
 import { parse } from "../../http/validate";
-import { advanceTotals, settleAdvance } from "../advances/advances";
+import { atLeast, effectiveAccess } from "../../permissions/matrix";
 import type { RouteContext } from "../context";
+import { ledgerOverview } from "../ledger/ledger.routes";
+import { assertLedgerLive, balancesOf, heldAccounts, isHeld, loadLedger, MESSAGES as LEDGER, newestPaymentsFirst, paymentQuery, paymentRow, postOrderDebit } from "../ledger/ledger";
 import { orderClosed, orderClosedOn } from "./closure";
-import { balanceOf, depositState, orderMoney, round2 } from "./money";
+import { hiddenSettlement, orderMoney, orderSettlement, round2 } from "./money";
 
 // Owner: BE-orders. ORD-1 GET /orders, ORD-2 GET /orders/options, ORD-3 POST /orders, CAL-1 GET /deliveries,
-// PAY-1 GET /payments (docs/live-screens-contracts.md). Payments are records only: nothing here moves money.
-// `stocked`, `closed` and `closedOn` (docs/phase2-contracts.md section 1) come from ./closure.ts.
-// Money is in the order's `currency` (the *Cny names stay for compatibility); `rateInr` is INR per 1 of it.
+// PAY-1 GET /payments (docs/live-screens-contracts.md; supplier money per docs/unified-ledger.md). An order's value is
+// posted to its supplier's ledger account when it is created (ORD-3); its settled and outstanding amounts are the
+// ledger's FIFO projection. `stocked`, `closed` and `closedOn` (docs/phase2-contracts.md section 1) come from
+// ./closure.ts. Money is in the order's `currency` (the *Cny names stay for compatibility); `rateInr` is INR per 1 of it.
 
 export const MESSAGES = {
   supplier: "Choose a supplier from the list.",
@@ -50,6 +53,8 @@ export const MESSAGES = {
   rateInr: "Enter the INR rate.",
   rateForInr: "Leave the rate empty for an INR order.",
   mode: "Enter the payment mode.",
+  /** ORD-3 deposits are shipping-agent payments only (docs/unified-ledger.md): supplier money goes through PAY-2. */
+  supplierDeposit: "Record supplier payments with Record payment.",
   currency: "Choose a supported currency code (ISO 4217, such as CNY, USD or AED).",
   /** The order is in its supplier's currency (docs/supplier-currency.md); another one is refused. */
   supplierCurrency: (currency: string) => `This supplier's orders are in ${currency}.`,
@@ -164,6 +169,7 @@ async function checkRules(db: Database, input: NewOrder) {
   if (active.length < itemIds.length) problems.lines = M.item;
   const rate = input.deposits.map((entry) => rateProblem(currency, entry.rateInr, M.rateInr)).find(Boolean);
   if (rate) problems.deposits = rate;
+  if (input.deposits.some((entry) => entry.payeeRole === "supplier")) problems.deposits = M.supplierDeposit;
   if (Object.keys(problems).length > 0) throw validationFailed(problems);
   /** The order's currency (the deposits' rate rule was checked for it); the rate is read again, locked, when the order is written. */
   return { currency };
@@ -198,7 +204,7 @@ export const orderColumns = {
   closed: orderClosed,
   closedOn: orderClosedOn,
   ...orderMoney,
-  /** The deposit the supplier asked for (0009); null when none. depositState() turns it and depositPaidCny into the status. */
+  /** The deposit the supplier asked for (0009); null when none. depositMilestone() compares the FIFO-settled amount with it. */
   depositRequiredCny: orders.depositRequiredCny,
   /** The order's container terms (0015): FOB or CNF; null until set (orders from before 0015). */
   terms: orders.terms,
@@ -221,9 +227,11 @@ export function orderRows(db: Database, orderBy: SQL[], where?: SQL) {
 export function ordersRoutes({ db }: RouteContext) {
   const router = Router();
 
-  // ORD-1. Order date, then PO, newest first.
-  router.get("/orders", requirePermission("ordersView", "View"), async (_req, res) => {
-    const rows = await orderRows(db, newestFirst);
+  // ORD-1. Order date, then PO, newest first. The money (the ledger's projection, agent payments) only with payments
+  // View, as ORD-4's sections; otherwise those fields are null and the ledger is never read.
+  router.get("/orders", requirePermission("ordersView", "View"), async (req, res) => {
+    const money = atLeast(effectiveAccess(req.user!.role, req.user!.stages, "payments"), "View");
+    const [rows, ledger, held] = await Promise.all([orderRows(db, newestFirst), money ? loadLedger(db) : null, money ? null : heldAccounts(db)]);
     res.json(
       rows.map((row) => ({
         id: row.id,
@@ -243,14 +251,7 @@ export function ordersRoutes({ db }: RouteContext) {
         closed: row.closed,
         closedOn: row.closedOn,
         orderValueCny: row.orderValueCny,
-        paidCny: row.paidCny,
-        paidInr: row.paidInr,
-        supplierPaidCny: row.supplierPaidCny,
-        supplierPaidInr: row.supplierPaidInr,
-        // The supplier advance applied (docs/supplier-advance.md): balance to supplier = value - supplier paid - advance.
-        advanceCny: row.advanceCny,
-        advanceInr: row.advanceInr,
-        ...depositState(row.depositRequiredCny, row.depositPaidCny),
+        ...(ledger ? orderSettlement(ledger.order(row.id), row) : hiddenSettlement(held!.has(`${row.supplierId} ${row.currency}`), row.depositRequiredCny)),
       })),
     );
   });
@@ -285,7 +286,7 @@ export function ordersRoutes({ db }: RouteContext) {
   });
 
   // ORD-2. What the new-order form offers; readable by anyone who can open Orders (no Settings access needed).
-  router.get("/orders/options", requirePermission("ordersView", "View"), async (_req, res) => {
+  router.get("/orders/options", requirePermission("ordersView", "View"), async (req, res) => {
     const [po, supplierRows, itemRows, agents] = await Promise.all([
       nextPo(db),
       db
@@ -314,17 +315,22 @@ export function ordersRoutes({ db }: RouteContext) {
         .where(eq(shippingAgents.status, "Active"))
         .orderBy(asc(shippingAgents.createdAt), asc(shippingAgents.name)),
     ]);
-    // Each supplier's advance available in its own currency (docs/supplier-advance.md): ORD-3 applies it automatically.
-    const advance = new Map((await advanceTotals(db)).map((row) => [`${row.supplierId} ${row.currency}`, row.availableCny]));
+    // Each supplier's ledger balances (docs/unified-ledger.md), and whether its current currency's account is held
+    // (ORD-3 refuses an order into a held account).
+    const ledger = await loadLedger(db, { supplierIds: supplierRows.map((row) => row.id) });
+    // Money, so only with payments View (as ORD-1's figures); `held` is not money (ORD-3 refuses a held account).
+    const canPay = atLeast(effectiveAccess(req.user!.role, req.user!.stages, "payments"), "View");
     res.json({
       nextPo: po,
-      suppliers: supplierRows.map((row) => ({ ...row, advanceAvailable: advance.get(`${row.id} ${row.currency}`) ?? 0 })),
+      suppliers: supplierRows.map((row) => ({ ...row, held: ledger.account(row.id, row.currency)?.held ?? false, ledgerBalance: canPay ? balancesOf(ledger, row.id) : null })),
       items: itemRows,
       agents,
     });
   });
 
-  // ORD-3. The order, its lines and its deposits in one transaction; the PO number is the form's or assigned inside it.
+  // ORD-3. The order, its lines, its agent deposits and its debit in the supplier's ledger in one transaction; the PO
+  // number is the form's or assigned inside it. Refused while the ledger is in maintenance (503) or the supplier's
+  // account in the order's currency is held (409).
   router.post("/orders", requirePermission("ordersEdit", "Enter"), async (req, res) => {
     const input = parse(newOrder, req.body);
     const money = await checkRules(db, input);
@@ -332,12 +338,15 @@ export function ordersRoutes({ db }: RouteContext) {
     for (let attempt = 1; ; attempt++) {
       try {
         const order = await db.transaction(async (tx) => {
+          await assertLedgerLive(tx);
           // One order at a time takes a PO number, so a burst of creates can't all pick the same one (audit M1).
           await tx.execute(sql`select pg_advisory_xact_lock(hashtext('orders.po_number'))`);
           // The supplier's row share-locked (as SD-2 reads it): a rate or currency edit waits for this order, so the
           // snapshot is the rate the supplier has when the order is written, never one already superseded.
           const [supplier] = await tx.select({ currency: suppliers.currency, exchangeRate: suppliers.exchangeRate }).from(suppliers).where(eq(suppliers.id, input.supplierId)).for("share");
           if (!supplier || supplier.currency !== money.currency) throw validationFailed({ currency: M.supplierCurrency(supplier?.currency ?? money.currency) });
+          if (await isHeld(tx, input.supplierId, supplier.currency)) throw conflict("account_held", LEDGER.held);
+          const exchangeRate = supplier.currency === "INR" ? 1 : supplier.exchangeRate;
           const created = await tx
             .insert(orders)
             .values({
@@ -346,12 +355,12 @@ export function ordersRoutes({ db }: RouteContext) {
               orderDate: input.orderDate,
               deliveryDate: input.deliveryDate,
               currency: supplier.currency,
-              exchangeRate: supplier.currency === "INR" ? 1 : supplier.exchangeRate,
+              exchangeRate,
               depositRequiredCny: input.depositRequiredCny ?? null,
               terms: input.terms ?? null,
               createdBy: userId,
             })
-            .returning({ id: orders.id, po: orders.poNumber });
+            .returning({ id: orders.id, po: orders.poNumber, orderDate: orders.orderDate });
           const orderId = created[0]!.id;
           await tx.insert(orderLines).values(input.lines.map((entry, position) => ({ ...entry, orderId, position })));
           // An agent deposit keeps the agent's name, not its id: it must name an active agent (any letter case), read
@@ -364,18 +373,26 @@ export function ordersRoutes({ db }: RouteContext) {
               .for("share");
             if (agent.length === 0) throw validationFailed({ deposits: M.payee });
           }
+          // Agent deposits only (checkRules refused supplier ones): sea freight, never posted to the ledger.
           if (input.deposits.length > 0) {
             await tx
               .insert(payments)
               .values(input.deposits.map((entry) => ({ ...entry, rateInr: entry.rateInr ?? 1, orderId, kind: "Deposit", status: "paid", createdBy: userId })));
           }
-          // The supplier's advance in the order's currency covers what the deposits above leave to pay, as far as it
-          // goes (docs/supplier-advance.md); in this transaction, so the order and its allocation stand or fall together.
-          const advance = await settleAdvance(tx, { id: orderId, po: created[0]!.po, supplierId: input.supplierId, currency: supplier.currency }, userId);
-          return { ...created[0]!, advance };
+          // The order's value, debited to the supplier's account in the order's currency at its rate snapshot, once.
+          const posted = await postOrderDebit(
+            tx,
+            { id: orderId, po: created[0]!.po, supplierId: input.supplierId, currency: supplier.currency, exchangeRate, orderDate: created[0]!.orderDate },
+            userId,
+          );
+          return {
+            order: { id: orderId, po: created[0]!.po },
+            ledger: { supplierId: input.supplierId, currency: supplier.currency, debitCny: -posted.changeCny, balanceBefore: posted.balanceBefore, balanceAfter: posted.balanceAfter },
+          };
         });
-        const { advance, ...created } = order;
-        res.status(201).json({ order: created, advance });
+        // The account's balances are money: only with payments View (ORD-3 itself needs ordersEdit Enter).
+        const canPay = atLeast(effectiveAccess(req.user!.role, req.user!.stages, "payments"), "View");
+        res.status(201).json(canPay ? order : { ...order, ledger: null });
         return;
       } catch (error) {
         if (!isPoTaken(error)) throw error;
@@ -415,54 +432,26 @@ export function ordersRoutes({ db }: RouteContext) {
     );
   });
 
-  // PAY-1. Every order's figures (newest first) and every payment record (latest date first). `balanceCny` is what
-  // the supplier is still owed (order value less supplier payments and the advance applied); `paidCny`/`paidInr` count every payee.
+  // PAY-1. Every order's figures (newest first: the ledger's projection, its agent payments and next due), every
+  // payment record (orderless and voided ones included, latest date first) and the ledger's accounts and totals (LED-2).
   router.get("/payments", requirePermission("payments", "View"), async (_req, res) => {
-    const [orderList, paymentList] = await Promise.all([
-      orderRows(db, newestFirst),
-      db
-        .select({
-          id: payments.id,
-          orderId: payments.orderId,
-          po: orders.poNumber,
-          currency: orders.currency,
-          kind: payments.kind,
-          payee: payments.payee,
-          payeeRole: payments.payeeRole,
-          amountCny: payments.amountCny,
-          status: payments.status,
-          paidOn: payments.paidOn,
-          dueDate: payments.dueDate,
-          rateInr: payments.rateInr,
-          mode: payments.mode,
-          reference: payments.reference,
-          notes: payments.notes,
-          /** INR at the payment's own rate, rounded in SQL as every total is (the same paisa as ORD-4); null while due. */
-          amountInr: sql<number | null>`case when ${payments.status} = 'paid' then round(${payments.amountCny} * ${payments.rateInr}, 2) end`.mapWith(Number),
-        })
-        .from(payments)
-        .innerJoin(orders, eq(orders.id, payments.orderId))
-        .orderBy(desc(sql`coalesce(${payments.paidOn}, ${payments.dueDate})`), desc(payments.createdAt)),
-    ]);
+    const [orderList, paymentList, ledger] = await Promise.all([orderRows(db, newestFirst), paymentQuery(db).orderBy(...newestPaymentsFirst), loadLedger(db)]);
+    const { accounts, totals } = await ledgerOverview(db, ledger);
     res.json({
       orders: orderList.map((row) => ({
         orderId: row.id,
         po: row.po,
+        supplierId: row.supplierId,
         supplier: row.supplierName,
         currency: row.currency,
         supplierRate: row.supplierRate,
         orderValueCny: row.orderValueCny,
-        paidCny: row.paidCny,
-        paidInr: row.paidInr,
-        supplierPaidCny: row.supplierPaidCny,
-        supplierPaidInr: row.supplierPaidInr,
-        advanceCny: row.advanceCny,
-        advanceInr: row.advanceInr,
-        balanceCny: balanceOf({ orderValueCny: row.orderValueCny, paidCny: row.supplierPaidCny, advanceCny: row.advanceCny }),
-        ...depositState(row.depositRequiredCny, row.depositPaidCny),
+        ...orderSettlement(ledger.order(row.id), row),
         nextDue: row.nextDue,
       })),
-      payments: paymentList,
+      payments: paymentList.map(paymentRow),
+      accounts,
+      totals,
     });
   });
 

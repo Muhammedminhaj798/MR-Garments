@@ -1,5 +1,7 @@
 # Phase 2 fixes: what the production-readiness audit asked for
 
+> **Superseded in part (0017, unified supplier ledger):** supplier payments, PAY-2/PAY-3, advances, excess, supplier deposits and every paid / balance / outstanding figure now follow `docs/unified-ledger.md`. Where this file disagrees, that file wins.
+
 Remediation of the audit findings (2026-11-09), built on `feature/phase-2` as `fix/phase2-audit` in both repositories.
 Scope is the audit's list; nothing else was redesigned. Migration **0009** is required (section 5) and has not been
 applied anywhere but the local test databases.

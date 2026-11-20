@@ -32,7 +32,7 @@ const NINGBO = {
   email: "xu.feng@ningbo-denim.cn",
 };
 // The profile fields a row has when they were never set, and the money lists of a supplier without orders.
-const EXTRAS = { state: "", postalCode: "", paymentTerms: "", taxNumber: "", openPos: 0, ytdValue: [], balance: [], exchangeRate: null, rateUpdatedAt: null, hasTransactions: false };
+const EXTRAS = { state: "", postalCode: "", paymentTerms: "", taxNumber: "", openPos: 0, ytdValue: [], balance: [], heldCurrencies: [], exchangeRate: null, rateUpdatedAt: null, hasTransactions: false };
 
 const UNKNOWN = "00000000-0000-4000-8000-000000000000";
 const list = (query = "") => http.get(`/suppliers${query}`).set("Cookie", management);
@@ -376,13 +376,31 @@ describe("DELETE /suppliers/:id with supplier deposits (docs/phase2-contracts.md
     expect(refused.body).toEqual({ error: { code: "in_use", message: "This supplier is used by 1 deposit, so it can't be deleted. Deactivate it instead." } });
     const order = await makeOrder(ctx, { supplier: "Dalian Deposits", lines: [{ item: "Denim jeans", quantity: 10, rateCny: 5 }] });
     expect((await http.delete(`/suppliers/${id}`).set("Cookie", management)).body.error.message).toBe(
-      "This supplier is used by 1 order and 1 deposit, so it can't be deleted. Deactivate it instead.",
+      // The order's ledger debit counts too (docs/unified-ledger.md).
+      "This supplier is used by 1 order, 1 deposit and 1 ledger posting, so it can't be deleted. Deactivate it instead.",
     );
     expect((await ctx.db.select().from(suppliers).where(eq(suppliers.id, id))).length).toBe(1);
 
+    // The order and the deposit gone, its ledger history stays (the journal is append-only), so the supplier is
+    // still in use: a supplier with ledger history is deactivated, never deleted (docs/unified-ledger.md).
     await ctx.db.delete(orders).where(eq(orders.id, order.id));
     await ctx.db.delete(supplierDeposits).where(eq(supplierDeposits.id, deposit.id));
-    expect((await http.delete(`/suppliers/${id}`).set("Cookie", management)).status).toBe(204);
-    expect((await ctx.db.select().from(suppliers).where(eq(suppliers.id, id))).length).toBe(0);
+    const kept = await http.delete(`/suppliers/${id}`).set("Cookie", management);
+    expect(kept.status).toBe(409);
+    expect(kept.body.error.message).toBe("This supplier is used by 1 ledger posting, so it can't be deleted. Deactivate it instead.");
+    expect((await ctx.db.select().from(suppliers).where(eq(suppliers.id, id))).length).toBe(1);
+
+    // A supplier that only ever had a deposit goes once the deposit is gone.
+    const other = (await add({ name: "Dalian Deposits Two" })).body.supplier.id as string;
+    const only = (
+      await ctx.db
+        .insert(supplierDeposits)
+        .values({ supplierId: other, direction: "give", amount: 500, currency: "CNY", openedOn: "2026-10-20" })
+        .returning({ id: supplierDeposits.id })
+    )[0]!;
+    expect((await http.delete(`/suppliers/${other}`).set("Cookie", management)).status).toBe(409);
+    await ctx.db.delete(supplierDeposits).where(eq(supplierDeposits.id, only.id));
+    expect((await http.delete(`/suppliers/${other}`).set("Cookie", management)).status).toBe(204);
+    expect((await ctx.db.select().from(suppliers).where(eq(suppliers.id, other))).length).toBe(0);
   });
 });

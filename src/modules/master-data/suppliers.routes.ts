@@ -4,7 +4,7 @@ import { z } from "zod";
 
 import { requirePermission } from "../../auth/current-user";
 import { currencyCode } from "../../currencies";
-import { type Currency, orders, STATUSES, supplierAdvanceEntries, supplierDeposits, suppliers } from "../../db/schema";
+import { type Currency, orders, payments, STATUSES, supplierAdvanceEntries, supplierDeposits, supplierLedgerEntries, suppliers } from "../../db/schema";
 import { conflict, GENERIC_MESSAGE, HttpError, notFound, validationFailed } from "../../http/errors";
 import { parse } from "../../http/validate";
 import type { RouteContext } from "../context";
@@ -119,7 +119,8 @@ export function suppliersRoutes({ db }: RouteContext) {
 
   /**
    * MD-1 rows (one when `id` is given). Open orders: the supplier's orders not yet received in the warehouse
-   * (stage < 6). `ytdValue` and `balance`: this year's order value and what is still owed, per order currency.
+   * (stage < 6). `ytdValue`: this year's order value per order currency; `balance`: the signed ledger balance per
+   * currency (held accounts left out, named in `heldCurrencies`; docs/unified-ledger.md).
    */
   const load = async (id?: string) => {
     const [rows, money] = await Promise.all([
@@ -142,8 +143,9 @@ export function suppliersRoutes({ db }: RouteContext) {
           currency: suppliers.currency,
           exchangeRate: suppliers.exchangeRate,
           rateUpdatedAt: suppliers.rateUpdatedAt,
-          /** Any order or supplier deposit: a change of currency or rate then applies to new transactions only. */
-          hasTransactions: sql<boolean>`count(${orders.id}) > 0 or exists (select 1 from ${supplierDeposits} where ${supplierDeposits.supplierId} = ${suppliers.id})`,
+          /** Any order, supplier deposit or orderless payment: a change of currency or rate then applies to new transactions only. */
+          hasTransactions: sql<boolean>`count(${orders.id}) > 0 or exists (select 1 from ${supplierDeposits} where ${supplierDeposits.supplierId} = ${suppliers.id})
+            or exists (select 1 from ${payments} where ${payments.supplierId} = ${suppliers.id})`,
           openOrders: sql<number>`count(${orders.id}) filter (where ${orders.stage} < 6)`.mapWith(Number),
           /** Orders not closed (phase 2 §1): the Suppliers page's "Active POs", the same rule as its Open POs card. */
           openPos: sql<number>`count(${orders.id}) filter (where not ${orderClosed})`.mapWith(Number),
@@ -156,7 +158,7 @@ export function suppliersRoutes({ db }: RouteContext) {
         .orderBy(...creationOrder(suppliers)),
       supplierMoneyRows(db, todayInIndia()),
     ]);
-    return rows.map((row) => ({ ...row, ...(money.get(row.id) ?? { ytdValue: [], balance: [] }) }));
+    return rows.map((row) => ({ ...row, ...(money.get(row.id) ?? { ytdValue: [], balance: [], heldCurrencies: [] }) }));
   };
 
   // Before the :id routes, so "summary" and "insights" are never read as a supplier id.
@@ -208,12 +210,14 @@ export function suppliersRoutes({ db }: RouteContext) {
     res.json({ supplier: (await load(id))[0] });
   });
 
-  // A supplier with orders, supplier deposits (docs/phase2-contracts.md 3.2) or an advance account (docs/supplier-advance.md)
-  // is deactivated instead of deleted.
+  // A supplier with orders, supplier deposits (docs/phase2-contracts.md 3.2), an advance account (docs/supplier-advance.md),
+  // ledger entries or orderless payments (docs/unified-ledger.md) is deactivated instead of deleted.
   deleteRoute(router, db, "/suppliers", suppliers, "Supplier", [
     { what: "order", table: orders, of: (id) => eq(orders.supplierId, id) },
     { what: "deposit", table: supplierDeposits, of: (id) => eq(supplierDeposits.supplierId, id) },
     { what: "advance record", table: supplierAdvanceEntries, of: (id) => eq(supplierAdvanceEntries.supplierId, id) },
+    { what: "ledger posting", table: supplierLedgerEntries, of: (id) => eq(supplierLedgerEntries.supplierId, id) },
+    { what: "payment", table: payments, of: (id) => eq(payments.supplierId, id) },
   ]);
 
   return router;

@@ -1,8 +1,10 @@
+import { randomUUID } from "node:crypto";
+
 import { asc, desc, eq, sql } from "drizzle-orm";
 import supertest from "supertest";
 import { afterAll, beforeEach, describe, expect, it } from "vitest";
 
-import { locations, notifications, shippingAgents, users } from "../../db/schema";
+import { locations, notifications, shippingAgents, suppliers, users } from "../../db/schema";
 import { api, createTestContext, resetData, SEEDED, signInAs } from "../../test/harness";
 import { idOf, indiaDay, makeOrder, receive } from "../stock/fixtures";
 import { day, money, notify, qty } from "./notify";
@@ -278,26 +280,37 @@ describe("short-receipt (REC-3)", () => {
 });
 
 describe("payment-recorded (PAY-2)", () => {
+  /** A supplier payment, against the supplier (no order: docs/unified-ledger.md). */
   const pay = async (cookie: string) => {
-    const order = await makeOrder(ctx, { lines: [{ item: "Denim jeans", quantity: 1000, rateCny: 10 }] });
-    const res = await http
-      .post("/payments", { orderId: order.id, kind: "Balance", payeeRole: "supplier", agentId: null, amountCny: 234567.5, paidOn: indiaDay(-1), rateInr: 12, mode: "Bank" })
-      .set("Cookie", cookie);
+    const supplierId = await idOf(ctx, suppliers, "Guangzhou Textile Co.");
+    const res = await http.post("/payments", { supplierId, amount: 234567.5, paidOn: indiaDay(-1), rateInr: 12, mode: "Bank", clientRequestId: randomUUID() }).set("Cookie", cookie);
     expect(res.status).toBe(201);
-    return { id: res.body.payment.id as string, po: order.po };
+    return { id: res.body.payment.id as string, supplierId };
   };
 
-  it("by Management reaches Procurement and Accounts, not China staff", async () => {
-    const { id, po } = await pay(cookies.management);
+  it("by Management reaches Procurement and Accounts, not China staff, linking to the supplier's ledger", async () => {
+    const { id, supplierId } = await pay(cookies.management);
     const rows = await inbox("payment-recorded");
     expect(rows.map((row) => row.email)).toEqual([SEEDED.accounts, SEEDED.procurement]);
     for (const row of rows) {
       expect(row).toMatchObject({
-        title: `${po} payment recorded`,
-        details: ["Balance ¥2,34,567.50", "Guangzhou Textile Co."],
-        href: `/orders/${po}/payments`,
+        title: "Guangzhou Textile Co. payment recorded",
+        details: ["Payment ¥2,34,567.50", "Guangzhou Textile Co."],
+        href: `/supplier-ledger/${supplierId}`,
         dedupeKey: `payment-recorded:${id}`,
       });
+    }
+  });
+
+  it("an agent payment on an order links to the order's payments", async () => {
+    const order = await makeOrder(ctx, { lines: [{ item: "Denim jeans", quantity: 1000, rateCny: 10 }] });
+    const agentId = await idOf(ctx, shippingAgents, "Sino Freight");
+    const res = await http
+      .post("/payments", { orderId: order.id, payeeRole: "agent", agentId, kind: "Balance", amountCny: 500, paidOn: indiaDay(-1), rateInr: 12, mode: "Bank", clientRequestId: randomUUID() })
+      .set("Cookie", cookies.management);
+    expect(res.status).toBe(201);
+    for (const row of await inbox("payment-recorded")) {
+      expect(row).toMatchObject({ title: `${order.po} payment recorded`, details: ["Balance ¥500", "Sino Freight"], href: `/orders/${order.po}/payments` });
     }
   });
 
@@ -307,7 +320,7 @@ describe("payment-recorded (PAY-2)", () => {
   });
 
   it("is not written when the payment is refused", async () => {
-    const res = await http.post("/payments", { orderId: UNKNOWN, kind: "Balance", payeeRole: "supplier", agentId: null, amountCny: 5, paidOn: indiaDay(-1), rateInr: 12, mode: "Bank" }).set("Cookie", cookies.accounts);
+    const res = await http.post("/payments", { supplierId: UNKNOWN, amount: 5, paidOn: indiaDay(-1), rateInr: 12, mode: "Bank", clientRequestId: randomUUID() }).set("Cookie", cookies.accounts);
     expect(res.status).toBe(422);
     expect(await ctx.db.select().from(notifications)).toEqual([]);
   });

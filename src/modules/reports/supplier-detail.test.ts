@@ -3,7 +3,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import { type Currency, items, orders, payments, suppliers } from "../../db/schema";
 import { api, createTestContext, resetData, SEEDED, signInAs } from "../../test/harness";
-import { idOf, indiaDay, makeOrder } from "../stock/fixtures";
+import { idOf, indiaDay, makeOrder, postLegacy } from "../stock/fixtures";
 
 const ctx = createTestContext();
 const http = api(ctx);
@@ -22,7 +22,8 @@ const get = async (url: string) => {
 //      Paid to the supplier: deposit ¥1,000 at 12, balance ¥500 at 12.5 (₹18,250); ¥2,750 due in 10 days.
 //      ¥100 paid to the agent: sea freight, never counted or listed.
 // USD  ordered 10 days ago, stage 6: 100 Track pants at $2 = $200. Deposit $50 at 88 (₹4,400); $30 due in 5 days.
-// Guangzhou Textile Co. has a CNY order of its own, which never shows here.
+// Guangzhou Textile Co. has a CNY order of its own, which never shows here. The supplier payments are legacy
+// order-linked rows, posted to the ledger (docs/unified-ledger.md): settled and outstanding are its FIFO projection.
 describe("GET /reports/payments-per-supplier/:supplierId", () => {
   let foshan = "";
   let cny: Awaited<ReturnType<typeof makeOrder>>;
@@ -39,8 +40,8 @@ describe("GET /reports/payments-per-supplier/:supplierId", () => {
         { item: "Cotton fabric", quantity: 500, rateCny: 8 },
       ],
     });
-    usd = await makeOrder(ctx, { supplier: "Foshan Fabrics", stage: 6, lines: [{ item: "Track pants", quantity: 100, rateCny: 2 }] });
-    await ctx.db.update(orders).set({ currency: "USD", orderDate: indiaDay(-10) }).where(eq(orders.id, usd.id));
+    usd = await makeOrder(ctx, { supplier: "Foshan Fabrics", stage: 6, currency: "USD", lines: [{ item: "Track pants", quantity: 100, rateCny: 2 }] });
+    await ctx.db.update(orders).set({ orderDate: indiaDay(-10) }).where(eq(orders.id, usd.id));
     const other = await makeOrder(ctx, { lines: [{ item: "Polo shirts", quantity: 10, rateCny: 30 }] });
     const toFoshan = { payee: "Foshan Fabrics", payeeRole: "supplier" } as const;
     await ctx.db.insert(payments).values([
@@ -52,6 +53,7 @@ describe("GET /reports/payments-per-supplier/:supplierId", () => {
       { ...toFoshan, orderId: usd.id, kind: "Balance", amountCny: 30, status: "due", dueDate: indiaDay(5) },
       { orderId: other.id, kind: "Deposit", payee: "Guangzhou Textile Co.", payeeRole: "supplier", amountCny: 100, rateInr: 12, status: "paid", mode: "Bank", paidOn: indiaDay(-1) },
     ]);
+    await postLegacy(ctx);
   });
 
   it("is 401 signed out and 403 without reports access", async () => {
@@ -102,10 +104,16 @@ describe("GET /reports/payments-per-supplier/:supplierId", () => {
       lineItems: 3,
       products: 2,
       byCurrency: [
-        { currency: "CNY", orders: 1, orderValueCny: 4250, paidCny: 1500, paidInr: 18250, depositsCny: 1000, advanceCny: 0, balanceCny: 2750 },
-        { currency: "USD", orders: 1, orderValueCny: 200, paidCny: 50, paidInr: 4400, depositsCny: 50, advanceCny: 0, balanceCny: 150 },
+        { currency: "CNY", held: false, orders: 1, orderValueCny: 4250, settledCny: 1500, outstandingCny: 2750, creditsCny: 1500, balanceCny: -2750, paidInr: 18250 },
+        { currency: "USD", held: false, orders: 1, orderValueCny: 200, settledCny: 50, outstandingCny: 150, creditsCny: 50, balanceCny: -150, paidInr: 4400 },
       ],
     });
+    // The supplier's ledger, whole: an account per currency and every posting (two debits, three credits).
+    expect(body.ledger.accounts.map((row: { currency: string; balanceCny: number }) => [row.currency, row.balanceCny])).toEqual([
+      ["CNY", -2750],
+      ["USD", -150],
+    ]);
+    expect(body.ledger.entries).toHaveLength(5);
 
     expect(body.payments).toMatchObject({ total: 5, page: 1, pageSize: 10 });
     expect(body.payments.rows.map((row: { amountCny: number }) => row.amountCny)).toEqual([2750, 30, 50, 500, 1000]);
@@ -113,8 +121,12 @@ describe("GET /reports/payments-per-supplier/:supplierId", () => {
       id: expect.any(String),
       orderId: cny.id,
       po: cny.po,
+      supplierId: foshan,
+      supplier: "Foshan Fabrics",
       currency: "CNY",
       kind: "Balance",
+      payee: "Foshan Fabrics",
+      payeeRole: "supplier",
       status: "due",
       paidOn: null,
       dueDate: indiaDay(10),
@@ -122,6 +134,14 @@ describe("GET /reports/payments-per-supplier/:supplierId", () => {
       rateInr: null,
       amountInr: null,
       mode: null,
+      reference: "",
+      notes: "",
+      recordedAt: expect.any(String),
+      voided: false,
+      voidedAt: null,
+      voidedBy: null,
+      voidReason: "",
+      held: false,
     });
     expect(body.payments.rows[2]).toMatchObject({ orderId: usd.id, currency: "USD", status: "paid", paidOn: indiaDay(-5), rateInr: 88, amountInr: 4400, mode: "Wire" });
 
@@ -138,9 +158,11 @@ describe("GET /reports/payments-per-supplier/:supplierId", () => {
       received: 0,
       unit: "pcs",
       orderValueCny: 200,
-      paidCny: 50,
-      advanceCny: 0,
-      balanceCny: 150,
+      held: false,
+      settledCny: 50,
+      outstandingCny: 150,
+      paymentStatus: "partly",
+      settledInr: 4400,
     });
     expect(body.orders.rows[1]).toMatchObject({
       id: cny.id,
@@ -148,7 +170,7 @@ describe("GET /reports/payments-per-supplier/:supplierId", () => {
         { unit: "pcs", quantity: 100 },
         { unit: "m", quantity: 500 },
       ],
-      paidCny: 1500,
+      settledCny: 1500,
     });
 
     expect(body.lines).toMatchObject({ total: 3, page: 1, pageSize: 10 });
@@ -206,9 +228,10 @@ describe("GET /reports/payments-per-supplier/:supplierId", () => {
 //       deposit of 1 @12 paid on day -32 (one insert: the same day and created_at, so the id breaks the tie)
 // Hangzhou Knits: CNY stage 1 (-30) 50 Track pants ¥2 = 100, paid 40 @12 (-32), 60 due (+5), agent 10 @12 (-32); USD stage 3
 // (-12) 10 Kids t-shirts $1.50 = 15, paid 5 @88 (-10). Shenzhen Apparel: CNY stage 2 (-20) 10 Men's jackets ¥50 = 500, no
-// payments. Guangzhou Textile Co.: nothing.
+// payments. Guangzhou Textile Co.: nothing. The payments are legacy order-linked rows, posted to the ledger: its FIFO
+// projection settles each account's oldest order first (docs/unified-ledger.md).
 type PaymentRow = { id: string; orderId: string; currency: Currency; status: string; paidOn: string | null; dueDate: string | null; amountCny: number; amountInr: number | null };
-type OrderRow = { id: string; po: string; stage: number; currency: Currency; orderValueCny: number; paidCny: number; balanceCny: number };
+type OrderRow = { id: string; po: string; stage: number; currency: Currency; orderValueCny: number; settledCny: number; outstandingCny: number };
 type LineRow = { orderLineId: string; orderId: string; po: string; itemId: string; item: string; unit: string; quantity: number; rateCny: number; amountCny: number; currency: Currency };
 const LIST_PAGE = { payments: "paymentsPage", orders: "ordersPage", lines: "linesPage" } as const;
 const round2 = (value: number) => Math.round(value * 100) / 100;
@@ -240,8 +263,8 @@ describe("GET /reports/payments-per-supplier/:supplierId on a larger data set", 
   const ADDRESS = "No. 8 Futian Market, Yiwu";
 
   const order = async (supplier: string, currency: Currency, stage: number, daysAgo: number, lines: { item: string; quantity: number; rateCny: number }[]) => {
-    const made = await makeOrder(ctx, { supplier, stage, lines });
-    await ctx.db.update(orders).set({ currency, orderDate: indiaDay(-daysAgo) }).where(eq(orders.id, made.id));
+    const made = await makeOrder(ctx, { supplier, stage, currency, lines });
+    await ctx.db.update(orders).set({ orderDate: indiaDay(-daysAgo) }).where(eq(orders.id, made.id));
     return made;
   };
   const paid = (orderId: string, kind: "Deposit" | "Balance", amountCny: number, rateInr: number, day: number, payee = "Yiwu Trims Ltd.") =>
@@ -316,6 +339,7 @@ describe("GET /reports/payments-per-supplier/:supplierId on a larger data set", 
     yiwuPayments = ids(inserted.filter(isYiwus));
     foreignPayments = ids(inserted.filter((row) => !isYiwus(row)));
     expect([yiwuPayments.length, foreignPayments.length]).toEqual([17, 5]);
+    await postLegacy(ctx);
   });
 
   it("2: gives every field of the supplier and echoes the period", async () => {
@@ -396,7 +420,7 @@ describe("GET /reports/payments-per-supplier/:supplierId on a larger data set", 
     expect(of(y[4]!)).toMatchObject({ quantities: [{ unit: "pcs", quantity: 20 }], quantity: 20, unit: "pcs" });
   });
 
-  it("7: totals each currency apart: deposits within paid, an overpayment below zero, INR rounded per payment", async () => {
+  it("7: totals each currency apart: FIFO settles the oldest order first, the balance is signed, INR rounded per payment", async () => {
     const { summary } = await get(path(yiwu));
     expect(summary).toEqual({
       orders: 12,
@@ -405,18 +429,24 @@ describe("GET /reports/payments-per-supplier/:supplierId on a larger data set", 
       lineItems: 14,
       products: 6,
       byCurrency: [
-        // The overpaid fixture order (written directly, so without an excess lot) counts 0, never below (0016).
-        { currency: "CNY", orders: 7, orderValueCny: 2090, paidCny: 1734, paidInr: 21308, depositsCny: 604, advanceCny: 0, balanceCny: 386 },
+        // ¥1,734 of credits all go to order 1 (¥1,850, the oldest): ¥116 of it and every newer order still owed.
+        { currency: "CNY", held: false, orders: 7, orderValueCny: 2090, settledCny: 1734, outstandingCny: 356, creditsCny: 1734, balanceCny: -356, paidInr: 21308 },
         // ₹123.57 + ₹123.57 + 3 x ₹12, not round(2 x 10.01 x 12.345) = ₹247.15 + ₹36.
-        { currency: "USD", orders: 4, orderValueCny: 155, paidCny: 23.02, paidInr: 283.14, depositsCny: 23.02, advanceCny: 0, balanceCny: 131.98 },
-        { currency: "INR", orders: 1, orderValueCny: 1500, paidCny: 1000, paidInr: 1000, depositsCny: 1000, advanceCny: 0, balanceCny: 500 },
+        { currency: "USD", held: false, orders: 4, orderValueCny: 155, settledCny: 23.02, outstandingCny: 131.98, creditsCny: 23.02, balanceCny: -131.98, paidInr: 283.14 },
+        { currency: "INR", held: false, orders: 1, orderValueCny: 1500, settledCny: 1000, outstandingCny: 500, creditsCny: 1000, balanceCny: -500, paidInr: 1000 },
       ],
     });
+    // Order 2 was "overpaid" by its own payments; pooled in the account, they settle order 1 first, so order 2 is unpaid
+    // (FIFO, D3). The period scopes the orders, never the account's own figures.
     const overpaid = await get(path(yiwu, `from=${indiaDay(-55)}&to=${indiaDay(-55)}`));
-    // Overpaid: the balance is 0, never below (the excess is the supplier's advance once its lot exists, 0016).
-    expect(overpaid.summary.byCurrency).toEqual([{ currency: "CNY", orders: 1, orderValueCny: 120, paidCny: 150, paidInr: 1800, depositsCny: 100, advanceCny: 0, balanceCny: 0 }]);
-    expect(overpaid.orders.rows).toMatchObject([{ id: y[1]!.id, orderValueCny: 120, paidCny: 150, balanceCny: 0 }]);
-    for (const row of await everyRow<OrderRow>(yiwu, "orders")) expect(row.balanceCny, row.po).toBe(Math.max(0, round2(row.orderValueCny - row.paidCny)));
+    expect(overpaid.summary.byCurrency).toEqual([
+      { currency: "CNY", held: false, orders: 1, orderValueCny: 120, settledCny: 0, outstandingCny: 120, creditsCny: 1734, balanceCny: -356, paidInr: 21308 },
+    ]);
+    expect(overpaid.orders.rows).toMatchObject([{ id: y[1]!.id, orderValueCny: 120, settledCny: 0, outstandingCny: 120, paymentStatus: "unpaid" }]);
+    for (const row of await everyRow<OrderRow>(yiwu, "orders")) {
+      expect(row.outstandingCny, row.po).toBe(round2(row.orderValueCny - row.settledCny));
+      expect(row.outstandingCny, row.po).toBeGreaterThanOrEqual(0);
+    }
     const inr = (await everyRow<PaymentRow>(yiwu, "payments")).filter((row) => row.currency === "INR");
     expect(inr).toMatchObject([{ orderId: y[3]!.id, amountCny: 1000, amountInr: 1000 }]);
   });
@@ -428,20 +458,44 @@ describe("GET /reports/payments-per-supplier/:supplierId on a larger data set", 
     const supplierId = expect.any(String);
     expect(report.suppliers).toEqual([
       // y[4] is a stage-6 fixture without a stocked receipt, so it is open, not finished (closure rule, docs/phase2-contracts.md 1).
-      { supplierId: yiwu, supplier: "Yiwu Trims Ltd.", currency: "CNY", orders: pos(y[11]!, y[9]!, y[7]!, y[5]!, y[4]!, y[1]!, y[0]!), orderValueCny: 2090, paidCny: 1734, paidInr: 21308, advanceCny: 0, balanceCny: 386 },
-      { supplierId, supplier: "Shenzhen Apparel", currency: "CNY", orders: pos(others.shenzhen), orderValueCny: 500, paidCny: 0, paidInr: 0, advanceCny: 0, balanceCny: 500 },
-      { supplierId, supplier: "Hangzhou Knits", currency: "CNY", orders: pos(h1), orderValueCny: 100, paidCny: 40, paidInr: 480, advanceCny: 0, balanceCny: 60 },
-      { supplierId: yiwu, supplier: "Yiwu Trims Ltd.", currency: "USD", orders: pos(y[10]!, y[8]!, y[6]!, y[2]!), orderValueCny: 155, paidCny: 23.02, paidInr: 283.14, advanceCny: 0, balanceCny: 131.98 },
-      { supplierId, supplier: "Hangzhou Knits", currency: "USD", orders: pos(h2), orderValueCny: 15, paidCny: 5, paidInr: 440, advanceCny: 0, balanceCny: 10 },
-      { supplierId: yiwu, supplier: "Yiwu Trims Ltd.", currency: "INR", orders: pos(y[3]!), orderValueCny: 1500, paidCny: 1000, paidInr: 1000, advanceCny: 0, balanceCny: 500 },
+      {
+        supplierId: yiwu,
+        supplier: "Yiwu Trims Ltd.",
+        currency: "CNY",
+        held: false,
+        orders: pos(y[11]!, y[9]!, y[7]!, y[5]!, y[4]!, y[1]!, y[0]!),
+        orderValueCny: 2090,
+        settledCny: 1734,
+        outstandingCny: 356,
+        creditsCny: 1734,
+        balanceCny: -356,
+        paidInr: 21308,
+      },
+      { supplierId, supplier: "Shenzhen Apparel", currency: "CNY", held: false, orders: pos(others.shenzhen), orderValueCny: 500, settledCny: 0, outstandingCny: 500, creditsCny: 0, balanceCny: -500, paidInr: 0 },
+      { supplierId, supplier: "Hangzhou Knits", currency: "CNY", held: false, orders: pos(h1), orderValueCny: 100, settledCny: 40, outstandingCny: 60, creditsCny: 40, balanceCny: -60, paidInr: 480 },
+      {
+        supplierId: yiwu,
+        supplier: "Yiwu Trims Ltd.",
+        currency: "USD",
+        held: false,
+        orders: pos(y[10]!, y[8]!, y[6]!, y[2]!),
+        orderValueCny: 155,
+        settledCny: 23.02,
+        outstandingCny: 131.98,
+        creditsCny: 23.02,
+        balanceCny: -131.98,
+        paidInr: 283.14,
+      },
+      { supplierId, supplier: "Hangzhou Knits", currency: "USD", held: false, orders: pos(h2), orderValueCny: 15, settledCny: 5, outstandingCny: 10, creditsCny: 5, balanceCny: -10, paidInr: 440 },
+      { supplierId: yiwu, supplier: "Yiwu Trims Ltd.", currency: "INR", held: false, orders: pos(y[3]!), orderValueCny: 1500, settledCny: 1000, outstandingCny: 500, creditsCny: 1000, balanceCny: -500, paidInr: 1000 },
     ]);
-    const cny = { orders: 9, orderValueCny: 2690, paidCny: 1774, paidInr: 21788, advanceCny: 0, balanceCny: 946 };
+    const cny = { orders: 9, orderValueCny: 2690, settledCny: 1774, outstandingCny: 916, balanceCny: -916, payableCny: 916, availableCny: 0, paidInr: 21788 };
     expect(report).toMatchObject({
       totals: cny,
       totalsByCurrency: [
         { currency: "CNY", ...cny },
-        { currency: "USD", orders: 5, orderValueCny: 170, paidCny: 28.02, paidInr: 723.14, advanceCny: 0, balanceCny: 141.98 },
-        { currency: "INR", orders: 1, orderValueCny: 1500, paidCny: 1000, paidInr: 1000, advanceCny: 0, balanceCny: 500 },
+        { currency: "USD", orders: 5, orderValueCny: 170, settledCny: 28.02, outstandingCny: 141.98, balanceCny: -141.98, payableCny: 141.98, availableCny: 0, paidInr: 723.14 },
+        { currency: "INR", orders: 1, orderValueCny: 1500, settledCny: 1000, outstandingCny: 500, balanceCny: -500, payableCny: 500, availableCny: 0, paidInr: 1000 },
       ],
       dueNext30Cny: 410,
       dueNext30ByCurrency: [
@@ -465,12 +519,12 @@ describe("GET /reports/payments-per-supplier/:supplierId on a larger data set", 
         {
           orders: inCurrency.map((order) => order.po).sort(),
           orderValueCny: sum(inCurrency.map((order) => order.orderValueCny)),
-          paidCny: sum(inCurrency.map((order) => order.paidCny)),
+          settledCny: sum(inCurrency.map((order) => order.settledCny)),
           paidInr: sum(paymentRows.filter((p) => orderIds.has(p.orderId) && p.status === "paid").map((p) => p.amountInr ?? 0)),
-          balanceCny: sum(inCurrency.map((order) => order.balanceCny)),
+          outstandingCny: sum(inCurrency.map((order) => order.outstandingCny)),
         },
         row.currency,
-      ).toEqual({ orders: [...row.orders].sort(), orderValueCny: row.orderValueCny, paidCny: row.paidCny, paidInr: row.paidInr, balanceCny: row.balanceCny });
+      ).toEqual({ orders: [...row.orders].sort(), orderValueCny: row.orderValueCny, settledCny: row.settledCny, paidInr: row.paidInr, outstandingCny: row.outstandingCny });
     }
   });
 
@@ -538,10 +592,10 @@ describe("GET /reports/payments-per-supplier/:supplierId on a larger data set", 
       payments: 0,
       lineItems: 1,
       products: 1,
-      byCurrency: [{ currency: "CNY", orders: 1, orderValueCny: 500, paidCny: 0, paidInr: 0, depositsCny: 0, advanceCny: 0, balanceCny: 500 }],
+      byCurrency: [{ currency: "CNY", held: false, orders: 1, orderValueCny: 500, settledCny: 0, outstandingCny: 500, creditsCny: 0, balanceCny: -500, paidInr: 0 }],
     });
     expect(shenzhen.payments).toEqual({ rows: [], total: 0, page: 1, pageSize: 10 });
-    expect(shenzhen.orders.rows).toMatchObject([{ id: others.shenzhen.id, paidCny: 0, balanceCny: 500 }]);
+    expect(shenzhen.orders.rows).toMatchObject([{ id: others.shenzhen.id, settledCny: 0, outstandingCny: 500, paymentStatus: "unpaid" }]);
     expect(shenzhen.lines.rows).toMatchObject([{ orderLineId: others.shenzhen.lineIds[0], item: "Men's jackets" }]);
 
     const empty = { rows: [], total: 0, page: 1, pageSize: 10 };

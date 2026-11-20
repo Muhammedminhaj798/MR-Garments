@@ -1,4 +1,4 @@
-import { and, asc, desc, eq, gt, inArray, isNull, lt, notInArray, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, inArray, isNull, lt, notInArray, or, sql } from "drizzle-orm";
 import { alias } from "drizzle-orm/pg-core";
 import { Router } from "express";
 import { z } from "zod";
@@ -24,8 +24,8 @@ import { loadLandedCosts } from "../costs/landed-cost";
 import type { RouteContext } from "../context";
 import { notify } from "../notifications/notify";
 import { atLeast, effectiveAccess } from "../../permissions/matrix";
+import { balancesOf, cents, fromCents, type Ledger, loadLedger } from "../ledger/ledger";
 import { round2, unitSymbol } from "../orders/orders.routes";
-import { supplierMoney } from "../reports/reports";
 import { moveOrdersToStage, settleStages } from "../stages-shared";
 import {
   canSeeCost,
@@ -110,48 +110,39 @@ const teamOptions = (db: RouteContext["db"], extra: string[] = []) =>
 
 /**
  * Previous supplier outstanding, shown beside the cost so far but never part of it: per supplier of the trip's orders,
- * the unpaid balance of its orders placed before the trip (order date before the trip's `loadedOn`, so same-day orders
- * are out) other than the trip's own POs: order value - paid supplier payments - supplier advance applied (the Payments per supplier rule), per
- * order currency and never converted. Fully paid and overpaid orders are left out. Two queries, none per order.
+ * the outstanding (the ledger's FIFO projection, docs/unified-ledger.md) of its orders placed before the trip (order
+ * date before the trip's `loadedOn`, so same-day orders are out) other than the trip's own POs, per order currency and
+ * never converted, with the supplier's signed ledger balance beside it. Settled orders and held accounts are left out.
  */
-async function previousOutstanding(db: Database, orderIds: string[], tripDate: string) {
+async function previousOutstanding(db: Database, orderIds: string[], tripDate: string, ledger: Ledger) {
   if (orderIds.length === 0) return [];
   const tripSuppliers = db.select({ id: orders.supplierId }).from(orders).where(inArray(orders.id, orderIds));
-  const perOrder = db
-    .select({
-      supplierId: orders.supplierId,
-      currency: orders.currency,
-      // Less the supplier advance applied too (docs/supplier-advance.md): money the supplier already has.
-      balance: sql<number>`${supplierMoney.orderValueCny} - ${supplierMoney.paidCny} - ${supplierMoney.advanceCny}`.as("balance"),
-    })
-    .from(orders)
-    .where(and(inArray(orders.supplierId, tripSuppliers), notInArray(orders.id, orderIds), lt(orders.orderDate, tripDate)))
-    .as("per_order");
-  const [owners, owed] = await Promise.all([
+  const [owners, earlier] = await Promise.all([
     db
       .select({ id: suppliers.id, name: suppliers.name, currency: suppliers.currency })
       .from(suppliers)
       .where(inArray(suppliers.id, tripSuppliers))
       .orderBy(asc(suppliers.name)),
     db
-      .select({
-        supplierId: perOrder.supplierId,
-        currency: perOrder.currency,
-        amount: sql<number>`sum(${perOrder.balance})`.mapWith(Number),
-        orders: sql<number>`count(*)`.mapWith(Number),
-      })
-      .from(perOrder)
-      .where(gt(perOrder.balance, 0))
-      .groupBy(perOrder.supplierId, perOrder.currency),
+      .select({ id: orders.id, supplierId: orders.supplierId, currency: orders.currency })
+      .from(orders)
+      .where(and(inArray(orders.supplierId, tripSuppliers), notInArray(orders.id, orderIds), lt(orders.orderDate, tripDate))),
   ]);
   return owners.map((owner) => {
-    const rows = owed.filter((row) => row.supplierId === owner.id);
+    const owing = earlier
+      .filter((row) => row.supplierId === owner.id)
+      .map((row) => ({ ...row, outstanding: ledger.order(row.id)?.held ? 0 : (ledger.order(row.id)?.outstandingCny ?? 0) }))
+      .filter((row) => row.outstanding > 0);
     return {
       supplierId: owner.id,
       supplier: owner.name,
       currency: owner.currency,
-      orders: rows.reduce((total, row) => total + row.orders, 0),
-      byCurrency: orderedCurrencies(rows.map((row) => row.currency)).flatMap((currency) => rows.filter((row) => row.currency === currency).map((row) => ({ currency, amount: round2(row.amount) }))),
+      orders: owing.length,
+      byCurrency: orderedCurrencies(owing.map((row) => row.currency)).map((currency) => ({
+        currency,
+        amount: fromCents(owing.filter((row) => row.currency === currency).reduce((total, row) => total + cents(row.outstanding), 0)),
+      })),
+      ledgerBalance: balancesOf(ledger, owner.id),
     };
   });
 }
@@ -341,6 +332,9 @@ export function warehouseRoutes({ db }: RouteContext) {
     const orderIds = [...new Set(goods.map((line) => line.orderId))];
     // Supplier money: only for users who see the cost and payments (Management today).
     const seesOwed = canSeeCost(req.user!) && atLeast(effectiveAccess(req.user!.role, req.user!.stages, "payments"), "View");
+    // The ledger of the trip's suppliers, once: the goods cost and the previous outstanding both read it.
+    const owners = orderIds.length && canSeeCost(req.user!) ? await db.select({ id: orders.supplierId }).from(orders).where(inArray(orders.id, orderIds)) : [];
+    const ledger = canSeeCost(req.user!) ? await loadLedger(db, { supplierIds: [...new Set(owners.map((row) => row.id))] }) : null;
     const [teamList, warehouses, costs, ordered, owed] = await Promise.all([
       teamOptions(db, [...new Set(savedLines.map((line) => line.teamId))]),
       db
@@ -348,14 +342,14 @@ export function warehouseRoutes({ db }: RouteContext) {
         .from(locations)
         .where(or(and(eq(locations.type, "Warehouse"), eq(locations.status, "Active")), saved ? eq(locations.id, saved.locationId) : undefined))
         .orderBy(asc(locations.createdAt), asc(locations.name)),
-      canSeeCost(req.user!) ? loadLandedCosts(db, orderIds) : null,
+      ledger ? loadLandedCosts(db, orderIds, ledger) : null,
       orderIds.length
         ? db
             .select({ pieces: sql<number>`coalesce(sum(${orderLines.quantity}), 0)`.mapWith(Number) })
             .from(orderLines)
             .where(inArray(orderLines.orderId, orderIds))
         : [{ pieces: 0 }],
-      seesOwed ? previousOutstanding(db, orderIds, tripDate) : null,
+      seesOwed ? previousOutstanding(db, orderIds, tripDate, ledger!) : null,
     ]);
 
     // Cost so far: the landed cost of the orders in this container, added up; null parts stay null until one exists.

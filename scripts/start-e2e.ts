@@ -14,5 +14,13 @@ process.env.SEED_DEV_PASSWORD = password;
 
 const settings = config();
 await resetDatabase(settings.DATABASE_URL, { nodeEnv: "test", devPassword: password });
+// A freshly seeded browser-test database has no history to reconcile, so its ledger is open (docs/unified-ledger.md).
+{
+  const { createDatabase } = await import("../src/db/client");
+  const { sql } = await import("drizzle-orm");
+  const fresh = createDatabase(settings.DATABASE_URL);
+  await fresh.db.execute(sql`update ledger_state set state = 'live', note = 'browser-test reset'`);
+  await fresh.pool.end();
+}
 console.info(`Browser-test database ${databaseName(settings.DATABASE_URL)} reset and seeded.`);
 await import("../src/server");

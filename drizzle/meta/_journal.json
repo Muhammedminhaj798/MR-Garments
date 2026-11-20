@@ -120,6 +120,13 @@
       "when": 1795002191499,
       "tag": "0016_supplier_excess",
       "breakpoints": true
+    },
+    {
+      "idx": 17,
+      "version": "7",
+      "when": 1795155384570,
+      "tag": "0017_supplier_ledger",
+      "breakpoints": true
     }
   ]
 }

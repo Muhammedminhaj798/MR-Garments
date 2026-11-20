@@ -1,5 +1,8 @@
 # Supplier advance account (migration 0014)
 
+> **Superseded by the unified supplier ledger (migration 0017): see `docs/unified-ledger.md`.** The advance entries
+> below are a read-only archive (ADV-1); ADV-2, ADV-3 and ADV-4 answer 410, and supplier payments go to the ledger.
+
 Money the client has already paid a supplier before any order exists is recorded as an **advance**. New orders for that
 supplier use it automatically. MR Garments only records it; nothing moves money.
 

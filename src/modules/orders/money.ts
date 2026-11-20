@@ -1,45 +1,29 @@
 import { type SQL, sql } from "drizzle-orm";
 
-import { orderLines, orders, payments, supplierAdvanceEntries as advances } from "../../db/schema";
+import { orderLines, orders, payments } from "../../db/schema";
+import { cents, depositMilestone, fromCents, type OrderSettlement, settlementFields } from "../ledger/ledger";
 
-// The money of the order in the row (`orders.id`), as correlated subqueries: the one place the payee rules live
-// (docs/phase2-fixes.md section 1). Every list, detail, report and statement reads these, so a figure called the same
-// thing is the same figure everywhere. Agent payments are sea freight (docs/wave3-contracts.md 6.2): they count in
-// `paidCny`/`paidInr` (what left the company for the order) and never in the supplier figures, the balance or the
-// deposit against what the supplier asked for.
+// The money of the order in the row (`orders.id`), as correlated subqueries. Supplier money is the unified ledger's
+// (docs/unified-ledger.md): every order's settled, outstanding and payment status come from the FIFO projection
+// (`loadLedger`), never from payments named on the order. What stays here is the order's value, its shipping-agent
+// payments (sea freight: never in the ledger) and its due rows. A voided payment counts in none of them.
 //
 // The fragments correlate on `orders.id`, so they belong in a select FROM orders that has at least one join (in a
 // single-table select drizzle drops the table name from the outer columns and the inner table would shadow them).
 
 export const round2 = (value: number) => Math.round(value * 100) / 100;
 
-const ofOrder = sql`${payments.orderId} = ${orders.id}`;
-const paid = sql`${ofOrder} and ${payments.status} = 'paid'`;
-/** Payments of the order to its supplier, paid or due. */
-export const toSupplier = sql`${ofOrder} and ${payments.payeeRole} = 'supplier'`;
-const paidToSupplier = sql`${paid} and ${payments.payeeRole} = 'supplier'`;
+// A voided payment counts nowhere; nor does any payment of a held account (D4: listed as a record, in no figure).
+const notHeld = sql`not exists (select 1 from supplier_ledger_holds h where h.supplier_id = ${orders.supplierId} and h.currency = ${orders.currency})`;
+const ofOrder = sql`${payments.orderId} = ${orders.id} and ${payments.voidedAt} is null and ${notHeld}`;
+const paidToAgent = sql`${ofOrder} and ${payments.payeeRole} = 'agent' and ${payments.status} = 'paid'`;
+/** Due (not yet paid) supplier payments of the order, not voided. */
+export const dueToSupplier = sql`${ofOrder} and ${payments.payeeRole} = 'supplier' and ${payments.status} = 'due'`;
 
 const sumCny = (where: SQL) => sql<number>`(select coalesce(sum(${payments.amountCny}), 0) from ${payments} where ${where})`.mapWith(Number);
 /** INR is amountCny * rateInr rounded to 2 decimals per payment, then summed (the same paisa on every screen). */
 const sumInr = (where: SQL) =>
   sql<number>`(select coalesce(sum(round(${payments.amountCny} * ${payments.rateInr}, 2)), 0) from ${payments} where ${where})`.mapWith(Number);
-
-// The supplier advance applied to the order (docs/supplier-advance.md): its allocations less their reversals, each at
-// the rate of the advance it came from. Never a payment: the balance, payment status and the deposit against what the
-// supplier asked for count it beside the supplier payments, once.
-const advanceOfOrder = sql`${advances.orderId} = ${orders.id} and ${advances.kind} in ('allocation', 'reversal')`;
-const appliedSign = sql`case when ${advances.kind} = 'allocation' then 1 else -1 end`;
-const advanceCny = sql<number>`(select coalesce(sum(${appliedSign} * ${advances.amount}), 0) from ${advances} where ${advanceOfOrder})`.mapWith(Number);
-const advanceInr = sql<number>`(select coalesce(sum(${appliedSign} * round(${advances.amount} * ${advances.exchangeRate}, 2)), 0) from ${advances} where ${advanceOfOrder})`.mapWith(Number);
-
-// The order's excess (0016, docs/supplier-advance.md): its paid supplier payments beyond its value, moved to the
-// supplier's available advance (excess lots less their returns), at each payment's own rate. It is taken off every
-// "paid" figure below, so the money counts once: on this order up to its value, and as advance wherever it is applied.
-const excessOfOrder = sql`${advances.orderId} = ${orders.id} and ${advances.kind} in ('excess', 'excess_return')`;
-const excessSign = sql`case when ${advances.kind} = 'excess' then 1 else -1 end`;
-const excessCny = sql<number>`(select coalesce(sum(${excessSign} * ${advances.amount}), 0) from ${advances} where ${excessOfOrder})`.mapWith(Number);
-const excessInr = sql<number>`(select coalesce(sum(${excessSign} * round(${advances.amount} * ${advances.exchangeRate}, 2)), 0) from ${advances} where ${excessOfOrder})`.mapWith(Number);
-const less = (figure: SQL, minus: SQL) => sql<number>`(${figure} - ${minus})`.mapWith(Number);
 
 // Each correlation is its own fragment, nested: drizzle keeps a nested fragment's table names, but drops them from a
 // single-table select's top-level columns (so an inlined `orders.id` would become the subquery's own `id`).
@@ -47,52 +31,44 @@ const linesOfOrder = sql`${orderLines.orderId} = ${orders.id}`;
 
 export const orderMoney = {
   orderValueCny: sql<number>`(select round(coalesce(sum(${orderLines.quantity} * ${orderLines.rateCny}), 0), 2) from ${orderLines} where ${linesOfOrder})`.mapWith(Number),
-  /** Every paid payment, agents included, less the order's excess (paid toward this order). */
-  paidCny: less(sumCny(paid), excessCny),
-  paidInr: less(sumInr(paid), excessInr),
-  /** Paid to the supplier toward this order (less its excess): the order's balance, payment status and deposit figures read these. */
-  supplierPaidCny: less(sumCny(paidToSupplier), excessCny),
-  supplierPaidInr: less(sumInr(paidToSupplier), excessInr),
-  /** Supplier payments beyond the order's value, moved to the supplier's available advance (0016), and their INR. */
-  excessCny,
-  excessInr,
-  /** The supplier advance applied to the order (not a payment), and its INR at each advance's own rate. */
-  advanceCny,
-  advanceInr,
-  /** Paid supplier deposits plus the advance applied: what counts against `orders.deposit_required_cny`. */
-  depositPaidCny: sql<number>`(${sumCny(sql`${paidToSupplier} and ${payments.kind} = 'Deposit'`)} + ${advanceCny})`.mapWith(Number),
+  /** Paid to shipping agents for the order: sea freight (landed cost), never the supplier's money. */
+  agentPaidCny: sumCny(paidToAgent),
+  agentPaidInr: sumInr(paidToAgent),
   /** The earliest due payment, or null. */
   nextDue: sql<string | null>`(select min(${payments.dueDate})::text from ${payments} where ${ofOrder} and ${payments.status} = 'due')`,
 };
 
-/** 13.5's names for the supplier-only figures (Payments per supplier, its detail, the order reports, warehouse outstanding). */
-export const supplierMoney = {
-  orderValueCny: orderMoney.orderValueCny,
-  paidCny: orderMoney.supplierPaidCny,
-  paidInr: orderMoney.supplierPaidInr,
-  advanceCny: orderMoney.advanceCny,
-  advanceInr: orderMoney.advanceInr,
-  excessCny: orderMoney.excessCny,
-  excessInr: orderMoney.excessInr,
-};
-
 /**
- * What the supplier is still owed: the order value less supplier payments toward it and the advance applied (one rule,
- * every screen); never below 0, as anything paid beyond the value is the supplier's advance (0016).
+ * The order's money for a response from its settlement (FIFO projection) and its own figures: SettlementFields,
+ * MilestoneFields, the agent payments and `paidInr` = goods INR (settledInr) + agent INR, null while settledInr is.
  */
-export const balanceOf = (row: { orderValueCny: number; paidCny: number; advanceCny: number }) => Math.max(0, round2(row.orderValueCny - row.paidCny - row.advanceCny));
+export function orderSettlement(settlement: OrderSettlement | undefined, row: { depositRequiredCny: number | null; agentPaidCny: number; agentPaidInr: number }) {
+  const figures = settlementFields(settlement);
+  // A held account's order (D4) carries no money figure at all, its sea freight included.
+  const held = settlement?.held ?? false;
+  return {
+    ...figures,
+    ...depositMilestone(row.depositRequiredCny, settlement),
+    agentPaidCny: held ? null : row.agentPaidCny,
+    agentPaidInr: held ? null : row.agentPaidInr,
+    paidInr: figures.settledInr === null ? null : fromCents(cents(figures.settledInr) + cents(row.agentPaidInr)),
+  };
+}
 
-export const DEPOSIT_STATUSES = ["none", "due", "partly", "paid"] as const;
-export type DepositStatus = (typeof DEPOSIT_STATUSES)[number];
-
-/**
- * The order's deposit against what the supplier asked for (0009): `none` when no deposit was agreed; otherwise `due`
- * (nothing paid yet), `partly`, or `paid` (paid supplier deposits reach the requirement; more is kept as paid, never
- * as a negative pending). Pure, so the lists, the detail, the Deposits page and the report agree.
- */
-export function depositState(required: number | null, paid: number) {
-  if (required === null) return { depositRequiredCny: null, depositPaidCny: paid, depositPendingCny: null, depositStatus: "none" as DepositStatus };
-  const pending = Math.max(0, round2(required - paid));
-  const depositStatus: DepositStatus = paid <= 0 ? "due" : pending === 0 ? "paid" : "partly";
-  return { depositRequiredCny: required, depositPaidCny: paid, depositPendingCny: pending, depositStatus };
+/** The same fields for a user without payments View: money null; the order's held flag and deposit term stay. */
+export function hiddenSettlement(held: boolean, depositRequiredCny: number | null) {
+  return {
+    held,
+    settledCny: null,
+    outstandingCny: null,
+    paymentStatus: null,
+    settledInr: null,
+    depositRequiredCny,
+    depositSettledCny: null,
+    depositPendingCny: null,
+    depositStatus: depositRequiredCny === null ? ("none" as const) : null,
+    agentPaidCny: null,
+    agentPaidInr: null,
+    paidInr: null,
+  };
 }

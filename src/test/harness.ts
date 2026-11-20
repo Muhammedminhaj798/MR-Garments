@@ -53,6 +53,8 @@ export async function resetData(ctx: TestContext) {
   await seed(ctx.db, { nodeEnv: "test" });
   const hash = await hashPassword(TEST_PASSWORD);
   await ctx.db.update(users).set({ passwordHash: hash, passwordChangedAt: new Date() });
+  // A fresh test database has no history to reconcile: the ledger is open (docs/unified-ledger.md, write-state guard).
+  await ctx.db.execute(sql`update ledger_state set state = 'live', note = 'test reset'`);
 }
 
 /** Supertest with the headers a same-site browser request carries (B9.8). */
@@ -64,7 +66,7 @@ export function api(ctx: TestContext) {
     post: (path: string, body: object = {}) => agent.post(`/api/v1${path}`).set("Origin", origin).send(body),
     patch: (path: string, body: object = {}) => agent.patch(`/api/v1${path}`).set("Origin", origin).send(body),
     put: (path: string, body: object = {}) => agent.put(`/api/v1${path}`).set("Origin", origin).send(body),
-    delete: (path: string) => agent.delete(`/api/v1${path}`).set("Origin", origin).send({}),
+    delete: (path: string, body: object = {}) => agent.delete(`/api/v1${path}`).set("Origin", origin).send(body),
   };
 }
 

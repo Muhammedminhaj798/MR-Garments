@@ -1,19 +1,21 @@
+import { randomUUID } from "node:crypto";
+
 import { eq } from "drizzle-orm";
 import { afterAll, beforeEach, describe, expect, it } from "vitest";
 
-import { items, locations, notifications, orders, payments, receipts, supplierAdvanceEntries, suppliers, users } from "../../db/schema";
+import { items, locations, notifications, orders, payments, receipts, shippingAgents, supplierLedgerEntries, suppliers, users } from "../../db/schema";
 import { api, createTestContext, resetData, SEEDED, signInAs } from "../../test/harness";
 import { MESSAGES } from "./orders.routes";
 
 // ORD-5 `po`: renumbering an order (docs/contracts.md ORD-5). The order keeps its id, so everything linked to it by id
-// follows; notification links follow the new number; the advance ledger shows it while keeping its stored number.
+// follows; notification links follow the new number; the supplier ledger shows it while keeping its stored number.
 
 const ctx = createTestContext();
 const http = api(ctx);
 afterAll(() => ctx.pool.end());
 
 let management = "";
-let ids: { supplier: string; jeans: string; office: string; userId: string };
+let ids: { supplier: string; jeans: string; office: string; userId: string; sino: string };
 beforeEach(async () => {
   await resetData(ctx);
   management = await signInAs(ctx, SEEDED.management);
@@ -23,8 +25,15 @@ beforeEach(async () => {
     jeans: await idOf(items, "Denim jeans"),
     office: await idOf(locations, "Guangzhou office"),
     userId: (await ctx.db.select({ id: users.id }).from(users).where(eq(users.email, SEEDED.management)))[0]!.id,
+    sino: (await ctx.db.select({ id: shippingAgents.id }).from(shippingAgents).where(eq(shippingAgents.name, "Sino Freight")))[0]!.id,
   };
 });
+/** PAY-2: a shipping-agent payment on the order (order-linked, sea freight). */
+const payAgent = (orderId: string, amountCny: number) =>
+  http
+    .post("/payments")
+    .send({ orderId, payeeRole: "agent", agentId: ids.sino, kind: "Balance", amountCny, paidOn: "2026-10-21", rateInr: 12, mode: "Bank transfer", clientRequestId: randomUUID() })
+    .set("Cookie", management);
 
 /** ORD-3: jeans 100 x 10 (¥1,000), with an optional typed PO. */
 async function createOrder(po?: string) {
@@ -131,46 +140,40 @@ describe("ORD-5 po: renumbering an order", () => {
     expect((await ctx.db.select({ id: orders.id }).from(orders).where(eq(orders.poNumber, "PO-BOTH"))).length).toBe(1);
   });
 
-  it("keeps payments, receipts, the supplier advance and its ledger linked by id, with every amount unchanged", async () => {
-    // A supplier advance (ADV-2) drawn by the next order (ORD-3), a supplier payment (PAY-2) and a receipt.
-    const advance = await http
-      .post(`/suppliers/${ids.supplier}/advances`)
-      .send({ amount: 300, paidOn: "2026-10-19", rateInr: 12.5, mode: "Bank transfer" })
-      .set("Cookie", management);
-    expect(advance.status, JSON.stringify(advance.body)).toBe(201);
-    const order = await createOrder();
+  it("keeps payments, receipts and the supplier ledger linked by id, with every amount unchanged", async () => {
+    // A supplier payment (PAY-2, against the supplier), an agent payment on the order and a receipt.
     const paid = await http
       .post("/payments")
-      .send({ orderId: order.id, kind: "Deposit", payeeRole: "supplier", amountCny: 200, paidOn: "2026-10-21", rateInr: 12, mode: "Bank transfer" })
+      .send({ supplierId: ids.supplier, amount: 300, paidOn: "2026-10-19", rateInr: 12.5, mode: "Bank transfer", clientRequestId: randomUUID() })
       .set("Cookie", management);
     expect(paid.status, JSON.stringify(paid.body)).toBe(201);
+    const order = await createOrder();
+    const freight = await payAgent(order.id, 200);
+    expect(freight.status, JSON.stringify(freight.body)).toBe(201);
     const receipt = (await ctx.db.insert(receipts).values({ orderId: order.id, receivedOn: "2026-10-26", locationId: ids.office, receivedBy: ids.userId, bundles: 2 }).returning())[0]!;
     const before = (await get(`/orders/${order.po}`)).body;
-    const ledgerBefore = await ctx.db.select().from(supplierAdvanceEntries).orderBy(supplierAdvanceEntries.createdAt);
+    const ledgerBefore = await ctx.db.select().from(supplierLedgerEntries).orderBy(supplierLedgerEntries.createdAt);
     const paymentsBefore = await ctx.db.select().from(payments);
 
     expect((await edit(order.po, { po: "PO-RENAMED" })).status).toBe(200);
 
     const after = (await get("/orders/PO-RENAMED")).body;
-    for (const key of ["id", "orderValueCny", "paidCny", "paidInr", "supplierPaidCny", "advanceCny", "advanceInr", "balanceCny", "depositPaidCny"]) expect(after[key], key).toEqual(before[key]);
-    expect(after.payments.map((p: { id: string }) => p.id)).toEqual([paid.body.payment.id]);
+    for (const key of ["id", "orderValueCny", "settledCny", "settledInr", "outstandingCny", "paymentStatus", "agentPaidCny", "paidInr", "slices", "supplierAccount"]) expect(after[key], key).toEqual(before[key]);
+    expect(after.payments.map((p: { id: string; po: string }) => [p.id, p.po])).toEqual([[freight.body.payment.id, "PO-RENAMED"]]);
     expect(after.receipts.map((r: { id: string }) => r.id)).toEqual([receipt.id]);
-    expect(after.advanceCny).toBe(300);
+    expect(after.settledCny).toBe(300);
     // The ledger shows the order's current number; its stored rows (and every payment row) are untouched.
-    expect(after.advanceEntries.map((e: { po: string; orderId: string }) => [e.po, e.orderId])).toEqual([["PO-RENAMED", order.id]]);
-    expect(await ctx.db.select().from(supplierAdvanceEntries).orderBy(supplierAdvanceEntries.createdAt)).toEqual(ledgerBefore);
+    expect(await ctx.db.select().from(supplierLedgerEntries).orderBy(supplierLedgerEntries.createdAt)).toEqual(ledgerBefore);
+    expect(ledgerBefore.find((row) => row.entryType === "order_debit")!.poNumber).toBe(order.po);
     expect(await ctx.db.select().from(payments)).toEqual(paymentsBefore);
-    const account = (await get(`/suppliers/${ids.supplier}/advances`)).body;
-    expect(account.entries.filter((e: { kind: string }) => e.kind === "allocation").map((e: { po: string }) => e.po)).toEqual(["PO-RENAMED"]);
+    const statement = (await get(`/suppliers/${ids.supplier}/ledger`)).body;
+    expect(statement.entries.filter((e: { entryType: string }) => e.entryType === "order_debit").map((e: { po: string; orderId: string }) => [e.po, e.orderId])).toEqual([["PO-RENAMED", order.id]]);
     expect((await get(`/reports/payments-per-supplier/${ids.supplier}`)).body.orders.rows.map((r: { po: string }) => r.po)).toEqual(["PO-RENAMED"]);
   });
 
   it("points notification links to the order at the new number, keeping their titles", async () => {
     const order = await createOrder();
-    const paid = await http
-      .post("/payments")
-      .send({ orderId: order.id, kind: "Balance", payeeRole: "supplier", amountCny: 100, paidOn: "2026-10-21", rateInr: 12, mode: "Bank transfer" })
-      .set("Cookie", management);
+    const paid = await payAgent(order.id, 100);
     expect(paid.status).toBe(201);
     const other = await createOrder();
     await ctx.db.insert(notifications).values([
@@ -196,19 +199,19 @@ describe("ORD-5 po: renumbering an order", () => {
     expect(payment.every((link) => link.href === "/orders/PO%20A%26B/payments")).toBe(true);
   });
 
-  it("writes new advance entries under the new number when the lines change in the same edit", async () => {
-    const advance = await http.post(`/suppliers/${ids.supplier}/advances`).send({ amount: 5000, paidOn: "2026-10-19", rateInr: 12.5, mode: "Bank transfer" }).set("Cookie", management);
-    expect(advance.status).toBe(201);
+  it("posts the value change under the new number when the lines change in the same edit", async () => {
     const order = await createOrder();
     const lines = (await get(`/orders/${order.po}`)).body.lines as { id: string }[];
     const res = await edit(order.po, { po: "PO-BIGGER", lines: [{ id: lines[0]!.id, itemId: ids.jeans, quantity: 200, rateCny: 10 }] });
     expect(res.status, JSON.stringify(res.body)).toBe(200);
-    expect(res.body.advance).toMatchObject({ appliedCny: 2000, changeCny: 1000 });
-    const stored = await ctx.db.select({ kind: supplierAdvanceEntries.kind, po: supplierAdvanceEntries.poNumber }).from(supplierAdvanceEntries).orderBy(supplierAdvanceEntries.createdAt);
+    expect(res.body.ledger).toMatchObject({ changeCny: -1000, balanceBefore: -1000, balanceAfter: -2000 });
+    const stored = await ctx.db
+      .select({ type: supplierLedgerEntries.entryType, po: supplierLedgerEntries.poNumber })
+      .from(supplierLedgerEntries)
+      .orderBy(supplierLedgerEntries.createdAt);
     expect(stored).toEqual([
-      { kind: "receipt", po: "" },
-      { kind: "allocation", po: order.po },
-      { kind: "allocation", po: "PO-BIGGER" },
+      { type: "order_debit", po: order.po },
+      { type: "order_adjustment", po: "PO-BIGGER" },
     ]);
   });
 });

@@ -1,7 +1,23 @@
+import { randomUUID } from "node:crypto";
+
 import { asc, eq, sql } from "drizzle-orm";
 import { afterAll, beforeEach, describe, expect, it } from "vitest";
 
-import { containerLines, containers, items, locations, orderLines, orders, payments, receiptLines, receipts, shippingAgents, suppliers, users } from "../../db/schema";
+import {
+  containerLines,
+  containers,
+  items,
+  locations,
+  orderLines,
+  orders,
+  payments,
+  receiptLines,
+  receipts,
+  shippingAgents,
+  supplierLedgerEntries,
+  suppliers,
+  users,
+} from "../../db/schema";
 import { api, createTestContext, resetData, SEEDED, signInAs } from "../../test/harness";
 import { MESSAGES } from "./orders.routes";
 
@@ -57,7 +73,8 @@ async function createOrder(overrides: object = {}) {
   const order = res.body.order as { id: string; po: string };
   return { ...order, lines: await linesOf(order.id) };
 }
-const deposit = (amountCny: number) => ({ payee: "Guangzhou Textile Co.", payeeRole: "supplier", amountCny, paidOn: "2026-10-21", rateInr: 11.8, mode: "Bank transfer" });
+/** An ORD-3 deposit: shipping-agent money only (docs/unified-ledger.md). */
+const deposit = (amountCny: number) => ({ payee: "Sino Freight", payeeRole: "agent", amountCny, paidOn: "2026-10-21", rateInr: 11.8, mode: "Bank transfer" });
 const edit = (po: string, body: object, cookie = management) => http.patch(`/orders/${po}`, body).set("Cookie", cookie);
 const remove = (po: string, cookie = management) => http.delete(`/orders/${po}`).set("Cookie", cookie);
 const setStage = (orderId: string, stage: number) => ctx.db.update(orders).set({ stage }).where(eq(orders.id, orderId));
@@ -120,10 +137,10 @@ describe("ORD-5 PATCH /orders/:po", () => {
       ],
     });
     expect(res.status, JSON.stringify(res.body)).toBe(200);
-    // A lines edit also answers with the supplier advance re-settled (docs/supplier-advance.md); none here.
+    // A lines edit also answers with the value change posted to the supplier's ledger (docs/unified-ledger.md).
     expect(res.body).toEqual({
       order: { id: order.id, po: order.po, stage: 1, orderDate: "2026-10-22", deliveryDate: "2026-12-15", terms: null },
-      advance: { appliedCny: 0, changeCny: 0, availableCny: 0, balanceCny: 11800, excessCny: 0, status: "none" },
+      ledger: { supplierId: ids.supplier, currency: "CNY", changeCny: 3175, balanceBefore: -14975, balanceAfter: -11800 },
     });
     const lines = await linesOf(order.id);
     expect(lines).toEqual([
@@ -220,17 +237,24 @@ describe("ORD-5 PATCH /orders/:po", () => {
     expect(await linesOf(other.id)).toEqual(other.lines);
   });
 
-  it("refuses a total below the paid payments, in CNY with Indian grouping", async () => {
-    const order = await createOrder({ lines: [{ itemId: ids.jeans, quantity: 10000, rateCny: 12.5 }], deposits: [deposit(100000), deposit(23456.78)] });
+  it("takes a total below what the supplier was paid (D9): one adjustment, and the account holds the rest", async () => {
+    const order = await createOrder({ lines: [{ itemId: ids.jeans, quantity: 10000, rateCny: 12.5 }] });
     const id = order.lines[0]!.id;
-    // A due payment is not paid, so it doesn't count.
+    const paid = await http
+      .post("/payments", { supplierId: ids.supplier, amount: 123456.78, paidOn: "2026-10-21", rateInr: 11.8, mode: "Bank transfer", clientRequestId: randomUUID() })
+      .set("Cookie", management);
+    expect(paid.body.ledger).toMatchObject({ balanceBefore: -125000, balanceAfter: -1543.22 });
+    // A due payment is not paid, so it changes nothing.
     await ctx.db.insert(payments).values({ orderId: order.id, kind: "Balance", payee: "Guangzhou Textile Co.", payeeRole: "supplier", amountCny: 50000, status: "due", dueDate: "2026-12-01" });
-    expectFields(await edit(order.po, { lines: [{ id, itemId: ids.jeans, quantity: 9000, rateCny: 12.5 }] }), {
-      lines: "The order total can't be less than the ¥1,23,456.78 already paid to the supplier.",
-    });
-    expect(await linesOf(order.id)).toEqual(order.lines);
-    const equal = await edit(order.po, { lines: [{ id, itemId: ids.jeans, quantity: 1, rateCny: 123456.78 }] });
-    expect(equal.status, JSON.stringify(equal.body)).toBe(200);
+    const lower = await edit(order.po, { lines: [{ id, itemId: ids.jeans, quantity: 9000, rateCny: 12.5 }] });
+    expect(lower.status, JSON.stringify(lower.body)).toBe(200);
+    expect(lower.body.ledger).toEqual({ supplierId: ids.supplier, currency: "CNY", changeCny: 12500, balanceBefore: -1543.22, balanceAfter: 10956.78 });
+    expect((await http.get(`/orders/${order.po}`).set("Cookie", management)).body).toMatchObject({ orderValueCny: 112500, settledCny: 112500, outstandingCny: 0, paymentStatus: "paid" });
+    const adjustments = await ctx.db.select().from(supplierLedgerEntries).where(eq(supplierLedgerEntries.orderId, order.id));
+    expect(adjustments.map((row) => [row.entryType, row.amount])).toEqual([
+      ["order_debit", -125000],
+      ["order_adjustment", 12500],
+    ]);
   });
 
   it("is 404 for an unknown or malformed PO", async () => {
@@ -294,8 +318,8 @@ describe("ORD-6 DELETE /orders/:po", () => {
     expectConflict(await remove(received.po), "in_use", "This order has 1 receipt, so it can't be deleted.");
   });
 
-  // Every foreign key to orders and order_lines is ON DELETE CASCADE, so a dependent ORD-6 doesn't count would be
-  // deleted with the order, not refused. A new referencing table must fail here until ORD-6 counts it.
+  // A foreign key to orders and order_lines that cascades would delete a dependent ORD-6 doesn't count with the order,
+  // not refuse it. A new referencing table must fail here until ORD-6 counts it.
   it("counts every table that references orders or order lines", async () => {
     const found = await ctx.db.execute(sql`
       select kcu.table_name || '.' || kcu.column_name || ' -> ' || ccu.table_name as name
@@ -307,11 +331,13 @@ describe("ORD-6 DELETE /orders/:po", () => {
       [
         "container_lines.order_line_id -> order_lines", // containers
         "order_lines.order_id -> orders", // the order's own lines, deleted with it
-        "payments.order_id -> orders", // payments
+        "payments.order_id -> orders", // payments (ON DELETE RESTRICT since 0017: a payment never disappears)
         "receipt_lines.order_line_id -> order_lines", // receipts
         "receipts.order_id -> orders", // receipts
-        // ON DELETE SET NULL: ORD-6 returns the order's advance first; the ledger keeps its rows (docs/supplier-advance.md).
+        // ON DELETE SET NULL: the archived advance entries keep their PO number (docs/supplier-advance.md).
         "supplier_advance_entries.order_id -> orders",
+        // ON DELETE SET NULL: ORD-6 posts the order_cancel first; the journal keeps its postings by PO (docs/unified-ledger.md).
+        "supplier_ledger_entries.order_id -> orders",
         "warehouse_receipt_lines.order_line_id -> order_lines", // warehouse receipts
       ].sort(),
     );

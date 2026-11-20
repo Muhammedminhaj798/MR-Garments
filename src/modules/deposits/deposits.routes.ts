@@ -1,86 +1,24 @@
-import { desc, eq, isNotNull, type SQL, sql } from "drizzle-orm";
+import { and, desc, eq, isNotNull, type SQL, sql } from "drizzle-orm";
 import { Router } from "express";
-import { z } from "zod";
 
 import { requirePermission } from "../../auth/current-user";
 import type { Database } from "../../db/client";
-import { compareCurrencies, currencyCode } from "../../currencies";
+import { compareCurrencies } from "../../currencies";
 import { DEPOSIT_DIRECTIONS, orders, payments, supplierDeposits, supplierDepositTransactions, suppliers } from "../../db/schema";
-import { conflict, notFound, validationFailed } from "../../http/errors";
-import { parse } from "../../http/validate";
+import { HttpError, notFound } from "../../http/errors";
 import type { RouteContext } from "../context";
-import { advanceAccount, advanceSummary } from "../advances/advances";
-import { money } from "../notifications/notify";
-import { depositState, orderMoney, round2 } from "../orders/money";
-import { isUuid, todayInIndia } from "../stages/common";
+import { depositMilestone, loadLedger, newestPaymentsFirst, paymentQuery, paymentRow } from "../ledger/ledger";
+import { round2 } from "../orders/money";
+import { isUuid } from "../stages/common";
 
-// Owner: Agent D (docs/phase2-contracts.md section 3). DEP-1 GET /deposits, SD-1 GET /suppliers/:supplierId/deposits,
-// SD-2 POST /suppliers/:supplierId/deposits, SD-3 POST /supplier-deposits/:id/transactions, SD-4 DELETE
-// /supplier-deposit-transactions/:id, SD-5 DELETE /supplier-deposits/:id. Supplier deposits are records only and are
-// never order payments: nothing here touches `payments`, so order paid/balance and every payment report stay as they
-// are. A deposit's settled, pending and status are summed live from its transactions.
+// Owner: Agent D (docs/phase2-contracts.md section 3; docs/unified-ledger.md). DEP-1 GET /deposits and SD-1 GET
+// /suppliers/:supplierId/deposits. Supplier deposits (give/receive, 0008) are a read-only archive since the unified
+// ledger: SD-2..5 answer 410. DEP-1's milestones are the Deposit Required term (D11) against the order's FIFO-settled
+// amount; its order deposits are the legacy order-linked Deposit payments, listed as they are.
 
-// Proposed wording, in the voice of payments.routes.ts MESSAGES.
 export const MESSAGES = {
-  direction: "Choose Give or Receive.",
-  amount: "Enter an amount above 0.",
-  currency: "Choose a supported currency code (ISO 4217, such as CNY, USD or AED).",
-  /** SD-2: the deposit's currency must be the supplier's (docs/supplier-currency.md). */
-  supplierCurrency: (currency: string) => `This supplier's deposits are in ${currency}.`,
-  openedOn: "Enter the date the deposit was agreed.",
-  paidOn: "Enter the date of the payment or receipt.",
-  future: "The date can't be in the future.",
-  mode: "Enter the payment mode.",
-  modeTooLong: "Use 100 characters or fewer for the mode.",
-  referenceTooLong: "Use 100 characters or fewer for the reference.",
-  notesTooLong: "Use 1,000 characters or fewer for the notes.",
-  /** SD-3: the amount is more than what is left on the deposit (pending in the deposit's currency, "¥1,234.50"). */
-  overSettled: (pending: string) => `Only ${pending} left to settle.`,
-  inUse: (n: number) => `This deposit has ${n} transaction${n === 1 ? "" : "s"}, so it can't be deleted.`,
-  /** SD-2: the typed rate (INR per 1 unit), when given. */
-  rateInr: "Enter the exchange rate: a number above 0 with at most 4 decimals.",
-  /** SD-2: a supplier without a saved rate (it is optional on the supplier) needs one typed for the deposit. */
-  rateMissing: (currency: string) => `This supplier has no exchange rate yet: enter the rate for this deposit (1 ${currency} = ? INR), or set it on the supplier.`,
-  rateForInr: "An INR deposit takes no exchange rate (it is 1).",
+  gone: "Supplier deposits are a read-only archive now.",
 };
-const M = MESSAGES;
-
-// Inside numeric(14, 2): at most 2 decimals, up to 999,999,999,999.
-const amount = z
-  .number({ error: M.amount })
-  .min(0.01, M.amount)
-  .max(999_999_999_999, M.amount)
-  .refine((value) => Number(value.toFixed(2)) === value, M.amount);
-const notAfterToday = (missing: string) => z.iso.date({ error: missing }).refine((day) => day <= todayInIndia(), M.future);
-const reference = z.string({ error: M.referenceTooLong }).trim().max(100, M.referenceTooLong).default("");
-const notes = z.string({ error: M.notesTooLong }).trim().max(1000, M.notesTooLong).default("");
-
-const newDeposit = z.strictObject({
-  direction: z.enum(DEPOSIT_DIRECTIONS, { error: M.direction }),
-  amount,
-  /** Left out: the supplier's currency; given, it must be the supplier's. */
-  currency: currencyCode(M.currency).optional(),
-  openedOn: notAfterToday(M.openedOn),
-  reference,
-  notes,
-  /**
-   * INR per 1 unit, for a supplier with no saved rate (the rate is optional on the supplier): required then, as the
-   * deposit keeps its rate. A supplier with a saved rate has it snapshotted, as before; left out, nothing changes.
-   */
-  rateInr: z
-    .number({ error: M.rateInr })
-    .min(0.0001, M.rateInr)
-    .max(99_999_999.9999, M.rateInr)
-    .refine((value) => Number(value.toFixed(4)) === value, M.rateInr)
-    .optional(),
-});
-const newTransaction = z.strictObject({
-  paidOn: notAfterToday(M.paidOn),
-  amount,
-  mode: z.string({ error: M.mode }).trim().min(1, M.mode).max(100, M.modeTooLong),
-  reference,
-  notes,
-});
 
 const t = supplierDepositTransactions;
 // Nested, so the columns keep their table names whatever select they end up in (drizzle drops them from a
@@ -148,60 +86,21 @@ const transactionColumns = { id: t.id, paidOn: t.paidOn, amount: t.amount, mode:
 export function depositsRoutes({ db }: RouteContext) {
   const router = Router();
 
-  /** The deposit's row, locked for the rest of the transaction (SD-3 and SD-4 serialise on it); 404 when unknown. */
-  async function lockDeposit(tx: Pick<Database, "select">, id: string) {
-    if (!isUuid(id)) throw notFound("Deposit");
-    const locked = (await tx.select({ id: supplierDeposits.id }).from(supplierDeposits).where(eq(supplierDeposits.id, id)).for("update"))[0];
-    if (!locked) throw notFound("Deposit");
-    return toRow((await depositRows(tx, eq(supplierDeposits.id, id)))[0]!);
-  }
-
-  // DEP-1. Order deposits (payments of kind Deposit, PAY-1's order), every supplier deposit, and the suppliers to filter by.
+  // DEP-1. The Deposit Required milestones (newest first), the legacy order deposits (archive, latest first), every
+  // supplier deposit (archive) and the suppliers to filter by.
   router.get("/deposits", requirePermission("payments", "View"), async (_req, res) => {
-    const [orderDeposits, requirementRows, supplierRows, active, advanceRows] = await Promise.all([
-      db
-        .select({
-          id: payments.id,
-          orderId: payments.orderId,
-          po: orders.poNumber,
-          supplierId: orders.supplierId,
-          supplier: suppliers.name,
-          /** Who was paid: the order's supplier, or a shipping agent (ORD-3 `payeeRole: "agent"`). */
-          payee: payments.payee,
-          payeeRole: payments.payeeRole,
-          currency: orders.currency,
-          amountCny: payments.amountCny,
-          status: payments.status,
-          paidOn: payments.paidOn,
-          dueDate: payments.dueDate,
-          rateInr: payments.rateInr,
-          amountInr: sql<number | null>`case when ${payments.status} = 'paid' then round(${payments.amountCny} * ${payments.rateInr}, 2) end`.mapWith(Number),
-          mode: payments.mode,
-          reference: payments.reference,
-          notes: payments.notes,
-        })
-        .from(payments)
-        .innerJoin(orders, eq(orders.id, payments.orderId))
-        .innerJoin(suppliers, eq(suppliers.id, orders.supplierId))
-        .where(eq(payments.kind, "Deposit"))
-        // PAY-1's order; the id last keeps it stable when payments share a timestamp (one ORD-3 insert).
-        .orderBy(desc(sql`coalesce(${payments.paidOn}, ${payments.dueDate})`), desc(payments.createdAt), desc(payments.id)),
-      // Orders with a deposit the supplier asked for (0009), newest first: the obligation the Pending tab tracks.
+    const [orderDeposits, requirementRows, supplierRows, active, ledger] = await Promise.all([
+      // Order-linked Deposit payments of either payee, voided ones flagged: what New order recorded before the ledger.
+      paymentQuery(db, and(eq(payments.kind, "Deposit"), isNotNull(payments.orderId))).orderBy(...newestPaymentsFirst),
       db
         .select({
           orderId: orders.id,
           po: orders.poNumber,
+          orderDate: orders.orderDate,
           supplierId: orders.supplierId,
           supplier: suppliers.name,
           currency: orders.currency,
           required: orders.depositRequiredCny,
-          /** Paid supplier deposits plus the supplier advance applied (docs/supplier-advance.md). */
-          paid: orderMoney.depositPaidCny,
-          advance: orderMoney.advanceCny,
-          lastPaidOn: sql<string | null>`(select max(${payments.paidOn})::text from ${payments}
-            where ${payments.orderId} = ${orders.id} and ${payments.status} = 'paid' and ${payments.kind} = 'Deposit' and ${payments.payeeRole} = 'supplier')`,
-          payments: sql<number>`(select count(*) from ${payments}
-            where ${payments.orderId} = ${orders.id} and ${payments.status} = 'paid' and ${payments.kind} = 'Deposit' and ${payments.payeeRole} = 'supplier')`.mapWith(Number),
         })
         .from(orders)
         .innerJoin(suppliers, eq(suppliers.id, orders.supplierId))
@@ -209,33 +108,26 @@ export function depositsRoutes({ db }: RouteContext) {
         .orderBy(desc(orders.orderDate), desc(orders.poNumber)),
       depositRows(db, sql`true`),
       db.select({ id: suppliers.id, name: suppliers.name }).from(suppliers).where(eq(suppliers.status, "Active")),
-      advanceSummary(db),
+      loadLedger(db),
     ]);
     const supplierDepositList = supplierRows.map(toRow);
-    const orderObligations = requirementRows.map(({ required, paid, advance, ...row }) => {
-      const state = depositState(required, paid);
-      return { ...row, requiredCny: required!, paidCny: paid, advanceCny: advance, pendingCny: state.depositPendingCny!, status: state.depositStatus };
+    const milestones = requirementRows.map(({ required, ...row }) => {
+      const settlement = ledger.order(row.orderId);
+      return { ...row, ...depositMilestone(required, settlement), held: settlement?.held ?? false };
     });
-    // Active suppliers plus any (inactive) one that still has a deposit of either kind or an advance account, so every
-    // row can be filtered; by name.
+    const orderDepositList = orderDeposits.map(paymentRow);
+    // Active suppliers plus any (inactive) one that still has a row here, so every row can be filtered; by name.
     const byId = new Map(active.map((s) => [s.id, s]));
-    for (const row of [...orderDeposits, ...orderObligations, ...supplierDepositList]) byId.set(row.supplierId, { id: row.supplierId, name: row.supplier });
-    const names = new Map((await db.select({ id: suppliers.id, name: suppliers.name }).from(suppliers)).map((s) => [s.id, s.name]));
-    for (const row of advanceRows) byId.set(row.supplierId, { id: row.supplierId, name: names.get(row.supplierId)! });
-    // One line per supplier and currency with an advance account (docs/supplier-advance.md), by name then currency.
-    const advances = advanceRows
-      .map((row) => ({ ...row, supplier: names.get(row.supplierId)! }))
-      .sort((x, y) => x.supplier.localeCompare(y.supplier) || compareCurrencies(x.currency, y.currency));
+    for (const row of [...orderDepositList, ...milestones, ...supplierDepositList]) byId.set(row.supplierId, { id: row.supplierId, name: row.supplier });
     res.json({
-      orderDeposits,
-      orderObligations,
+      milestones,
+      orderDeposits: orderDepositList,
       supplierDeposits: supplierDepositList,
-      advances,
       suppliers: [...byId.values()].sort((a, b) => a.name.localeCompare(b.name)),
     });
   });
 
-  // SD-1. One supplier's statement: the supplier, a summary per currency and direction, each deposit with its transactions.
+  // SD-1. One supplier's deposits archive: the supplier, a summary per currency and direction, each deposit with its transactions.
   router.get("/suppliers/:supplierId/deposits", requirePermission("payments", "View"), async (req, res) => {
     const supplierId = String(req.params.supplierId);
     if (!isUuid(supplierId)) throw notFound("Supplier");
@@ -247,7 +139,6 @@ export function depositsRoutes({ db }: RouteContext) {
         phone: suppliers.phone,
         city: suppliers.city,
         currency: suppliers.currency,
-        /** The supplier's rate now (null while not set): New deposit asks for one when there is none. */
         exchangeRate: suppliers.exchangeRate,
         status: suppliers.status,
       })
@@ -265,8 +156,6 @@ export function depositsRoutes({ db }: RouteContext) {
       : [];
     res.json({
       supplier,
-      // The supplier advance account beside the deposits, never netted with them (docs/supplier-advance.md).
-      advance: await advanceAccount(db, supplierId),
       summary: summarise(deposits),
       deposits: deposits.map((deposit) => ({
         ...deposit,
@@ -275,92 +164,14 @@ export function depositsRoutes({ db }: RouteContext) {
     });
   });
 
-  // SD-2. Opens a deposit for a supplier (any known one: a deposit to get back from a supplier no longer used is still
-  // a record). The currency is the supplier's (a different one is 422); the supplier's rate is snapshotted on the deposit.
-  router.post("/suppliers/:supplierId/deposits", requirePermission("payments", "Enter"), async (req, res) => {
-    const supplierId = String(req.params.supplierId);
-    if (!isUuid(supplierId)) throw notFound("Supplier");
-    const input = parse(newDeposit, req.body);
-    const deposit = await db.transaction(async (tx) => {
-      // The supplier's row share-locked (as PAY-2 locks the agent): a delete of the supplier waits for this deposit and
-      // then counts it, instead of the insert failing on the foreign key.
-      const [supplier] = await tx
-        .select({ currency: suppliers.currency, exchangeRate: suppliers.exchangeRate })
-        .from(suppliers)
-        .where(eq(suppliers.id, supplierId))
-        .for("share");
-      if (!supplier) throw notFound("Supplier");
-      if (input.currency !== undefined && input.currency !== supplier.currency) throw validationFailed({ currency: M.supplierCurrency(supplier.currency) });
-      // The deposit's rate: 1 for INR; the supplier's saved rate; else the one typed. Never a guessed 0 or 1.
-      const { rateInr, ...fields } = input;
-      if (supplier.currency === "INR" && rateInr !== undefined && rateInr !== 1) throw validationFailed({ rateInr: M.rateForInr });
-      const exchangeRate = supplier.currency === "INR" ? 1 : (supplier.exchangeRate ?? rateInr ?? null);
-      if (exchangeRate === null) throw validationFailed({ rateInr: M.rateMissing(supplier.currency) });
-      const created = (
-        await tx
-          .insert(supplierDeposits)
-          .values({
-            ...fields,
-            supplierId,
-            currency: supplier.currency,
-            exchangeRate,
-            createdBy: req.user!.id,
-          })
-          .returning({ id: supplierDeposits.id })
-      )[0]!;
-      return toRow((await depositRows(tx, eq(supplierDeposits.id, created.id)))[0]!);
-    });
-    res.status(201).json({ deposit });
-  });
-
-  // SD-3. A payment (give) or receipt (receive) against the deposit, in its currency. One transaction with the deposit
-  // row locked, so two settlements can't both fit in the same pending amount.
-  router.post("/supplier-deposits/:id/transactions", requirePermission("payments", "Enter"), async (req, res) => {
-    const id = String(req.params.id);
-    const input = parse(newTransaction, req.body);
-    const result = await db.transaction(async (tx) => {
-      const deposit = await lockDeposit(tx, id);
-      if (input.amount > deposit.pending) throw validationFailed({ amount: M.overSettled(money(deposit.pending, deposit.currency)) });
-      const transaction = (await tx.insert(t).values({ ...input, depositId: id, createdBy: req.user!.id }).returning(transactionColumns))[0]!;
-      return { transaction, deposit: toRow((await depositRows(tx, eq(supplierDeposits.id, id)))[0]!) };
-    });
-    res.status(201).json(result);
-  });
-
-  // SD-4. Management only (payments Full). The deposit's figures follow; nothing else refers to a transaction.
-  router.delete("/supplier-deposit-transactions/:id", requirePermission("payments", "Full"), async (req, res) => {
-    const id = String(req.params.id);
-    if (!isUuid(id)) throw notFound("Transaction");
-    const deleted = await db.transaction(async (tx) => {
-      const found = (await tx.select({ depositId: t.depositId }).from(t).where(eq(t.id, id)))[0];
-      if (!found) throw notFound("Transaction");
-      const deposit = await lockDeposit(tx, found.depositId);
-      // Read again under the lock: a delete of the same transaction that got there first leaves nothing (404).
-      const row = (await tx.select({ amount: t.amount, paidOn: t.paidOn }).from(t).where(eq(t.id, id)))[0];
-      if (!row) throw notFound("Transaction");
-      await tx.delete(t).where(eq(t.id, id));
-      return { ...row, deposit };
-    });
-    // ponytail: the server log is the deletion record, as PAY-3; an audit table needs a migration.
-    console.info(
-      `Supplier deposit transaction ${id} (${money(deleted.amount, deleted.deposit.currency)} on ${deleted.paidOn}, ${deleted.deposit.direction} deposit ${deleted.deposit.id} of ${deleted.deposit.supplier}) deleted by user ${req.user!.id}.`,
-    );
-    res.status(204).end();
-  });
-
-  // SD-5. Management only. Only a deposit nothing was settled against goes; one with transactions is refused (409 in_use),
-  // so no settlement ever disappears with its deposit (the cascade is for the database's integrity, not a flow).
-  router.delete("/supplier-deposits/:id", requirePermission("payments", "Full"), async (req, res) => {
-    const id = String(req.params.id);
-    const deleted = await db.transaction(async (tx) => {
-      const deposit = await lockDeposit(tx, id);
-      if (deposit.transactions > 0) throw conflict("in_use", M.inUse(deposit.transactions));
-      await tx.delete(supplierDeposits).where(eq(supplierDeposits.id, id));
-      return deposit;
-    });
-    console.info(`Supplier deposit ${id} (${deleted.direction} ${money(deleted.amount, deleted.currency)} of ${deleted.supplier}) deleted by user ${req.user!.id}.`);
-    res.status(204).end();
-  });
+  // SD-2, SD-3, SD-4, SD-5: retired at the ledger's cutover (refunds and corrections are Management adjustments, LED-3).
+  const gone = () => {
+    throw new HttpError(410, "gone", MESSAGES.gone);
+  };
+  router.post("/suppliers/:supplierId/deposits", gone);
+  router.post("/supplier-deposits/:id/transactions", gone);
+  router.delete("/supplier-deposit-transactions/:id", gone);
+  router.delete("/supplier-deposits/:id", gone);
 
   return router;
 }

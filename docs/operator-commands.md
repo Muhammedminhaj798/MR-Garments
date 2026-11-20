@@ -55,3 +55,26 @@ changes while you type (for example it is deactivated), nothing is written.
 by an authorized operator, against an explicitly verified production target before it can be relied on. Until then a
 lost Management password in production can be set by another active Management user on Edit user; with no other
 Management user it can only be recovered with direct database access.
+
+## Unified supplier ledger (0017, docs/unified-ledger.md)
+
+Release order, each step only with the owner's approval.
+
+BEFORE migration 0017 (data entry paused):
+
+```sh
+npx tsx scripts/ledger-reconcile.ts --write-baseline before.json      # legacy fingerprints only (works before 0017)
+```
+
+Then migrate (the ledger opens in `maintenance`) and deploy the backend, then:
+
+```sh
+npx tsx scripts/ledger-backfill.ts --preflight                         # rate coverage (read-only)
+npx tsx scripts/ledger-backfill.ts                                     # dry run
+npx tsx scripts/ledger-backfill.ts --apply --database <name>           # post history (idempotent: a rerun writes 0)
+npx tsx scripts/ledger-reconcile.ts --baseline before.json --compare-legacy --expect PO-1134647
+npx tsx scripts/ledger-reconcile.ts --baseline before.json --compare-legacy --expect PO-1134647 --open "who, why" --database <name>
+npx tsx scripts/ledger-reconcile.ts --close "reason" --database <name> # incident: writes paused again
+npx tsx scripts/ledger-rollback-check.ts --baseline before.json        # only before any application write
+psql -f scripts/rollback/0017-down.sql                                 # only after the check passes and the owner approves
+```

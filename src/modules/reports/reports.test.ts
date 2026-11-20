@@ -1,9 +1,9 @@
 import { eq } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
-import { orders, payments, suppliers } from "../../db/schema";
+import { payments, suppliers } from "../../db/schema";
 import { api, createTestContext, resetData, SEEDED, signInAs } from "../../test/harness";
-import { indiaDay, makeOrder, receive } from "../stock/fixtures";
+import { indiaDay, makeOrder, postLegacy, receive } from "../stock/fixtures";
 import { REPORTS } from "./reports";
 import { buildLifecycle } from "./test-data";
 
@@ -137,14 +137,15 @@ describe("GET /reports/<name> on the lifecycle data", () => {
     expect(later).toMatchObject({ from: indiaDay(10), to: indiaDay(20), containers: [], nextArrival: null });
   });
 
-  it("payments-per-supplier: open orders per supplier, supplier payments only, and the finished POs", async () => {
+  it("payments-per-supplier: open orders per supplier with the ledger's settlement and signed balance, and the finished POs", async () => {
+    // A and B are paid in full (balance 0, finished): no row. The others owe (negative balances).
     expect(await get("/reports/payments-per-supplier")).toMatchObject({
       suppliers: [
-        { supplier: "Foshan Fabrics", orders: [data.c.po], orderValueCny: 4000, paidCny: 1000, paidInr: 12000, advanceCny: 0, balanceCny: 3000 },
-        { supplier: "Yiwu Trims Ltd.", orders: [data.d.po], orderValueCny: 1000, paidCny: 0, paidInr: 0, advanceCny: 0, balanceCny: 1000 },
-        { supplier: "Hangzhou Knits", orders: [data.e.po], orderValueCny: 800, paidCny: 0, balanceCny: 800 },
+        { supplier: "Foshan Fabrics", held: false, orders: [data.c.po], orderValueCny: 4000, settledCny: 1000, outstandingCny: 3000, creditsCny: 1000, balanceCny: -3000, paidInr: 12000 },
+        { supplier: "Yiwu Trims Ltd.", orders: [data.d.po], orderValueCny: 1000, settledCny: 0, outstandingCny: 1000, creditsCny: 0, balanceCny: -1000, paidInr: 0 },
+        { supplier: "Hangzhou Knits", orders: [data.e.po], orderValueCny: 800, settledCny: 0, outstandingCny: 800, balanceCny: -800 },
       ],
-      totals: { orders: 3, orderValueCny: 5800, paidCny: 1000, paidInr: 12000, advanceCny: 0, balanceCny: 4800 },
+      totals: { orders: 3, orderValueCny: 5800, settledCny: 1000, outstandingCny: 4800, balanceCny: -4800, payableCny: 4800, availableCny: 0, paidInr: 12000 },
       dueNext30Cny: 3000,
       finishedPos: [data.b.po, data.a.po],
     });
@@ -174,13 +175,13 @@ describe("reports never add amounts in different currencies (migration 0006)", (
     management = await signInAs(ctx, SEEDED.management);
     data = await buildLifecycle(ctx);
     // F: Foshan Fabrics again, in USD: 100 Track pants at $2 ($200), 80 received (short 20 = $40), $50 paid at 88, $30 due.
-    usd = await makeOrder(ctx, { supplier: "Foshan Fabrics", stage: 2, lines: [{ item: "Track pants", quantity: 100, rateCny: 2 }] });
-    await ctx.db.update(orders).set({ currency: "USD" }).where(eq(orders.id, usd.id));
+    usd = await makeOrder(ctx, { supplier: "Foshan Fabrics", stage: 2, currency: "USD", lines: [{ item: "Track pants", quantity: 100, rateCny: 2 }] });
     await receive(ctx, usd.id, [{ orderLineId: usd.lineIds[0]!, quantity: 80 }]);
     await ctx.db.insert(payments).values([
       { orderId: usd.id, kind: "Deposit", payee: "Foshan Fabrics", payeeRole: "supplier", amountCny: 50, rateInr: 88, status: "paid", mode: "Wire", paidOn: indiaDay(-5) },
       { orderId: usd.id, kind: "Balance", payee: "Foshan Fabrics", payeeRole: "supplier", amountCny: 30, status: "due", dueDate: indiaDay(5) },
     ]);
+    await postLegacy(ctx);
   });
 
   it("payments-per-supplier: one row per supplier and currency; the single-number totals stay CNY only", async () => {
@@ -195,18 +196,20 @@ describe("reports never add amounts in different currencies (migration 0006)", (
       supplierId: await supplierId("Foshan Fabrics"),
       supplier: "Foshan Fabrics",
       currency: "USD",
+      held: false,
       orders: [usd.po],
       orderValueCny: 200,
-      paidCny: 50,
+      settledCny: 50,
+      outstandingCny: 150,
+      creditsCny: 50,
+      balanceCny: -150,
       paidInr: 4400,
-      advanceCny: 0,
-      balanceCny: 150,
     });
-    const cny = { orders: 3, orderValueCny: 5800, paidCny: 1000, paidInr: 12000, advanceCny: 0, balanceCny: 4800 };
+    const cny = { orders: 3, orderValueCny: 5800, settledCny: 1000, outstandingCny: 4800, balanceCny: -4800, payableCny: 4800, availableCny: 0, paidInr: 12000 };
     expect(body.totals).toEqual(cny);
     expect(body.totalsByCurrency).toEqual([
       { currency: "CNY", ...cny },
-      { currency: "USD", orders: 1, orderValueCny: 200, paidCny: 50, paidInr: 4400, advanceCny: 0, balanceCny: 150 },
+      { currency: "USD", orders: 1, orderValueCny: 200, settledCny: 50, outstandingCny: 150, balanceCny: -150, payableCny: 150, availableCny: 0, paidInr: 4400 },
     ]);
     expect(body).toMatchObject({ dueNext30Cny: 3000, dueNext30ByCurrency: [{ currency: "CNY", amount: 3000 }, { currency: "USD", amount: 30 }] });
   });
@@ -216,13 +219,24 @@ describe("reports never add amounts in different currencies (migration 0006)", (
     expect(received.lines.find((line: { po: string }) => line.po === usd.po)).toMatchObject({ currency: "USD", short: 20, shortValueCny: 40 });
     expect(received.lines.find((line: { po: string }) => line.po === data.e.po)).toMatchObject({ currency: "CNY", shortValueCny: 200 });
     expect(received).toMatchObject({ shortValueCny: 200, shortValueByCurrency: [{ currency: "CNY", amount: 200 }, { currency: "USD", amount: 40 }] });
-    expect((await get("/reports/summary")).payments).toEqual({ dueNext30Cny: 3000, dueNext30ByCurrency: [{ currency: "CNY", amount: 3000 }, { currency: "USD", amount: 30 }] });
+    expect((await get("/reports/summary")).payments).toEqual({
+      dueNext30Cny: 3000,
+      dueNext30ByCurrency: [
+        { currency: "CNY", amount: 3000 },
+        { currency: "USD", amount: 30 },
+      ],
+      // What the business owes suppliers: the negative ledger balances, per currency.
+      payableByCurrency: [
+        { currency: "CNY", amount: 4800 },
+        { currency: "USD", amount: 150 },
+      ],
+    });
   });
 
   it("GET /landed-cost gives each order's currency, the currency of its goods payments", async () => {
     const res = await http.get("/landed-cost").set("Cookie", management);
     const row = res.body.orders.find((order: { po: string }) => order.po === usd.po);
-    expect(row).toMatchObject({ currency: "USD", goodsInr: 4400, goodsPayments: [expect.objectContaining({ amountCny: 50, rateInr: 88, amountInr: 4400 })] });
+    expect(row).toMatchObject({ currency: "USD", goodsInr: 4400, goodsPayments: [expect.objectContaining({ amount: 50, exchangeRate: 88, amountInr: 4400, mode: "Wire", memoPo: usd.po })] });
     expect(res.body.orders.find((order: { po: string }) => order.po === data.a.po).currency).toBe("CNY");
   });
 });

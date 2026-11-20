@@ -2,8 +2,9 @@ import { and, asc, desc, eq, inArray, sql } from "drizzle-orm";
 import { alias } from "drizzle-orm/pg-core";
 
 import type { Database } from "../../db/client";
-import { containerLines, containers, items, orderLines, orders, payments, suppliers, teams, warehouseReceiptLines, warehouseReceipts } from "../../db/schema";
+import { containerLines, containers, items, orderLines, orders, suppliers, teams, warehouseReceiptLines, warehouseReceipts } from "../../db/schema";
 import { loadLandedCosts } from "../costs/landed-cost";
+import { loadLedger, sliceDetails } from "../ledger/ledger";
 import { orderMoney } from "../orders/money";
 import { round2, unitSymbol } from "../orders/orders.routes";
 
@@ -30,7 +31,7 @@ export async function landedCostList(db: Database, { supplierId, teamId }: { sup
       unit: unitSymbol,
       quantity: main.quantity,
       // The PO in its own currency and the rate saved on the order (0012; null for older orders), for the report
-      // download (docs/report-downloads.md). The landed cost's goods stay the payments at their own rates.
+      // download (docs/report-downloads.md). The landed cost's goods stay the credits at their own rates.
       orderDate: orders.orderDate,
       orderValueCny: orderMoney.orderValueCny,
       exchangeRate: orders.exchangeRate,
@@ -41,9 +42,11 @@ export async function landedCostList(db: Database, { supplierId, teamId }: { sup
     .innerJoin(items, eq(items.id, main.itemId))
     .where(and(supplierId ? eq(orders.supplierId, supplierId) : undefined, teamId ? forTeam : undefined))
     .orderBy(desc(orders.orderDate), desc(orders.createdAt));
+  const ledger = await loadLedger(db, supplierId ? { supplierIds: [supplierId] } : {});
   const costs = await loadLandedCosts(
     db,
     rows.map((row) => row.orderId),
+    ledger,
   );
   const costed = rows.filter((row) => costs.get(row.orderId)!.totalInr > 0);
   const ids = costed.map((row) => row.orderId);
@@ -65,20 +68,11 @@ export async function landedCostList(db: Database, { supplierId, teamId }: { sup
       .groupBy(orderLines.orderId, teams.id)
       .having(sql`sum(${warehouseReceiptLines.quantity}) > 0`)
       .orderBy(asc(teams.createdAt), asc(teams.name)),
-    // Goods: paid payments to the supplier, oldest first, each changed to INR at its own rate (as loadLandedCosts).
-    db
-      .select({
-        id: payments.id,
-        orderId: payments.orderId,
-        kind: payments.kind,
-        paidOn: sql<string>`${payments.paidOn}::text`,
-        amountCny: payments.amountCny,
-        rateInr: sql<number>`${payments.rateInr}`.mapWith(Number),
-        amountInr: sql<number>`round(${payments.amountCny} * ${payments.rateInr}, 2)`.mapWith(Number),
-      })
-      .from(payments)
-      .where(and(inArray(payments.orderId, ids), eq(payments.status, "paid"), eq(payments.payeeRole, "supplier")))
-      .orderBy(asc(payments.paidOn), asc(payments.createdAt)),
+    // Goods: the credits that settled each order (the ledger's FIFO slices), oldest first, each at its own rate (as loadLandedCosts).
+    sliceDetails(
+      db,
+      ids.flatMap((id) => ledger.order(id)?.slices ?? []),
+    ),
     db
       .select({ id: suppliers.id, name: suppliers.name })
       .from(suppliers)
@@ -99,7 +93,7 @@ export async function landedCostList(db: Database, { supplierId, teamId }: { sup
       teams: splits
         .filter((split) => split.orderId === row.orderId)
         .map(({ teamId: id, team, pieces }) => ({ teamId: id, team, pieces, costInr: round2(pieces * (cost.perPieceInr ?? 0)) })),
-      goodsPayments: goods.filter((payment) => payment.orderId === row.orderId),
+      goodsPayments: goods(ledger.order(row.orderId)?.slices ?? []),
     };
   });
   const finished = list.filter((row) => row.final);

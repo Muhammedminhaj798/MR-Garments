@@ -1,10 +1,13 @@
+import { randomUUID } from "node:crypto";
+
 import { eq } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import { items, locations, shippingAgents, suppliers } from "../../db/schema";
 import { api, createTestContext, resetData, SEEDED, signInAs } from "../../test/harness";
 
-// ORD-4 GET /orders/:po. Orders, receipts and containers are created through their own endpoints (ORD-3, REC-3, CON-3).
+// ORD-4 GET /orders/:po. Orders, payments, receipts and containers are created through their own endpoints (ORD-3,
+// PAY-2, REC-3, CON-3). Supplier money is the ledger's FIFO projection (docs/unified-ledger.md).
 
 const ctx = createTestContext();
 const http = api(ctx);
@@ -60,12 +63,19 @@ describe("ORD-4 GET /orders/:po", () => {
         { itemId: ids.jeans, quantity: 1000, rateCny: 12.5 },
         { itemId: ids.fabric, quantity: 300, rateCny: 8.25 },
       ],
-      deposits: [
-        { payee: "Sino Freight", payeeRole: "agent", amountCny: 1000, paidOn: indiaDay(-20), rateInr: 11.9, mode: "Cash" },
-        { payee: "Guangzhou Textile Co.", payeeRole: "supplier", amountCny: 1234.56, paidOn: indiaDay(-25), rateInr: 11.8765, mode: "Bank transfer", reference: " TXN-778 ", notes: "First 10%" },
-      ],
+      deposits: [{ payee: "Sino Freight", payeeRole: "agent", amountCny: 1000, paidOn: indiaDay(-20), rateInr: 11.9, mode: "Cash" }],
     });
     po = created.order.po;
+    const paid = await post("/payments", {
+      supplierId: ids.supplier,
+      amount: 1234.56,
+      paidOn: indiaDay(-25),
+      rateInr: 11.8765,
+      mode: "Bank transfer",
+      reference: " TXN-778 ",
+      notes: "First 10%",
+      clientRequestId: randomUUID(),
+    });
     lineIds = (await get(`/orders/${po}`)).body.lines.map((line: { id: string }) => line.id);
     const [jeans, fabric] = lineIds as [string, string];
     const receipt = (receivedOn: string, lines: { orderLineId: string; quantity: number }[], bundles: number) =>
@@ -102,46 +112,82 @@ describe("ORD-4 GET /orders/:po", () => {
       closed: false,
       closedOn: null,
       orderValueCny: 14975, // 1000 * 12.5 + 300 * 8.25
-      paidCny: 2234.56,
-      paidInr: 26562.25, // 1234.56 * 11.8765 = 14662.25 (rounded) + 1000 * 11.9
-      supplierPaidCny: 1234.56,
-      supplierPaidInr: 14662.25,
       // Taken from its first container (sent CNF before 0015's order terms existed): docs/order-container-terms.md.
       terms: "CNF",
-      advanceCny: 0,
-      advanceInr: 0,
-      excessCny: 0,
-      excessInr: 0,
-      advanceStatus: "none",
-      advanceEntries: [],
-      advanceAvailableCny: 0,
-      balanceCny: 13740.44, // owed to the supplier: the ¥1,000 agent deposit is freight
+      // The ledger's FIFO projection: the supplier payment settles ¥1,234.56; the ¥1,000 agent deposit is freight.
+      held: false,
+      settledCny: 1234.56,
+      outstandingCny: 13740.44,
+      paymentStatus: "partly",
+      settledInr: 14662.25, // 1234.56 * 11.8765, rounded
       depositRequiredCny: null,
-      depositPaidCny: 1234.56,
+      depositSettledCny: 1234.56,
       depositPendingCny: null,
       depositStatus: "none",
+      agentPaidCny: 1000,
+      agentPaidInr: 11900,
+      paidInr: 26562.25, // 14662.25 + 1000 * 11.9
+      slices: [
+        {
+          entryId: expect.any(String),
+          entryType: "payment",
+          paymentId: paid.payment.id,
+          advanceEntryId: null,
+          entryDate: indiaDay(-25),
+          amount: 1234.56,
+          exchangeRate: 11.8765,
+          amountInr: 14662.25,
+          mode: "Bank transfer",
+          reference: "TXN-778", // trimmed
+          memoPo: null,
+        },
+      ],
+      supplierAccount: {
+        supplierId: ids.supplier,
+        currency: "CNY",
+        held: false,
+        creditsCny: 1234.56,
+        debitsCny: 14975,
+        balanceCny: -13740.44,
+        paidInr: 14662.25,
+        paidInrComplete: true,
+        outstandingCny: 13740.44,
+        openOrders: 1,
+        lastPaymentOn: indiaDay(-25),
+      },
       exchangeRate: null,
       lines: [
         { id: jeans, position: 0, item: { id: ids.jeans, name: "Denim jeans" }, unit: "pcs", quantity: 1000, rateCny: 12.5, valueCny: 12500, received: 900, loaded: 700 },
         { id: fabric, position: 1, item: { id: ids.fabric, name: "Cotton fabric" }, unit: "m", quantity: 300, rateCny: 8.25, valueCny: 2475, received: 100, loaded: 0 },
       ],
+      // Order-linked rows only: the agent deposit (the supplier payment names no order).
       payments: [
         {
           id: expect.any(String),
+          orderId: created.order.id,
+          po,
+          supplierId: ids.supplier,
+          supplier: "Guangzhou Textile Co.",
+          currency: "CNY",
           kind: "Deposit",
-          payee: "Guangzhou Textile Co.",
-          payeeRole: "supplier",
-          amountCny: 1234.56,
+          payee: "Sino Freight",
+          payeeRole: "agent",
+          amountCny: 1000,
           status: "paid",
-          paidOn: indiaDay(-25),
+          paidOn: indiaDay(-20),
           dueDate: null,
-          rateInr: 11.8765,
-          mode: "Bank transfer",
-          reference: "TXN-778", // trimmed
-          notes: "First 10%",
-          amountInr: 14662.25,
+          rateInr: 11.9,
+          mode: "Cash",
+          reference: "",
+          notes: "",
+          amountInr: 11900,
+          recordedAt: expect.any(String),
+          voided: false,
+          voidedAt: null,
+          voidedBy: null,
+          voidReason: "",
+          held: false,
         },
-        expect.objectContaining({ payee: "Sino Freight", payeeRole: "agent", amountCny: 1000, paidOn: indiaDay(-20), rateInr: 11.9, mode: "Cash" }),
       ],
       receipts: [
         {
@@ -190,7 +236,8 @@ describe("ORD-4 GET /orders/:po", () => {
       deposits: [],
     });
     const res = await get(`/orders/${created.order.po}`);
-    expect(res.body).toMatchObject({ stage: 1, received: 0, paidCny: 0, balanceCny: 150, payments: [], receipts: [], containers: [] });
+    // Newer than the first order, which the ¥1,234.56 only part settles: nothing is left for this one.
+    expect(res.body).toMatchObject({ stage: 1, received: 0, settledCny: 0, outstandingCny: 150, paymentStatus: "unpaid", slices: [], payments: [], receipts: [], containers: [] });
     expect(res.body.lines).toEqual([expect.objectContaining({ quantity: 50, valueCny: 150, received: 0, loaded: 0 })]);
   });
 
@@ -198,8 +245,8 @@ describe("ORD-4 GET /orders/:po", () => {
     // Accounts: payments Enter, receiving and containers None. Procurement: payments and receiving View, containers None.
     const accounts = await get(`/orders/${po}`, await signInAs(ctx, SEEDED.accounts));
     expect(accounts.status).toBe(200);
-    expect(accounts.body).toMatchObject({ po, received: 900, receipts: null, containers: null });
-    expect(accounts.body.payments).toHaveLength(2);
+    expect(accounts.body).toMatchObject({ po, received: 900, receipts: null, containers: null, settledCny: 1234.56 });
+    expect(accounts.body.payments).toHaveLength(1);
     expect(accounts.body.lines.map((line: { received: number; loaded: number }) => [line.received, line.loaded])).toEqual([
       [900, 700],
       [100, 0],
@@ -207,6 +254,7 @@ describe("ORD-4 GET /orders/:po", () => {
     const procurement = await get(`/orders/${po}`, await signInAs(ctx, SEEDED.procurement));
     expect(procurement.body.containers).toBeNull();
     expect(procurement.body.receipts).toHaveLength(2);
-    expect(procurement.body.payments).toHaveLength(2);
+    expect(procurement.body.payments).toHaveLength(1);
+    expect(procurement.body.slices).toHaveLength(1);
   });
 });

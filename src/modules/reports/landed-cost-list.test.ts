@@ -83,9 +83,10 @@ describe("GET /landed-cost on the lifecycle data", () => {
         { team: "Retail team", pieces: 60, costInr: 24270 },
         { team: "Online team", pieces: 40, costInr: 16180 },
       ],
+      // The ledger's settlement slices behind goodsInr (docs/unified-ledger.md): each credit at its own rate.
       goodsPayments: [
-        { kind: "Deposit", paidOn: indiaDay(-38), amountCny: 2000, rateInr: 12, amountInr: 24000 },
-        { kind: "Balance", paidOn: indiaDay(-15), amountCny: 1000, rateInr: 13, amountInr: 13000 },
+        { entryType: "payment", entryDate: indiaDay(-38), amount: 2000, exchangeRate: 12, amountInr: 24000, mode: "Bank", memoPo: data.a.po },
+        { entryType: "payment", entryDate: indiaDay(-15), amount: 1000, exchangeRate: 13, amountInr: 13000, mode: "Bank", memoPo: data.a.po },
       ],
     });
     expect(b).toMatchObject({ terms: "FOB", goodsInr: 12500, seaFreightInr: 0, clearingInr: 500, transportInr: 250, totalInr: 13250, perPieceInr: 132.5 });

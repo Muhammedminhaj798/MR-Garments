@@ -1,12 +1,13 @@
 import { afterAll, beforeEach, describe, expect, it } from "vitest";
 
-import { items, orders, supplierDeposits, suppliers } from "../../db/schema";
+import { items, orders, supplierLedgerEntries, suppliers } from "../../db/schema";
 import { api, createTestContext, resetData, SEEDED, signInAs } from "../../test/harness";
 import { idOf } from "../stock/fixtures";
 import { RATE_MESSAGES } from "./suppliers.routes";
 
-// docs/supplier-currency.md: one currency and one INR rate per supplier. New orders and supplier deposits are in that
-// currency (another is 422) and snapshot the rate; a later change of the supplier's rate never touches them.
+// docs/supplier-currency.md: one currency and one INR rate per supplier. New orders are in that currency (another is
+// 422) and snapshot the rate, and so does their ledger debit (docs/unified-ledger.md); a later change of the supplier's
+// rate never touches them. Supplier deposits are a read-only archive (SD-2 answers 410).
 
 const ctx = createTestContext();
 const http = api(ctx);
@@ -120,14 +121,14 @@ describe("new orders and deposits take the supplier's currency and snapshot its 
     expect(rows).toEqual(expect.arrayContaining([{ supplierId: shenzhen, currency: "CNY", exchangeRate: null }, { supplierId: foshan, currency: "INR", exchangeRate: 1 }]));
   });
 
-  it("SD-2: a deposit snapshots the supplier's rate; a later rate change leaves it", async () => {
+  it("the order's ledger debit copies the rate snapshot; a later rate change leaves it; SD-2 is retired (410)", async () => {
     await edit(guangzhou, { currency: "USD", exchangeRate: 88.25 });
-    const opened = await openDeposit(guangzhou, { direction: "give", amount: 100, openedOn: "2026-10-20" });
-    expect(opened.status).toBe(201);
-    expect(opened.body.deposit).toMatchObject({ currency: "USD", exchangeRate: 88.25 });
+    expect((await placeOrder(orderBody(guangzhou))).status).toBe(201);
     await edit(guangzhou, { exchangeRate: 90 });
-    expect((await get(`/suppliers/${guangzhou}/deposits`)).body.deposits[0]).toMatchObject({ currency: "USD", exchangeRate: 88.25 });
-    expect((await ctx.db.select({ exchangeRate: supplierDeposits.exchangeRate }).from(supplierDeposits))[0]).toEqual({ exchangeRate: 88.25 });
+    const posted = await ctx.db.select({ entryType: supplierLedgerEntries.entryType, currency: supplierLedgerEntries.currency, amount: supplierLedgerEntries.amount, exchangeRate: supplierLedgerEntries.exchangeRate }).from(supplierLedgerEntries);
+    expect(posted).toEqual([{ entryType: "order_debit", currency: "USD", amount: -25, exchangeRate: 88.25 }]);
+    const opened = await openDeposit(guangzhou, { direction: "give", amount: 100, openedOn: "2026-10-20" });
+    expect([opened.status, opened.body.error.code]).toEqual([410, "gone"]);
   });
 
   it("RPT-O1 and RPT-O2 give the PO's saved rate and its INR value at that rate, beside the supplier's rate now", async () => {

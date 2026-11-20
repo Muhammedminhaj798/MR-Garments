@@ -1,8 +1,10 @@
+import { randomUUID } from "node:crypto";
+
 import { eq } from "drizzle-orm";
 import { afterAll, beforeEach, describe, expect, it } from "vitest";
 
 import { compareCurrencies, currencySymbol, ISO_4217, isCurrency, orderedCurrencies, PREFERRED_CURRENCIES } from "../../currencies";
-import { items, orders, payments, supplierDeposits, suppliers } from "../../db/schema";
+import { items, orders, payments, suppliers } from "../../db/schema";
 import { api, createTestContext, resetData, SEEDED, signInAs } from "../../test/harness";
 import { money } from "../notifications/notify";
 import { idOf } from "../stock/fixtures";
@@ -84,7 +86,7 @@ describe("GET /currencies", () => {
 });
 
 describe("any currency of the master, and only those, for suppliers, orders and deposits", () => {
-  it("takes an AED supplier with its rate, an order and a deposit in it with the rate snapshotted, and a JPY supplier", async () => {
+  it("takes an AED supplier with its rate, an order and a supplier payment in it with the rate kept, and a JPY supplier", async () => {
     const aed = await add({ name: "Gulf Fabrics", currency: "AED", exchangeRate: 23.5 });
     expect(aed.status, aed.text).toBe(201);
     expect(aed.body.supplier).toMatchObject({ currency: "AED", exchangeRate: 23.5 });
@@ -95,28 +97,27 @@ describe("any currency of the master, and only those, for suppliers, orders and 
     expect(order.status, order.text).toBe(201);
     expect((await ctx.db.select({ currency: orders.currency, exchangeRate: orders.exchangeRate }).from(orders))[0]).toEqual({ currency: "AED", exchangeRate: 23.5 });
     expect((await get("/reports/orders")).body.rows[0]).toMatchObject({ currency: "AED", orderValueCny: 40, exchangeRate: 23.5, orderValueInr: 940 });
-    const deposit = await http.post(`/suppliers/${aed.body.supplier.id}/deposits`, { direction: "give", amount: 100, openedOn: "2026-10-20" }).set("Cookie", accounts);
-    expect(deposit.status, deposit.text).toBe(201);
-    expect(deposit.body.deposit).toMatchObject({ currency: "AED", exchangeRate: 23.5 });
-    expect((await ctx.db.select({ currency: supplierDeposits.currency }).from(supplierDeposits))[0]).toEqual({ currency: "AED" });
-    // A payment on the AED order: the amount in dirhams at its own typed rate, INR worked out from it.
+    // A supplier payment in AED (PAY-2, against the supplier): the amount in dirhams at its own typed rate.
     const paid = await http
-      .post("/payments", { orderId: order.body.order.id, kind: "Balance", payeeRole: "supplier", agentId: null, amountCny: 20, paidOn: "2026-10-21", rateInr: 23.75, mode: "Bank transfer" })
+      .post("/payments", { supplierId: aed.body.supplier.id, amount: 20, paidOn: "2026-10-21", rateInr: 23.75, mode: "Bank transfer", clientRequestId: randomUUID() })
       .set("Cookie", accounts);
     expect(paid.status, paid.text).toBe(201);
-    expect((await ctx.db.select({ amountCny: payments.amountCny, rateInr: payments.rateInr }).from(payments))[0]).toEqual({ amountCny: 20, rateInr: 23.75 });
-    // The supplier moves to a new rate, then to yen: the order, the deposit and the payment keep dirhams and their rates.
+    expect(paid.body).toMatchObject({ payment: { currency: "AED", amountInr: 475 }, ledger: { currency: "AED", balanceBefore: -40, balanceAfter: -20 } });
+    expect((await ctx.db.select({ amountCny: payments.amountCny, rateInr: payments.rateInr, currency: payments.currency }).from(payments))[0]).toEqual({ amountCny: 20, rateInr: 23.75, currency: "AED" });
+    // The supplier moves to a new rate, then to yen: the order and the payment keep dirhams and their rates, and the AED
+    // account (still owing) stays on offer for a payment beside the new JPY (D10).
     expect((await http.patch(`/suppliers/${aed.body.supplier.id}`, { exchangeRate: 24 }).set("Cookie", management)).status).toBe(200);
     expect((await http.patch(`/suppliers/${aed.body.supplier.id}`, { currency: "JPY", exchangeRate: 0.57 }).set("Cookie", management)).status).toBe(200);
     expect(await ctx.db.select({ currency: orders.currency, exchangeRate: orders.exchangeRate }).from(orders)).toEqual([{ currency: "AED", exchangeRate: 23.5 }]);
-    expect(await ctx.db.select({ currency: supplierDeposits.currency, exchangeRate: supplierDeposits.exchangeRate }).from(supplierDeposits)).toEqual([{ currency: "AED", exchangeRate: 23.5 }]);
     expect((await ctx.db.select({ rateInr: payments.rateInr }).from(payments))[0]).toEqual({ rateInr: 23.75 });
+    const offered = (await get("/supplier-advances/suppliers", accounts)).body.suppliers.find((row: { id: string }) => row.id === aed.body.supplier.id);
+    expect(offered).toMatchObject({ currency: "JPY", currencyOptions: ["AED", "JPY"], balances: [{ currency: "AED", balanceCny: -20 }] });
     const jpy = await add({ name: "Osaka Textiles", currency: "JPY", exchangeRate: 0.58 });
     expect(jpy.status, jpy.text).toBe(201);
     expect((await get("/suppliers")).body.filter((row: { currency: string }) => ["AED", "JPY"].includes(row.currency))).toHaveLength(2);
   });
 
-  it("refuses a code outside the master on a supplier, an order and a deposit, storing nothing", async () => {
+  it("refuses a code outside the master on a supplier, an order and a payment, storing nothing", async () => {
     for (const code of ["XAU", "BGN", "ZZZ", "eur", "EURO"]) {
       const supplier = await add({ name: "Nope", currency: code, exchangeRate: 1 });
       expect(supplier.status, code).toBe(422);
@@ -129,12 +130,14 @@ describe("any currency of the master, and only those, for suppliers, orders and 
       .set("Cookie", management);
     expect(order.status).toBe(422);
     expect(order.body.error.fields).toEqual({ currency: "Choose a supported currency code (ISO 4217, such as CNY, USD or AED)." });
-    const deposit = await http.post(`/suppliers/${guangzhou}/deposits`, { direction: "give", amount: 100, currency: "XAU", openedOn: "2026-10-20" }).set("Cookie", accounts);
-    expect(deposit.status).toBe(422);
-    expect(deposit.body.error.fields).toEqual({ currency: CURRENCY });
+    const payment = await http
+      .post("/payments", { supplierId: guangzhou, amount: 100, currency: "XAU", paidOn: "2026-10-20", rateInr: 1, mode: "Cash", clientRequestId: randomUUID() })
+      .set("Cookie", accounts);
+    expect(payment.status).toBe(422);
+    expect(payment.body.error.fields).toEqual({ currency: "Choose one of this supplier's currencies." });
     expect(await ctx.db.select().from(suppliers).where(eq(suppliers.name, "Nope"))).toHaveLength(0);
     expect(await ctx.db.select().from(orders)).toHaveLength(0);
-    expect(await ctx.db.select().from(supplierDeposits)).toHaveLength(0);
+    expect(await ctx.db.select().from(payments)).toHaveLength(0);
   });
 
   it("the database keeps only three-capital codes (0013); the API, the master", async () => {

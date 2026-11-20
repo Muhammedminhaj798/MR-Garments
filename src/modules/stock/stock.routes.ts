@@ -12,7 +12,6 @@ import {
   locations,
   orderLines,
   orders,
-  payments,
   receiptLines,
   receipts,
   shippingAgents,
@@ -24,6 +23,7 @@ import { conflict, notFound, validationFailed } from "../../http/errors";
 import { parse } from "../../http/validate";
 import { atLeast, effectiveAccess } from "../../permissions/matrix";
 import type { RouteContext } from "../context";
+import { loadLedger } from "../ledger/ledger";
 import { unitSymbol } from "../orders/orders.routes";
 import { day, notify, qty } from "../notifications/notify";
 import { joined } from "../orders/order-detail.routes";
@@ -244,15 +244,12 @@ export function stockRoutes({ db }: RouteContext) {
         orderId: orders.id,
         po: orders.poNumber,
         supplier: suppliers.name,
+        supplierId: orders.supplierId,
         // Not money: the currency of the (possibly withheld) amounts.
         currency: orders.currency,
         orderValueCny: money
           ? sql<number>`(select coalesce(round(sum(${allLines.quantity} * ${allLines.rateCny}), 2), 0) from ${orderLines} ${allLines}
           where ${allLines.orderId} = ${orders.id})`.mapWith(Number)
-          : hidden(),
-        depositsPaidCny: money
-          ? sql<number>`(select coalesce(sum(${payments.amountCny}), 0) from ${payments}
-          where ${payments.orderId} = ${orders.id} and ${payments.kind} = 'Deposit' and ${payments.status} = 'paid' and ${payments.payeeRole} = 'supplier')`.mapWith(Number)
           : hidden(),
         orderLineId: orderLines.id,
         item: items.name,
@@ -267,12 +264,14 @@ export function stockRoutes({ db }: RouteContext) {
       .innerJoin(items, eq(items.id, orderLines.itemId))
       .where(and(inArray(orders.stage, [1, 2]), sql`${received} < ${orderLines.quantity}`))
       .orderBy(desc(orders.orderDate), desc(orders.createdAt), asc(orderLines.position));
-    const byOrder = new Map<string, { orderId: string; po: string; supplier: string; currency: Currency; orderValueCny: number | null; depositsPaidCny: number | null; lines: object[] }>();
+    // What the supplier is still owed for the order: the ledger's FIFO projection (null while held or not posted).
+    const ledger = money ? await loadLedger(db, { supplierIds: [...new Set(rows.map((row) => row.supplierId))] }) : null;
+    const byOrder = new Map<string, { orderId: string; po: string; supplier: string; supplierId: string; currency: Currency; orderValueCny: number | null; outstandingCny: number | null; lines: object[] }>();
     for (const { orderLineId, item, unit, ordered, receivedEarlier, unitPriceCny, ...order } of rows) {
-      if (!byOrder.has(order.orderId)) byOrder.set(order.orderId, { ...order, lines: [] });
+      if (!byOrder.has(order.orderId)) byOrder.set(order.orderId, { ...order, outstandingCny: ledger?.order(order.orderId)?.outstandingCny ?? null, lines: [] });
       byOrder.get(order.orderId)!.lines.push({ orderLineId, item, unit, ordered, receivedEarlier, unitPriceCny });
     }
-    res.json({ offices, orders: [...byOrder.values()] });
+    res.json({ offices, orders: [...byOrder.values()].map(({ supplierId: _supplierId, ...order }) => order) });
   });
 
   // REC-3. One transaction with the order row locked (CON-3 and REC-4 lock it too). A line may receive more than was

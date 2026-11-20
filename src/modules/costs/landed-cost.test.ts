@@ -19,7 +19,7 @@ import {
 } from "../../db/schema";
 import { createTestContext, resetData } from "../../test/harness";
 import { moveOrdersToStage } from "../stages-shared";
-import { indiaDay, makeOrder } from "../stock/fixtures";
+import { indiaDay, makeOrder, postLegacy } from "../stock/fixtures";
 import { computeLandedCosts, type LandedCostFacts, loadLandedCosts } from "./landed-cost";
 
 type Container = LandedCostFacts["containers"][number];
@@ -147,6 +147,8 @@ describe("loadLandedCosts (database)", () => {
       { ...paid, orderId: a.id, payee: "Sino Freight", payeeRole: "agent", amountCny: 100, rateInr: 12 },
       { orderId: a.id, kind: "Balance", payee: "Guangzhou Textile Co.", payeeRole: "supplier", amountCny: 50, status: "due", dueDate: indiaDay(5) },
     ]);
+    // Order-linked supplier payments from before the ledger: posted to it by the backfill.
+    await postLegacy(ctx);
     const [box] = await ctx.db
       .insert(containers)
       .values({ number: "LCTU 1000001", shippingAgentId: await one(shippingAgents, "Sino Freight"), terms: "FOB", loadedOn: indiaDay(-15), eta: indiaDay(-5), status: "arrived" })

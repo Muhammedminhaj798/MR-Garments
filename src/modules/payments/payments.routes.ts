@@ -1,28 +1,35 @@
-import { and, eq } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import { Router } from "express";
 import { z } from "zod";
 
 import { requirePermission } from "../../auth/current-user";
+import { currencyCode } from "../../currencies";
 import type { Database } from "../../db/client";
-import { orders, PAYEE_ROLES, PAYMENT_KINDS, payments, shippingAgents, suppliers } from "../../db/schema";
-import { notFound, validationFailed } from "../../http/errors";
+import { orders, payments, shippingAgents, supplierLedgerEntries, suppliers } from "../../db/schema";
+import { conflict, HttpError, notFound, validationFailed } from "../../http/errors";
 import { parse } from "../../http/validate";
 import type { RouteContext } from "../context";
-import { settleAdvance } from "../advances/advances";
+import { assertLedgerLive, cents, fromCents, isHeld, loadLedger, MESSAGES as LEDGER, paymentQuery, paymentRow, postPaymentCredit, postPaymentVoid } from "../ledger/ledger";
+import { currencyOptions } from "../ledger/ledger.routes";
 import { money, notify } from "../notifications/notify";
 import { rateProblem } from "../orders/orders.routes";
-import { isUuid } from "../stages/common";
+import { isUuid, todayInIndia } from "../stages/common";
 
-// Owner: BE-payments. PAY-2 POST /payments (docs/live-screens-contracts.md, "Five-tab completion"), PAY-3 DELETE
-// /payments/:id. Payments are records only: nothing here moves money. The amount is in the order's currency; `rateInr`
-// is INR per 1 of it (none, stored as 1, for an INR order).
+// Owner: BE-payments. PAY-2 POST /payments and PAY-3 DELETE /payments/:id (docs/unified-ledger.md). A supplier payment
+// is recorded against the supplier (no order) and credited to its ledger account in the payment's currency, in one
+// transaction; a shipping-agent payment stays on its order as sea freight and is never posted. A payment is never
+// deleted: PAY-3 voids it (reason required) and reverses its posting. `rateInr` is INR per 1 of the currency (none,
+// stored as 1, for INR).
 
 export const MESSAGES = {
+  supplier: "Choose a supplier from the list.",
+  currency: "Choose one of this supplier's currencies.",
   order: "Choose an order from the list.",
   kind: "Choose Deposit or Balance.",
   payeeRole: "Choose who the payment was paid to.",
+  /** An order-linked supplier body (the form before 0017): supplier money now goes to the supplier's account. */
+  supplierOnOrder: "Supplier payments are now recorded against the supplier. Reload the page.",
   agent: "Choose a shipping agent from the list.",
-  agentForSupplier: "Leave the shipping agent empty when the supplier was paid.",
   amount: "Enter an amount above 0.",
   paidOn: "Enter the date the payment was made.",
   paidOnFuture: "The payment date can't be in the future.",
@@ -31,143 +38,266 @@ export const MESSAGES = {
   modeTooLong: "Use 100 characters or fewer for the mode.",
   referenceTooLong: "Use 100 characters or fewer for the reference.",
   notesTooLong: "Use 1,000 characters or fewer for the notes.",
+  clientRequestId: "Reload the page and try again.",
+  idempotencyConflict: "This payment was already recorded with different details. Reload the page.",
+  reason: "Enter the reason for voiding the payment.",
+  reasonTooLong: "Use 1,000 characters or fewer for the reason.",
+  alreadyVoided: "This payment was already voided.",
 };
 const M = MESSAGES;
 
-/** Today in India (Asia/Kolkata, UTC+5:30, no daylight saving) as YYYY-MM-DD. */
-const todayInIndia = () => new Date(Date.now() + 5.5 * 3600_000).toISOString().slice(0, 10);
-
 // Upper bounds keep values inside the numeric columns, so an absurd number is a 422, not a 500.
-const newPayment = z.strictObject({
-  orderId: z.uuid({ error: M.order }),
-  kind: z.enum(PAYMENT_KINDS, { error: M.kind }),
-  payeeRole: z.enum(PAYEE_ROLES, { error: M.payeeRole }),
-  agentId: z.uuid({ error: M.agent }).nullable().default(null),
-  amountCny: z.number({ error: M.amount }).min(0.01, M.amount).max(999_999_999_999, M.amount),
+const amount = z
+  .number({ error: M.amount })
+  .min(0.01, M.amount)
+  .max(999_999_999_999, M.amount)
+  .refine((value) => Number(value.toFixed(2)) === value, M.amount);
+const common = {
   paidOn: z.iso.date({ error: M.paidOn }).refine((day) => day <= todayInIndia(), M.paidOnFuture),
-  rateInr: z.number({ error: M.rateInr }).min(0.0001, M.rateInr).max(99_999_999, M.rateInr).optional(),
+  rateInr: z
+    .number({ error: M.rateInr })
+    .min(0.0001, M.rateInr)
+    .max(99_999_999.9999, M.rateInr)
+    .refine((value) => Number(value.toFixed(4)) === value, M.rateInr)
+    .optional(),
   mode: z.string({ error: M.mode }).trim().min(1, M.mode).max(100, M.modeTooLong),
-  // Transaction or receipt number and notes (0008); left out by an older frontend, both are "".
   reference: z.string({ error: M.referenceTooLong }).trim().max(100, M.referenceTooLong).default(""),
   notes: z.string({ error: M.notesTooLong }).trim().max(1000, M.notesTooLong).default(""),
+  /** The client's key for this submit (kept across its retries): a repeat returns the payment already recorded. */
+  clientRequestId: z.uuid({ error: M.clientRequestId }),
+};
+const supplierPayment = z.strictObject({ supplierId: z.uuid({ error: M.supplier }), amount, currency: currencyCode(M.currency).optional(), ...common });
+const agentPayment = z.strictObject({
+  orderId: z.uuid({ error: M.order }),
+  payeeRole: z.literal("agent", { error: M.payeeRole }),
+  agentId: z.uuid({ error: M.agent }),
+  kind: z.enum(["Deposit", "Balance"], { error: M.kind }),
+  amountCny: amount,
+  ...common,
 });
-type NewPayment = z.infer<typeof newPayment>;
+const voidPayment = z.strictObject({ reason: z.string({ error: M.reason }).trim().min(1, M.reason).max(1000, M.reasonTooLong) });
 
-/** The payee's name (the order's supplier, or the active agent), the PO and its currency, or 422 with every problem found (E1). */
-async function payeeName(db: Pick<Database, "select">, input: NewPayment) {
-  const problems: Record<string, string> = {};
-  const order = await db
-    .select({ supplier: suppliers.name, supplierId: orders.supplierId, po: orders.poNumber, currency: orders.currency })
-    .from(orders)
-    .innerJoin(suppliers, eq(suppliers.id, orders.supplierId))
-    .where(eq(orders.id, input.orderId));
-  if (order.length === 0) problems.orderId = M.order;
-  const rate = order[0] && rateProblem(order[0].currency, input.rateInr, M.rateInr);
-  if (rate) problems.rateInr = rate;
+type Tx = Parameters<Parameters<Database["transaction"]>[0]>[0];
+type Stored = typeof payments.$inferSelect;
 
-  let agent: string | undefined;
-  if (input.payeeRole === "supplier") {
-    if (input.agentId !== null) problems.agentId = M.agentForSupplier;
-  } else if (input.agentId === null) {
-    problems.agentId = M.agent;
-  } else {
-    const rows = await db
-      .select({ name: shippingAgents.name })
-      .from(shippingAgents)
-      .where(and(eq(shippingAgents.id, input.agentId), eq(shippingAgents.status, "Active")))
-      .for("share");
-    agent = rows[0]?.name;
-    if (!agent) problems.agentId = M.agent;
-  }
+/** One submit at a time per client key, so a double click can't record two payments (the second waits, then replays). */
+const lockRequest = (tx: Tx, clientRequestId: string) => tx.execute(sql`select pg_advisory_xact_lock(hashtext('payments.client_request'), hashtext(${clientRequestId}))`);
+const byRequest = async (tx: Tx, clientRequestId: string) => (await tx.select().from(payments).where(eq(payments.clientRequestId, clientRequestId)))[0];
 
-  if (Object.keys(problems).length > 0) throw validationFailed(problems);
-  return { payee: input.payeeRole === "supplier" ? order[0]!.supplier : agent!, supplierId: order[0]!.supplierId, po: order[0]!.po, currency: order[0]!.currency };
+/** Every business field of a stored payment against a resubmit's: any difference is 409 `idempotency_conflict`. */
+// The payee is compared by its id (supplierId, or orderId + payee role), never by its name: a supplier or agent renamed
+// between a timed-out submit and its retry must still replay.
+function sameDetails(stored: Stored, fields: Omit<Stored, "id" | "status" | "dueDate" | "clientRequestId" | "createdAt" | "updatedAt" | "createdBy" | "voidedAt" | "voidedBy" | "voidReason" | "payee">) {
+  const same = Object.entries(fields).every(([key, value]) => {
+    const saved = stored[key as keyof Stored];
+    // Numbers to the column's 4 decimals (amounts have 2), so a float's last digit never makes a resubmit different.
+    return typeof value === "number" && typeof saved === "number" ? Math.round(value * 10_000) === Math.round(saved * 10_000) : saved === value;
+  });
+  if (!same) throw conflict("idempotency_conflict", M.idempotencyConflict);
+}
+
+/** The balances a supplier payment's credit left its account with when it was posted (a replayed PAY-2 answers them again). */
+async function postedBalances(db: Pick<Database, "select">, paymentId: string) {
+  const e = supplierLedgerEntries;
+  const [credit] = await db.select().from(e).where(and(eq(e.paymentId, paymentId), eq(e.entryType, "payment")));
+  if (!credit) return null;
+  // Postings to one account are serialised by its lock, so everything recorded before this one was already committed.
+  const [row] = await db
+    .select({ total: sql<number>`coalesce(sum(${e.amount}), 0)`.mapWith(Number) })
+    .from(e)
+    .where(and(eq(e.supplierId, credit.supplierId), eq(e.currency, credit.currency), sql`${e.createdAt} < (select created_at from supplier_ledger_entries where id = ${credit.id})`));
+  const before = fromCents(cents(row!.total));
+  return { supplierId: credit.supplierId, currency: credit.currency, balanceBefore: before, balanceAfter: fromCents(cents(before) + cents(credit.amount)) };
 }
 
 export function paymentsRoutes({ db }: RouteContext) {
   const router = Router();
+  const view = async (id: string) => paymentRow((await paymentQuery(db, eq(payments.id, id)))[0]!);
 
-  // PAY-2. A payment already made: saved as paid, at any stage. No overpayment check (the balance may go below 0). A
-  // supplier payment re-checks the supplier advance applied to the order (docs/supplier-advance.md): what the direct
-  // payments now cover goes back to the supplier's account, so supplier payments plus advance never pass the order value.
-  router.post("/payments", requirePermission("payments", "Enter"), async (req, res) => {
-    const input = parse(newPayment, req.body);
-    const { payment, advance } = await db.transaction(async (tx) => {
-      // Read inside the transaction, the agent's row share-locked: an agent payment keeps the agent's name, so a rename
-      // or delete of that agent waits for this payment and then counts it (master-data DELETE, shipping-agent PATCH).
-      const { payee, supplierId, po, currency } = await payeeName(tx, input);
-      const toSupplier = input.payeeRole === "supplier";
-      // The order row first, as ORD-5, ORD-6, PAY-3 and ADV-4 lock it; the advance lock comes after (settleAdvance).
-      if (toSupplier) await tx.select({ id: orders.id }).from(orders).where(eq(orders.id, input.orderId)).for("update");
-      const created = (
-        await tx
-          .insert(payments)
-          .values({
-            orderId: input.orderId,
-            kind: input.kind,
-            payee,
-            payeeRole: input.payeeRole,
-            amountCny: input.amountCny,
-            status: "paid",
-            paidOn: input.paidOn,
-            rateInr: input.rateInr ?? 1,
-            mode: input.mode,
-            reference: input.reference,
-            notes: input.notes,
-            createdBy: req.user!.id,
-          })
-          .returning({ id: payments.id })
-      )[0]!;
+  /** PAY-2, supplier body: an orderless payment credited to the supplier's account in the payment's currency (D10). */
+  async function recordSupplierPayment(input: z.infer<typeof supplierPayment>, userId: string) {
+    return db.transaction(async (tx) => {
+      await assertLedgerLive(tx);
+      await lockRequest(tx, input.clientRequestId);
+      // Share-locked: a currency change of the supplier waits for this payment, so the options checked stay true.
+      const [supplier] = await tx.select({ id: suppliers.id, name: suppliers.name, currency: suppliers.currency }).from(suppliers).where(eq(suppliers.id, input.supplierId)).for("share");
+      const existing = await byRequest(tx, input.clientRequestId);
+      if (!supplier) throw validationFailed({ supplierId: M.supplier });
+      const currency = input.currency ?? supplier.currency;
+      const rateInr = currency === "INR" && input.rateInr === undefined ? 1 : (input.rateInr ?? null);
+      if (existing) {
+        sameDetails(existing, {
+          orderId: null,
+          supplierId: supplier.id,
+          currency,
+          kind: "Payment",
+          payeeRole: "supplier",
+          amountCny: input.amount,
+          paidOn: input.paidOn,
+          rateInr,
+          mode: input.mode,
+          reference: input.reference,
+          notes: input.notes,
+        });
+        return { id: existing.id, created: false };
+      }
+      if (await isHeld(tx, supplier.id, currency)) throw conflict("account_held", LEDGER.held);
+      const problems: Record<string, string> = {};
+      if (!currencyOptions(supplier, await loadLedger(tx, { supplierIds: [supplier.id] })).includes(currency)) problems.currency = M.currency;
+      const rate = rateProblem(currency, input.rateInr, M.rateInr);
+      if (rate) problems.rateInr = rate;
+      if (Object.keys(problems).length > 0) throw validationFailed(problems);
+      const [created] = await tx
+        .insert(payments)
+        .values({
+          supplierId: supplier.id,
+          currency,
+          kind: "Payment",
+          payee: supplier.name,
+          payeeRole: "supplier",
+          amountCny: input.amount,
+          status: "paid",
+          paidOn: input.paidOn,
+          rateInr: rateInr!,
+          mode: input.mode,
+          reference: input.reference,
+          notes: input.notes,
+          clientRequestId: input.clientRequestId,
+          createdBy: userId,
+        })
+        .returning({ id: payments.id });
+      await postPaymentCredit(tx, { id: created!.id, supplierId: supplier.id, currency, amount: input.amount, exchangeRate: rateInr, paidOn: input.paidOn }, userId);
       await notify(tx, {
         kind: "payment-recorded",
-        actorId: req.user!.id,
-        sourceId: created.id,
+        actorId: userId,
+        sourceId: created!.id,
+        title: `${supplier.name} payment recorded`,
+        details: [`Payment ${money(input.amount, currency)}`, supplier.name],
+        href: () => `/supplier-ledger/${supplier.id}`,
+      });
+      return { id: created!.id, created: true };
+    });
+  }
+
+  /** PAY-2, shipping-agent body: sea freight on its order, never posted. Read inside the transaction (E1: problems together). */
+  async function recordAgentPayment(input: z.infer<typeof agentPayment>, userId: string) {
+    return db.transaction(async (tx) => {
+      await assertLedgerLive(tx);
+      await lockRequest(tx, input.clientRequestId);
+      // A retry of a payment already recorded replays it before any check that may have changed since (an agent
+      // deactivated or renamed): same details 200, other details 409.
+      const replay = await byRequest(tx, input.clientRequestId);
+      if (replay) {
+        // The agent (by its id, active or not: a paid agent's name can't change) must be the one recorded.
+        const [named] = await tx.select({ name: shippingAgents.name }).from(shippingAgents).where(eq(shippingAgents.id, input.agentId));
+        if (!named || named.name.toLowerCase() !== replay.payee.toLowerCase()) throw conflict("idempotency_conflict", M.idempotencyConflict);
+        sameDetails(replay, {
+          orderId: input.orderId,
+          supplierId: null,
+          currency: null,
+          kind: input.kind,
+          payeeRole: "agent",
+          amountCny: input.amountCny,
+          paidOn: input.paidOn,
+          rateInr: input.rateInr ?? 1,
+          mode: input.mode,
+          reference: input.reference,
+          notes: input.notes,
+        });
+        return { id: replay.id, created: false };
+      }
+      const problems: Record<string, string> = {};
+      const [order] = await tx.select({ po: orders.poNumber, supplierId: orders.supplierId, currency: orders.currency }).from(orders).where(eq(orders.id, input.orderId));
+      if (!order) problems.orderId = M.order;
+      const rate = order && rateProblem(order.currency, input.rateInr, M.rateInr);
+      if (rate) problems.rateInr = rate;
+      // The agent's row share-locked: an agent payment keeps the agent's name, so a rename or delete of that agent waits
+      // for this payment and then counts it (master-data DELETE, shipping-agent PATCH).
+      const [agent] = await tx
+        .select({ name: shippingAgents.name })
+        .from(shippingAgents)
+        .where(and(eq(shippingAgents.id, input.agentId), eq(shippingAgents.status, "Active")))
+        .for("share");
+      if (!agent) problems.agentId = M.agent;
+      if (Object.keys(problems).length > 0) throw validationFailed(problems);
+      const rateInr = input.rateInr ?? 1;
+      // A payment of either payee on an order of a held account is refused (D18): the order's money is pending review.
+      if (await isHeld(tx, order!.supplierId, order!.currency)) throw conflict("account_held", LEDGER.held);
+      const [created] = await tx
+        .insert(payments)
+        .values({
+          orderId: input.orderId,
+          kind: input.kind,
+          payee: agent!.name,
+          payeeRole: "agent",
+          amountCny: input.amountCny,
+          status: "paid",
+          paidOn: input.paidOn,
+          rateInr,
+          mode: input.mode,
+          reference: input.reference,
+          notes: input.notes,
+          clientRequestId: input.clientRequestId,
+          createdBy: userId,
+        })
+        .returning({ id: payments.id });
+      const po = order!.po;
+      await notify(tx, {
+        kind: "payment-recorded",
+        actorId: userId,
+        sourceId: created!.id,
         title: `${po} payment recorded`,
-        details: [`${input.kind} ${money(input.amountCny, currency)}`, payee],
+        details: [`${input.kind} ${money(input.amountCny, order!.currency)}`, agent!.name],
         href: (canView) => (canView("ordersView") ? `/orders/${encodeURIComponent(po)}/payments` : "/payments"),
       });
-      // After the payment, in its transaction: never draws more advance, only gives back the excess.
-      const advance = toSupplier ? await settleAdvance(tx, { id: input.orderId, po, supplierId, currency }, req.user!.id, "cap") : null;
-      return { payment: created, advance };
+      return { id: created!.id, created: true };
     });
-    res.status(201).json(advance ? { payment, advance } : { payment });
+  }
+
+  // PAY-2. A payment already made, saved as paid. Two bodies: the supplier's (orderless, posted to its ledger account)
+  // or a shipping agent's on an order. An order-linked supplier body is the form from before the ledger: 422.
+  router.post("/payments", requirePermission("payments", "Enter"), async (req, res) => {
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    if (typeof body === "object" && "supplierId" in body) {
+      const result = await recordSupplierPayment(parse(supplierPayment, body), req.user!.id);
+      res.status(result.created ? 201 : 200).json({ payment: await view(result.id), ledger: await postedBalances(db, result.id) });
+      return;
+    }
+    if (body.payeeRole === "supplier") throw validationFailed({ payeeRole: M.supplierOnOrder });
+    const result = await recordAgentPayment(parse(agentPayment, body), req.user!.id);
+    res.status(result.created ? 201 : 200).json({ payment: await view(result.id) });
   });
 
-  // PAY-3. Management only (payments Full). A deposit or a balance payment, paid or due. One transaction: the payment's
-  // order locked first (as ORD-5 and ORD-6 lock it, so an order edit or delete can't interleave), then the payment. Only
-  // that row goes. No figure is stored: the order's paid, INR and balance, the supplier's paid and outstanding, landed
-  // cost (goods or sea freight), deposits paid on receiving, reports and the dashboard all sum the payments live, each at
-  // its own rate. Nothing links to a payment (no reconciliation, settlement or allocation exists), so nothing refuses it.
-  // The order, its other payments and the payment-recorded notification stay.
+  // PAY-3. Management only (payments Full): voids the payment, with a reason. The row stays (voided, by whom, why) and
+  // counts in no total; a posted payment also gets its reversing `payment_void`. The payment row is locked first, so a
+  // second void waits and then answers 409 without writing anything. Nothing else changes: no other order or payment.
   router.delete("/payments/:id", requirePermission("payments", "Full"), async (req, res) => {
     const id = String(req.params.id);
     if (!isUuid(id)) throw notFound("Payment");
-    const deleted = await db.transaction(async (tx) => {
-      const found = (await tx.select({ orderId: payments.orderId }).from(payments).where(eq(payments.id, id)))[0];
-      if (!found) throw notFound("Payment");
-      const order = (
-        await tx.select({ po: orders.poNumber, currency: orders.currency, supplierId: orders.supplierId }).from(orders).where(eq(orders.id, found.orderId)).for("update")
-      )[0]!;
-      // Read again under the lock: a delete of the same payment that got there first leaves nothing (404).
-      const row = (
-        await tx
-          .select({ kind: payments.kind, status: payments.status, payee: payments.payee, payeeRole: payments.payeeRole, amountCny: payments.amountCny })
-          .from(payments)
-          .where(eq(payments.id, id))
-          .for("update")
-      )[0];
+    const { reason } = parse(voidPayment, req.body);
+    const userId = req.user!.id;
+    const result = await db.transaction(async (tx) => {
+      await assertLedgerLive(tx);
+      const [row] = await tx.select().from(payments).where(eq(payments.id, id)).for("update");
       if (!row) throw notFound("Payment");
-      await tx.delete(payments).where(eq(payments.id, id));
-      // A supplier payment may have been partly the supplier's advance (excess, 0016): bring the order's excess back to
-      // what the remaining payments leave, in this transaction. Never draws advance by itself (cap); ADV-4 applies it.
-      if (row.payeeRole === "supplier") await settleAdvance(tx, { id: found.orderId, po: order.po, supplierId: order.supplierId, currency: order.currency }, req.user!.id, "cap");
-      return { ...row, ...order };
+      if (row.voidedAt) throw new HttpError(409, "already_voided", M.alreadyVoided);
+      const [order] = row.orderId ? await tx.select({ po: orders.poNumber, supplierId: orders.supplierId, currency: orders.currency }).from(orders).where(eq(orders.id, row.orderId)) : [];
+      const supplierId = row.supplierId ?? order!.supplierId;
+      const currency = row.currency ?? order!.currency;
+      if (await isHeld(tx, supplierId, currency)) throw conflict("account_held", LEDGER.held);
+      await tx.update(payments).set({ voidedAt: new Date(), voidedBy: userId, voidReason: reason, updatedAt: new Date() }).where(eq(payments.id, id));
+      const posted = await postPaymentVoid(tx, id, userId, reason);
+      return { row, po: order?.po ?? null, currency, posted };
     });
-    // ponytail: the server log is the deletion record; an audit table needs a migration, add one when audits are asked for.
+    // The voided row and its reversal are the record; this line says who voided it, as deletions were logged before.
+    const { row, po, currency, posted } = result;
     console.info(
-      `Payment ${id} (${deleted.status} ${deleted.kind} ${money(deleted.amountCny, deleted.currency)} to ${deleted.payee}) of ${deleted.po} deleted by user ${req.user!.id}.`,
+      `Payment ${id} (${row.status} ${row.kind} ${money(row.amountCny, currency)} to ${row.payee}${po ? ` of ${po}` : ""}) voided by user ${userId}: ${reason}`,
     );
-    res.status(204).end();
+    res.json({
+      payment: await view(id),
+      ledger: posted ? { supplierId: posted.entry.supplierId, currency: posted.entry.currency, balanceBefore: posted.balanceBefore, balanceAfter: posted.balanceAfter } : null,
+    });
   });
 
   return router;

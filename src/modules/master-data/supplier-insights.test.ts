@@ -3,7 +3,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import { containerLines, containers, orders, payments, shippingAgents, suppliers } from "../../db/schema";
 import { api, createTestContext, resetData, SEEDED, signInAs } from "../../test/harness";
-import { idOf, indiaDay, makeOrder, receive } from "../stock/fixtures";
+import { idOf, indiaDay, makeOrder, postLegacy, receive } from "../stock/fixtures";
 
 const ctx = createTestContext();
 const http = api(ctx);
@@ -24,6 +24,8 @@ const get = async (url: string, cookie = management) => {
 // Guangzhou Textile Co. (SUP-001):
 //   C  CNY, stage 2, ordered 30 days ago, due 8 days ago, received 5 days ago (late). 10 Polo shirts at ¥30 = ¥300,
 //      paid in full (rate 12).
+// The supplier payments are legacy order-linked rows, posted to the ledger: a supplier's balance is its signed ledger
+// balance per currency (docs/unified-ledger.md): − payable, 0 settled.
 describe("Suppliers page: MD-1 money, SUP-1 summary and SUP-2 insights", () => {
   let foshan = "";
   let guangzhou = "";
@@ -41,8 +43,8 @@ describe("Suppliers page: MD-1 money, SUP-1 summary and SUP-2 insights", () => {
       ],
     });
     await receive(ctx, a.id, [{ orderLineId: a.lineIds[0]!, quantity: 100 }]);
-    const b = await makeOrder(ctx, { supplier: "Foshan Fabrics", lines: [{ item: "Track pants", quantity: 100, rateCny: 2 }] });
-    await ctx.db.update(orders).set({ currency: "USD", orderDate: indiaDay(-10), deliveryDate: indiaDay(-2) }).where(eq(orders.id, b.id));
+    const b = await makeOrder(ctx, { supplier: "Foshan Fabrics", currency: "USD", lines: [{ item: "Track pants", quantity: 100, rateCny: 2 }] });
+    await ctx.db.update(orders).set({ orderDate: indiaDay(-10), deliveryDate: indiaDay(-2) }).where(eq(orders.id, b.id));
     const c = await makeOrder(ctx, { supplier: "Guangzhou Textile Co.", stage: 2, lines: [{ item: "Polo shirts", quantity: 10, rateCny: 30 }] });
     await ctx.db.update(orders).set({ deliveryDate: indiaDay(-8) }).where(eq(orders.id, c.id));
     await receive(ctx, c.id, [{ orderLineId: c.lineIds[0]!, quantity: 10 }]);
@@ -53,6 +55,7 @@ describe("Suppliers page: MD-1 money, SUP-1 summary and SUP-2 insights", () => {
       { orderId: a.id, kind: "Deposit", payee: "Sino Freight", payeeRole: "agent", amountCny: 100, rateInr: 12, status: "paid", mode: "Bank", paidOn: indiaDay(-20) },
       { orderId: c.id, kind: "Balance", payee: "Guangzhou Textile Co.", payeeRole: "supplier", amountCny: 300, rateInr: 12, status: "paid", mode: "Bank", paidOn: indiaDay(-3) },
     ]);
+    await postLegacy(ctx);
     const [container] = await ctx.db
       .insert(containers)
       .values({ number: "TEST0000001", shippingAgentId: await idOf(ctx, shippingAgents, "Sino Freight"), terms: "FOB", eta: indiaDay(3), status: "sea" })
@@ -69,7 +72,7 @@ describe("Suppliers page: MD-1 money, SUP-1 summary and SUP-2 insights", () => {
     }
   });
 
-  it("MD-1 rows carry this year's order value and the balance owed, per currency", async () => {
+  it("MD-1 rows carry this year's order value and the signed ledger balance, per currency", async () => {
     const rows: { name: string; code: string; ytdValue: unknown; balance: unknown }[] = await get("/suppliers");
     const jan1 = `${indiaDay().slice(0, 4)}-01-01`;
     const thisYear = (day: string) => day >= jan1;
@@ -83,12 +86,13 @@ describe("Suppliers page: MD-1 money, SUP-1 summary and SUP-2 insights", () => {
       openPos: 2,
       ytdValue: foshanYtd,
       balance: [
-        { currency: "CNY", amount: 3250 },
-        { currency: "USD", amount: 200 },
+        { currency: "CNY", amount: -3250 },
+        { currency: "USD", amount: -200 },
       ],
+      heldCurrencies: [],
     });
     expect(rows.find((row) => row.name === "Guangzhou Textile Co.")).toMatchObject({ code: "SUP-001", balance: [{ currency: "CNY", amount: 0 }] });
-    expect(rows.find((row) => row.name === "Shenzhen Apparel")).toMatchObject({ openOrders: 0, openPos: 0, ytdValue: [], balance: [] });
+    expect(rows.find((row) => row.name === "Shenzhen Apparel")).toMatchObject({ openOrders: 0, openPos: 0, ytdValue: [], balance: [], heldCurrencies: [] });
   });
 
   it("SUP-1: counts suppliers, open and in-transit orders, what is unpaid and what falls due within 7 days", async () => {
@@ -102,7 +106,7 @@ describe("Suppliers page: MD-1 money, SUP-1 summary and SUP-2 insights", () => {
         ],
       },
       inTransit: { orders: 1, nextEta: indiaDay(3), arrivingNext7: 1 },
-      // Guangzhou is paid in full: only Foshan owes (¥3,250 and $200), so one supplier has a balance.
+      // Guangzhou is paid in full: only Foshan's accounts are payable (¥3,250 and $200), so one supplier owes.
       unpaid: {
         amount: [
           { currency: "CNY", amount: 3250 },
@@ -139,9 +143,10 @@ describe("Suppliers page: MD-1 money, SUP-1 summary and SUP-2 insights", () => {
           { currency: "USD", amount: 200 },
         ],
         balance: [
-          { currency: "CNY", amount: 3250 },
-          { currency: "USD", amount: 200 },
+          { currency: "CNY", amount: -3250 },
+          { currency: "USD", amount: -200 },
         ],
+        heldCurrencies: [],
       },
       {
         supplierId: guangzhou,
@@ -158,6 +163,7 @@ describe("Suppliers page: MD-1 money, SUP-1 summary and SUP-2 insights", () => {
         averageDeliveryDays: 25,
         value: [{ currency: "CNY", amount: 300 }],
         balance: [{ currency: "CNY", amount: 0 }],
+        heldCurrencies: [],
       },
     ]);
     expect(body.top.map((row: { name: string }) => row.name)).toEqual(["Foshan Fabrics", "Guangzhou Textile Co."]);

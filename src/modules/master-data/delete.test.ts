@@ -146,7 +146,8 @@ describe("a record in use is refused with 409 in_use and kept", () => {
     const id = await add("supplier", "Ningbo Garments");
     await makeOrder(ctx, { supplier: "Ningbo Garments", lines: [{ item: "Polo shirts", quantity: 10, rateCny: 5 }] });
     await makeOrder(ctx, { supplier: "Ningbo Garments", lines: [{ item: "Polo shirts", quantity: 10, rateCny: 5 }] });
-    await expectInUse("supplier", id, "2 orders");
+    // Each order is posted to the supplier's ledger account (docs/unified-ledger.md): its debit is a use too.
+    await expectInUse("supplier", id, "2 orders and 2 ledger postings");
   });
 
   it("shipping agent: its containers and the agent payments made to it by name", async () => {

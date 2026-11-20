@@ -17,7 +17,7 @@ import {
   warehouseReceipts,
 } from "../../db/schema";
 import { api, createTestContext, resetData, SEEDED, signInAs } from "../../test/harness";
-import { indiaDay, makeOrder } from "../stock/fixtures";
+import { indiaDay, makeOrder, postLegacy } from "../stock/fixtures";
 
 const ctx = createTestContext();
 const http = api(ctx);
@@ -155,6 +155,8 @@ describe("stock from stocked warehouse receipts (6.3)", () => {
       { ...paid, orderId: b.id, amountCny: 1000 },
       { ...paid, orderId: c.id, amountCny: 500 },
     ]);
+    // Legacy order-linked supplier payments: the ledger posts them (the backfill); each order is paid in full (FIFO).
+    await postLegacy(ctx);
 
     type Line = { orderLineId: string; quantity: number };
     /** A container carrying `loads`, cleared (2000 INR), carried (1000 INR) and received with `status`. */
