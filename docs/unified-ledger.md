@@ -44,7 +44,10 @@ the backend implements and the frontend consumes. Where an older doc (supplier-a
   - PAY-2, PAY-3;
   - LED-3;
   - ORD-3;
-  - ORD-5 when `lines` are sent;
+  - ORD-5 when `lines` are sent, or a new order date, PO number or deposit required (the cutover baseline's fields),
+    with its own message: "Order dates, PO numbers, deposits and items are paused for maintenance. The delivery date
+    and container terms can still change." A field sent back unchanged is no change; delivery date and terms edits
+    are allowed;
   - ORD-6.
 - Reads keep working. The check (`assertLedgerLive(tx)`) runs inside the write's transaction.
 - Only `scripts/ledger-reconcile.ts --open "note" --database <name>` sets `live`, and only when every invariant
@@ -86,27 +89,74 @@ the backend implements and the frontend consumes. Where an older doc (supplier-a
 
 ### FIFO settlement projection (read-only, never stored)
 
-- Per account, the pool is payments − voids ± adjustments.
+- Per account, the pool is payments − voids ± adjustments. Credits (payments and positive adjustments) are lots in
+  date order (`entry_date`, then the moment recorded, then id), each in the account's currency at its own rate snapshot.
 - Live orders are settled **oldest first**: `order_date`, then the order's `created_at`, then id.
 - `settled` = what the pool covers of the order (never negative).
 - `outstanding` = value − settled (never negative).
 - `paymentStatus`: `unpaid` (settled 0), `partly`, or `paid` (settled = value, or value 0).
-- A void empties its own payment.
-- **Negative adjustments: newest credits first (LIFO), approved by the owner on 2026-11-20.**
-  - At its own date, a negative adjustment takes from the newest credits that exist then (payments and positive
-    adjustments, newest `entry_date`, then the latest recorded). Credits dated after it are untouched.
-  - Each credit keeps its own currency and its rate snapshot; nothing is converted or re-rated. An adjustment only
-    ever touches credits of its own account (supplier and currency).
-  - When it is larger than every credit left, the shortfall is a deficit that the next credits fill first.
-  - Nothing is stored: the projection recomputes it on every read. Orders are then settled oldest first (FIFO) from
-    what remains, so `settledCny`, the slices and goods INR (`settledInr`, landed cost) follow the credits that are
-    really left.
-  - Example (`src/modules/ledger/lifo.test.ts`): credits A ¥100 @10 (1 Oct), B ¥100 @11 (5 Oct), C ¥100 @12 (9 Oct)
-    and an order of ¥120.
-    - A −¥150 adjustment (10 Oct) empties C and half of B. The order settles A ¥100 @10 + B ¥20 @11 = ₹1,220, and the
-      balance is +¥30.
-    - At −¥300 nothing is left: the order is unpaid and the balance is −¥120.
-    - Dated 6 Oct instead, the −¥150 takes B and then ¥50 of A; C (9 Oct) is untouched.
+- **Negative adjustments (LIFO 2026-11-20; M7 and "oldest obligation first" confirmed by the owner on 2026-11-21).**
+  1. **Eligible credits.** A negative adjustment can take a credit only if it is dated on or before the adjustment and
+     was recorded before the adjustment was created.
+  2. **Worked out as recorded.** The adjustment's take is worked out as of the moment it was recorded: from its
+     eligible credits (less what adjustments recorded before it took), the dues of its date as they were then recorded
+     (orders, deleted ones included, and earlier shortfalls, dated on or before it, each at its value then) settle the
+     oldest first; the adjustment takes what is left free of them, **newest first**. **No credit is taken twice**: an
+     adjustment never takes money that settled an order or a shortfall dated on or before it, nor a credit taken by an
+     adjustment recorded before it. An order dated after the adjustment is a newer obligation: a backdated adjustment
+     (recorded after such an order already had its credits) is older, so it takes them first, and that order waits for
+     later credits (oldest obligation first). It may not do so to an order whose landed cost is final: LED-3 refuses
+     such an adjustment (422 `entryDate`, nothing written; owner decision 2026-11-21).
+  3. **Shortfall.** What the free eligible credits can't cover is a shortfall, payable to the supplier from the
+     adjustment's date. The balance is negative from that date (the statement's running balance shows it).
+  4. **Oldest obligation first.** Orders and shortfalls are settled together, oldest first: an order by its
+     `order_date`, a shortfall by its adjustment's `entry_date`, then the moment recorded, then id. Later credits
+     enter in date order and reduce the negative balance through this ordinary settlement: a later credit settles an
+     older shortfall before a newer order, and an older order before a newer shortfall.
+  5. **Never rewritten.** A credit dated after the adjustment, or recorded after it with an earlier date, never
+     changes its take; it settles orders and shortfalls in date order instead. Nor do orders recorded after it, later
+     order value changes, later adjustments, or an ORD-6 delete (a deleted order's postings keep its id in their key,
+     so the adjustments recorded while it existed still see it). Exceptions: a void (rule 6), and an ORD-5 order-date
+     move, because only an order's current date is known (no history is kept).
+  6. **Voids.** A void reverses its payment where that payment stands: the payment's credit is its amount less the
+     void, so a voided payment is as if it had never been recorded. Every adjustment is recalculated without it, by
+     rules 1-5 (still from the credits of its own date, never a later one).
+  7. **Currency and rates.** Each account (supplier and currency) settles apart. Each credit keeps its own rate
+     snapshot; nothing is converted or re-rated. Balances in the account's currency are the sum of the postings; the
+     INR paid is each payment (less its void) at its own rate; goods INR is each settling slice at its credit's rate.
+  8. Nothing is stored: the projection (`projectAccount` in `src/modules/ledger/ledger.ts`) recomputes it on every
+     read. The account's `outstandingCny` is the orders' outstanding only: while a shortfall is unsettled, the payable
+     balance is larger by it.
+  - Examples (`src/modules/ledger/lifo.test.ts`): credits A ¥100 @10 (1 Oct), B ¥100 @11 (5 Oct), C ¥100 @12 (9 Oct)
+    and an order o1 of ¥120 dated 2 Oct, all recorded on their dates. When an adjustment is recorded on 10 Oct, o1
+    has A and ¥20 of B; ¥180 is free (B ¥80, C ¥100).
+    - **Enough free credits.** −¥150 on 10 Oct takes C and ¥50 of B. o1 keeps A ¥100 @10 + B ¥20 @11 = ₹1,220; the
+      balance is +¥30. A later credit (¥100 @15 on 12 Oct) does not change this: it is left over.
+    - **More than the free credits.** −¥300 takes the free ¥180 and is ¥120 short. o1 stays paid (its credits are
+      never taken); the balance is −¥120, all of it the shortfall.
+    - **Future credits are not taken.** Dated 6 Oct, −¥150 can take only B's free ¥80 (C is dated later): ¥70 short
+      from 6 Oct. C then settles the shortfall; the balance is +¥30.
+    - **Later credits, oldest obligation first.** −¥350 on 10 Oct is ¥170 short. With an order o2 of ¥80 dated 11 Oct,
+      D ¥100 @13 (12 Oct) goes to the shortfall (10 Oct, older than o2): ¥70 still short. E ¥100 @14 (14 Oct) settles
+      the shortfall's last ¥70, then ¥30 of o2 at E's rate (₹420); the balance is −¥50, o2's outstanding.
+    - **The owner's example.** −¥50 on 2 Oct with no credits: ¥50 short. An order of ¥120 on 3 Oct. C ¥100 on 5 Oct
+      settles the 2 Oct shortfall (¥50), then ¥50 of the order. −¥100 on 6 Oct finds nothing free (C is spent) and is
+      ¥100 short. Payable ¥170: the 6 Oct shortfall ¥100 and the order's ¥70. A next credit settles the order's ¥70
+      first (3 Oct), then the 6 Oct shortfall.
+    - **An adjustment recorded later but dated earlier.** A ¥100 on 1 Oct; −¥50 dated 8 Oct takes ¥50 of A. Then −¥80
+      dated 4 Oct, recorded on 12 Oct, can take only A's other ¥50: ¥30 short from 4 Oct.
+    - **A credit recorded later.** An order of ¥200 (3 Oct) has Z1 ¥100 @11 (6 Oct) and Z2 ¥100 @12 (8 Oct) when −¥100
+      is recorded on 10 Oct: ¥100 short. X ¥200 @10 dated 5 Oct, recorded on 15 Oct, never changes that: X settles the
+      order, Z1 the shortfall, and Z2 a later order o2 (11 Oct) at ₹1,200.
+    - **A void.** With D ¥100 @13 (12 Oct) after −¥150 (10 Oct), voiding C: recalculated without C, the adjustment
+      takes B's free ¥80 and is ¥70 short; D settles that. o1 keeps A and ¥20 of B; the balance is +¥30.
+    - **A void that leaves nothing free.** With only A and B before the adjustment, voiding B: o1 had all of A, so all
+      ¥150 is short. D (12 Oct) settles o1's last ¥20 first (older), then ¥80 of the shortfall; E (14 Oct) its last
+      ¥70.
+    - **A deleted order.** A ¥100 @10 (1 Oct) and B ¥100 @11 (2 Oct) settle o1 ¥200 (3 Oct) when −¥100 is recorded on
+      10 Oct: ¥100 short. Deleting o1 later doesn't change that: the shortfall gets A, and a later order o2 (11 Oct) B.
+    - **A backdated adjustment.** A ¥100 (1 Oct) settles o (5 Oct). −¥100 dated 3 Oct, recorded later, is older than o: it
+      takes A, and o is unpaid until a later credit (refused if o's landed cost is final).
 - Goods INR (`settledInr`) = Σ slices, each at its own credit's rate. It is null when any slice has no rate.
 - An order whose debit is not posted yet has null figures (`posted: false`, not shown in responses).
 
@@ -180,7 +230,7 @@ and exports.
 | --- | --- | --- | --- |
 | LED-1 | `GET /suppliers/:supplierId/ledger` | payments View | `{ supplier: {id, code, name, currency, exchangeRate, status}, accounts: LedgerAccount[], currencyOptions: string[], entries: LedgerEntry[] (newest first), orders: [{ id, po, orderDate, stage, currency, exchangeRate, valueCny, ...SettlementFields, ...MilestoneFields }] (oldest first), held: [{ currency, reason, orders[], payments[], advanceEntries[] }] }` |
 | LED-2 | `GET /supplier-ledger` | payments View | `{ accounts: [LedgerAccount & { supplier, code, status }] (name, then currency), totals: [{ currency, accounts, balanceCny, payableCny, availableCny, outstandingCny }] (held left out), suppliers: [{id, name, status}] }` |
-| LED-3 | `POST /suppliers/:supplierId/ledger/adjustments` (one request per key at a time; a key already posted replays before any other check; `balanceBefore`/`balanceAfter` are the account's at the moment recorded, the entry's `runningBalance` is null here — LED-1 gives the date-order running balance) | payments **Full** | body `{ currency, amount /* signed, ≠ 0, 2 dp */, entryDate /* ≤ today */, rateInr? /* required non-INR, none or 1 for INR */, reason, idempotencyKey /* uuid */ }` (strict: other keys 400) → 201 `{ entry: LedgerEntry, balanceBefore, balanceAfter }`; same key + same details → 200 same; same key + other details → 409 `idempotency_conflict`; 409 `account_held`; 422 fields; 503 |
+| LED-3 | `POST /suppliers/:supplierId/ledger/adjustments` (one request per key at a time; a key already posted replays before any other check; `balanceBefore`/`balanceAfter` are the account's at the moment recorded, the entry's `runningBalance` is null here — LED-1 gives the date-order running balance) | payments **Full** | body `{ currency, amount /* signed, ≠ 0, 2 dp */, entryDate /* ≤ today */, rateInr? /* required non-INR, none or 1 for INR */, reason, idempotencyKey /* uuid */ }` (strict: other keys 400) → 201 `{ entry: LedgerEntry, balanceBefore, balanceAfter }`; same key + same details → 200 same; same key + other details → 409 `idempotency_conflict`; 409 `account_held`; 422 fields; 422 `entryDate` when it would change the settlement of an order whose landed cost is final ("An adjustment on this date would change the payments that settle <POs>, whose landed cost is already final. Choose a later date.", nothing written; owner decision 2026-11-21, the M8 check of `costs/landed-cost.ts`); 503 |
 | LED-4 | `GET /supplier-ledger/reconciliation` | admin Full | `{ ok, checks: [{ id, title, ok, problems[] }] }` |
 
 `currencyOptions` (D10) is the supplier's current currency plus every currency with a non-zero balance, never a held
@@ -236,6 +286,9 @@ one, ordered CNY, USD, INR, then the rest.
   - `deposits[]` takes **agent payees only**. A supplier payee answers 422 `deposits`: "Record supplier payments with
     Record payment."
   - Posts the order's debit in the same transaction.
+  - Refused with 422 `orderDate` when the order would change the settlement of an order whose landed cost is final
+    (M8, below): "This order date comes before <POs>, whose landed cost is already final: the order would take the
+    payments that settle it. Choose a later order date." Nothing is written.
   - Response: `{ order: { id, po }, ledger: { supplierId, currency, debitCny, balanceBefore, balanceAfter } }`.
 - **ORD-4 `GET /orders/:po`.** Removed: `paidCny`, `paidInr`, `supplierPaidCny`, `supplierPaidInr`, `advanceCny`,
   `advanceInr`, `excessCny`, `excessInr`, `advanceStatus`, `balanceCny`, `advanceEntries`, `advanceAvailableCny`,
@@ -253,6 +306,9 @@ one, ordered CNY, USD, INR, then the rest.
   - Response `{ order, ledger?: { supplierId, currency, changeCny, balanceBefore, balanceAfter } }` (`ledger` only when
     lines were sent).
   - Date, terms, PO and deposit-required edits post nothing.
+  - A new order date is refused with 422 `orderDate` when it would change the settlement of an order whose landed cost
+    is final (M8): "Changing the order date would change the payments that settle <POs>, whose landed cost is already
+    final. Keep the saved order date." Nothing is changed.
 - **ORD-6 `DELETE /orders/:po`.** Guard; held answers 409. Existing refusals stay: payments of any kind (voided
   included), receipts, containers, warehouse lines. Posts `order_cancel`, then deletes. Returns 204.
 
@@ -297,6 +353,9 @@ one, ordered CNY, USD, INR, then the rest.
   - `summary.paidInr` = Σ row `paidInr`.
 - **RPT-O1 `GET /orders/:po/report`:**
   - `payments`: `{ list: PaymentRow[], ...SettlementFields, slices, agentPaidCny, agentPaidInr, dueCny, ...MilestoneFields }`.
+    A held account's order has null `agentPaidCny`, `agentPaidInr` and `dueCny` too (as ORD-4): no money figure at all.
+- **RPT-O2 `GET /reports/orders`:** `summary.paidInr` and `summary.landedCostInr` leave a held account's orders out, as
+  `summary.byCurrency` does.
     Removed: `paidCny`, `paidInr`, `advance*`, `excess*`, `balanceCny`, `depositsPaidCny`, `advanceEntries`.
   - `supplierAccount`: `{ orders, openOrders, purchaseValue, settled, outstanding /* byCurrency lists */, accounts: LedgerAccount[], entries: LedgerEntry[], deposits: { summary, list } /* archive */ }`.
 - **Landed cost** (`loadLandedCosts`, LC `GET /landed-cost`, RPT-6):
@@ -304,10 +363,14 @@ one, ordered CNY, USD, INR, then the rest.
   - `goodsPayments` = the slices, so the list and the total agree;
   - `waitingFor: "supplier payment"` while outstanding > 0 or the order has no settlement;
   - sea freight = non-void agent payments.
+  - LC rows carry `held` (the order's account is held): listed, their money in no total.
 - **SUP-1 `GET /suppliers/summary`:** `unpaid` = Σ payable (negative) ledger balances per currency, held left out.
-  Due windows read non-void due rows.
+  Due windows read non-void due rows. `openPos` counts and totals the same orders: a held account's orders are in
+  neither its `count` nor its `value`, and are counted apart in `heldCount` (the card's "pending review" line). MD-1's
+  per-supplier `openPos` ("Active POs") follows the same rule, with the held ones in `heldOpenPos`.
 - **SUP-2 / MD-1 `GET /suppliers`:** `balance` per currency = the signed ledger balance; held accounts are left out of
-  it and listed in `heldCurrencies: string[]`.
+  it and listed in `heldCurrencies: string[]`. SUP-2's `value` (per supplier and per month) leaves a held account's
+  orders out, as MD-1's `ytdValue` does; its delivery and completion counts still count every order.
 - **WH-2:**
   - `previousOutstanding[]`: per supplier, `byCurrency` Σ outstanding (projection) of its other orders dated before
     the trip (> 0 only, held left out), plus `ledgerBalance: [{ currency, balanceCny }]`;
@@ -321,18 +384,77 @@ one, ordered CNY, USD, INR, then the rest.
 
 ## Scripts
 
-- **`scripts/ledger-backfill.ts`.** `[--preflight] [--apply --database <name>]`.
+The release and rollback order is in `docs/operator-commands.md` ("Unified supplier ledger").
+
+- **The approved baseline** (`legacyRecords`, format `supplier-ledger-baseline/2`): every legacy record (orders, order
+  lines, payments, advance entries, supplier deposits and their transactions) by id, with its financial fields only.
+  - Left out, so harmless work never blocks the cutover: an order's stage, delivery date and terms; a line's item and
+    position; modes, references, notes, `created_at`/`updated_at`/`created_by`; the payment columns 0017 added.
+  - Written once, in the rehearsal, from the production snapshot restored on this computer (`--write-baseline`). It
+    never overwrites a file, and is refused with `NODE_ENV=production` or a database that is not local. The owner
+    approves the file by its sha256.
+  - Every later step reads it with `--baseline <file> --baseline-sha256 <sha>` (the sha256 is always required) and lists
+    each record added, removed or changed since. A file of the older whole-row format, or with another sha256, is refused.
+- **`scripts/ledger-backfill.ts`.** `[--preflight] [--baseline f [--baseline-sha256 h]] [--apply --database <name> --baseline f --baseline-sha256 h]`.
   - A dry run by default. Idempotent.
   - Holds SUP-010 CNY and leaves out the excluded receipts (`DEFAULT_RECEIPT_EXCLUSIONS`).
-- **`scripts/ledger-reconcile.ts`.** `[--write-baseline f] [--baseline f] [--compare-legacy --expect PO…] [--open "note" | --close "reason"] [--database <name>]`.
-  - `--open` is refused unless `--baseline` and `--compare-legacy` are given and every check passes.
+  - `--apply` compares the legacy records with the approved baseline in the same snapshot it posts from (repeatable
+    read), and is refused on any difference.
+- **`scripts/ledger-reconcile.ts`.**
+  - `--write-baseline <new file>` (rehearsal only) and `--check-baseline f --baseline-sha256 h` (read-only, works before
+    0017; exit 1 on any difference).
+  - Checks: `[--baseline f --baseline-sha256 h] [--compare-legacy --expect <PO>=<legacy settled>:<ledger settled>…]`
+    `[--open "note" | --close "reason"] [--database <name>]`.
+  - `--expect` names each approved legacy difference with both amounts, to the cent. An unlisted difference, a listed
+    one with other amounts, a listed one that does not occur and a PO listed twice all fail; a bare PO is refused.
+  - `--open` is refused unless `--baseline`, `--baseline-sha256` and `--compare-legacy` are given and every check passes.
+    The checks and the switch to live run in one repeatable-read transaction that first locks the legacy tables, the
+    journal and the holds against writes (SHARE, 10 s lock timeout), so nothing can change between them.
   - The checks include the exclusion list (every DEFAULT_HOLDS entry must name a supplier and be held) and "no supplier
     deposit exists" (D8: they are never posted, so any one needs an owner decision).
-- **Backfill `--apply`** is refused while any hold on the list names no supplier, or any excluded receipt is unresolved.
-- **If reconciliation reports order drift** (an old-backend line edit or delete between the migration and the new
-  backend): stop, keep the guard in maintenance, and investigate. No application write exists yet, so the rehearsed
-  rollback is still allowed.
-- **`scripts/ledger-rollback-check.ts`.** `--baseline f`. Runs the pre-rollback checklist: exit 0 only before any
-  application write.
-- **`scripts/rollback/0017-down.sql`.** The rehearsed down migration. It refuses by itself once the application has
-  written.
+- **Backfill `--apply`** is refused while any hold on the list names no supplier, any excluded receipt is unresolved,
+  or any legacy record differs from the approved baseline.
+- **If reconciliation reports order drift or any baseline change** (for example an old-backend edit between the
+  migration and the new backend): stop, keep the guard in maintenance and data entry paused, and report to the owner.
+  The cutover continues only after a new rehearsal and a new approved baseline. The rollback check refuses too (its
+  item 4/5), so a rollback then also needs the owner's decision on that change.
+- **`scripts/ledger-rollback-check.ts`.** `--baseline f --baseline-sha256 h`. Runs the pre-rollback checklist: exit 0
+  only while the ledger is in maintenance, nothing was written through the new backend (no `app` entry, no orderless,
+  voided or keyed payment) and every legacy record still matches the approved baseline.
+- **`scripts/rollback/0017-down.sql`.** The rehearsed down migration, run with psql.
+  - It sets `ON_ERROR_STOP` itself: a refusal or any error exits non-zero (3) with nothing changed.
+  - It locks `ledger_state`, the holds, the journal and `payments` before its guard reads them (lock timeout 10 s).
+  - It refuses while `ledger_state` is not `maintenance`, and once the application has written (an `app` entry, an
+    orderless, voided or keyed payment).
+
+## Owner decisions on the pre-release audit (2026-11-21)
+
+- **M7. Negative adjustments and voids** (rules confirmed 2026-11-21): "Negative adjustments" in the FIFO projection
+  above: eligible credits only, the take worked out as recorded, no credit taken twice, shortfalls payable from their
+  date and settled oldest obligation first with the orders, voids recalculated the same way. Tests:
+  `src/modules/ledger/lifo.test.ts` (unit tests, and "negative adjustments through the API": the owner's example,
+  retries, a repeated void, a credit recorded later, and each currency apart) and `src/modules/ledger/ledger.test.ts`.
+- **M8. Final settlements are kept** (approved by the owner on 2026-11-21: the ORD-3 and ORD-5 order-date checks,
+  and the LED-3 adjustment check). FIFO settles by `order_date`, so an order created with a past
+  date, or moved by an ORD-5 date change, could take money that settles later orders, including orders closed with a
+  final landed cost (`costs/landed-cost.ts`: fully settled, cleared, unloaded and stocked). ORD-3 and an ORD-5 date
+  change now project the account before and after the write in its transaction, with the account locked
+  (`guardFinalSettlements`), and refuse it (422 `orderDate`, nothing written) when any order whose landed cost was
+  final would be settled by other credits or other amounts. ORD-5 judges the date move only: with lines in the same
+  request, the check runs after the value change is posted. ORD-3 skips the check when no stage-6 order of the account
+  is dated after the new one (only those are settled after it, and only stage 6 can be final). Other date changes and
+  new orders re-settle by FIFO as before. Every new LED-3 adjustment (either sign, any date) runs the same check and is
+  refused (422 `entryDate`, nothing written) when it would change a final order's settlement; a backdated one may
+  still change later-dated orders that are not final (owner decision 2026-11-21). Remaining limitations (not covered
+  by these checks; known to the owner at the approval):
+  - an ORD-5 value increase or an ORD-6 delete of an earlier open order, a void, or a payment recorded with a past
+    date (PAY-2) can still move a final order's settlement. A void removes its payment and every adjustment is
+    recalculated without it, which can re-price or reopen orders, final ones included;
+  - "final" is read from the clearing, transport and warehouse rows without locking them: a write that makes an order
+    final while an ORD-3, ORD-5 or LED-3 is between its two projections is not seen by that check (a narrow window);
+  - an order may be dated in the future (ORD-3 has no upper bound). A final order dated after today, settled by
+    credits dated before it, makes every negative LED-3 adjustment that would take those credits refused, whatever
+    its date (an adjustment can't be dated after today), until that order's date is corrected;
+  - a held account's orders are never final while held, so ORD-5 date changes on them are not checked; once a hold
+    is released, their dates decide FIFO with the rest.
+  Tests: `src/modules/ledger/ledger-flows.test.ts` ("final settlements are kept").

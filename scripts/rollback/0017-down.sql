@@ -1,10 +1,20 @@
--- Rollback of migration 0017_supplier_ledger (docs/unified-ledger.md, plan section 14). Run ONLY after
--- scripts/ledger-rollback-check.ts passes and the owner approves, with the previous backend already redeployed.
--- It refuses by itself when the application has written any financial record through the new backend.
+-- Rollback of migration 0017_supplier_ledger (docs/operator-commands.md, "Rollback"; plan section 14). Run ONLY with
+-- the new backend stopped, after scripts/ledger-rollback-check.ts passes and the owner approves; the previous backend is
+-- redeployed after it. It refuses by itself (psql exits non-zero, nothing is changed) while the ledger is not in
+-- maintenance, and once the application has written any financial record through the new backend.
+\set ON_ERROR_STOP on
 begin;
+
+-- Everything the guard reads or the rollback drops is locked before the guard reads it, so nothing can be written
+-- between the check and the drop. Give up rather than wait behind a long transaction (and block everyone behind us).
+set local lock_timeout = '10s';
+lock table ledger_state, supplier_ledger_holds, supplier_ledger_entries, payments in access exclusive mode;
 
 do $$
 begin
+  if (select state from ledger_state where id = 'ledger') is distinct from 'maintenance' then
+    raise exception 'rollback refused: the ledger is not in maintenance (close it first: ledger-reconcile.ts --close)';
+  end if;
   if exists (select 1 from supplier_ledger_entries where origin = 'app')
      or exists (select 1 from payments where order_id is null or voided_at is not null or client_request_id is not null) then
     raise exception 'rollback refused: the ledger has application-written records (roll forward only)';

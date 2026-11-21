@@ -15,7 +15,7 @@ import {
   warehouseReceipts,
 } from "../../db/schema";
 import { type Ledger, loadLedger } from "../ledger/ledger";
-import { round2 } from "../orders/orders.routes";
+import { round2 } from "../orders/money";
 
 // Landed cost per order (docs/wave3-contracts.md sections 6.1-6.2; goods per docs/unified-ledger.md). Coordinator-owned:
 // Agents 3, 5 and 6 call loadLandedCosts and never copy it. All amounts are INR with 2 decimals.
@@ -153,11 +153,24 @@ export function computeLandedCosts(facts: LandedCostFacts): Map<string, OrderLan
   return costs;
 }
 
+/** Promise.all, one at a time (a transaction's single connection). */
+async function inSequence<T extends readonly unknown[]>(list: T) {
+  const done: unknown[] = [];
+  for (const item of list) done.push(await item);
+  return done as { -readonly [K in keyof T]: Awaited<T[K]> };
+}
+
 /**
  * Landed cost of the given orders (every order when omitted), keyed by order id. Five queries whatever the count, plus
- * the ledger of the orders' suppliers unless the caller passes the one it already loaded.
+ * the ledger of the orders' suppliers unless the caller passes the one it already loaded. Inside a transaction (one
+ * connection) pass `inTransaction`: the queries then run one after another, as pg needs, instead of together.
  */
-export async function loadLandedCosts(db: Pick<Database, "select">, orderIds?: string[], given?: Ledger): Promise<Map<string, OrderLandedCost>> {
+export async function loadLandedCosts(
+  db: Pick<Database, "select">,
+  orderIds?: string[],
+  given?: Ledger,
+  { inTransaction = false }: { inTransaction?: boolean } = {},
+): Promise<Map<string, OrderLandedCost>> {
   if (orderIds?.length === 0) return new Map();
   const of = (column: PgColumn) => (orderIds ? inArray(column, orderIds) : undefined);
   // The containers carrying the orders; every container when no orders are given.
@@ -176,7 +189,9 @@ export async function loadLandedCosts(db: Pick<Database, "select">, orderIds?: s
     return loadLedger(db, { supplierIds: [...new Set(owners.map((row) => row.id))] });
   };
 
-  const [orderRows, agentRows, ledger, loads, containerRows, stocked] = await Promise.all([
+  // Drizzle's queries start when awaited: together on a pool, one by one in a transaction.
+  const queries = [
+    inTransaction ? await ledgerOf() : ledgerOf(),
     // Joined, not a correlated subquery: Drizzle leaves columns unqualified in a select without joins.
     db
       .select({
@@ -200,7 +215,6 @@ export async function loadLandedCosts(db: Pick<Database, "select">, orderIds?: s
       .innerJoin(orders, eq(orders.id, payments.orderId))
       // A held account's payments (D4) count in no figure: its orders' sea freight leaves them out too.
       .where(and(eq(payments.status, "paid"), eq(payments.payeeRole, "agent"), isNull(payments.voidedAt), of(payments.orderId), sql`not exists (select 1 from supplier_ledger_holds h where h.supplier_id = ${orders.supplierId} and h.currency = ${orders.currency})`)),
-    ledgerOf(),
     db
       .select({
         containerId: containerLines.containerId,
@@ -237,7 +251,8 @@ export async function loadLandedCosts(db: Pick<Database, "select">, orderIds?: s
       .innerJoin(orderLines, eq(orderLines.id, warehouseReceiptLines.orderLineId))
       .where(of(orderLines.orderId))
       .groupBy(orderLines.orderId),
-  ]);
+  ] as const;
+  const [ledger, orderRows, agentRows, loads, containerRows, stocked] = inTransaction ? await inSequence(queries) : await Promise.all(queries);
 
   // ponytail: a slice whose credit has no rate (legacy NULL) adds no INR; the order's settledInr says null for it.
   const goods = orderRows.flatMap((order) =>
@@ -255,4 +270,28 @@ export async function loadLandedCosts(db: Pick<Database, "select">, orderIds?: s
     })),
     stocked,
   });
+}
+
+/**
+ * Pre-release audit M8: an order whose landed cost is final keeps its settlement. A write that can move the account's
+ * FIFO order (ORD-3 with a past date, an ORD-5 order-date change, an LED-3 adjustment) takes this before it writes,
+ * with the account locked, and calls the returned check after, in the same transaction: the check gives the PO numbers
+ * of the final orders whose settling credits or amounts changed (reopened or re-priced), so the caller refuses the
+ * write. Empty means no change.
+ * ponytail: two projections of the supplier's ledger per such write (a few hundred rows); fine at ORD-3/5 and LED-3 rates.
+ */
+export async function guardFinalSettlements(db: Pick<Database, "select">, supplierId: string, currency: string) {
+  const slicesOf = (ledger: Ledger, id: string) => JSON.stringify(ledger.order(id)?.slices.map((slice) => [slice.entryId, slice.amount]) ?? null);
+  const before = await loadLedger(db, { supplierIds: [supplierId] });
+  const ids = [...before.orders.values()].filter((row) => row.currency === currency && row.posted).map((row) => row.orderId);
+  const costs = await loadLandedCosts(db, ids, before, { inTransaction: true });
+  const final = ids.filter((id) => costs.get(id)?.final);
+  return async () => {
+    if (final.length === 0) return [];
+    const after = await loadLedger(db, { supplierIds: [supplierId] });
+    const changed = final.filter((id) => slicesOf(before, id) !== slicesOf(after, id));
+    if (changed.length === 0) return [];
+    const rows = await db.select({ po: orders.poNumber }).from(orders).where(inArray(orders.id, changed)).orderBy(orders.orderDate, orders.poNumber);
+    return rows.map((row) => row.po);
+  };
 }

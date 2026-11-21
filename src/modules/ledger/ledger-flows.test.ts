@@ -312,9 +312,9 @@ describe("the write-state guard", () => {
     const order = await place(100);
     const paid = (await pay(supplierPayment({ amount: 10 }))).body.payment;
     await ctx.db.execute(sql`update ledger_state set state = 'maintenance'`);
-    const paused = (res: { status: number; body: { error?: { code: string; message: string } } }) => {
+    const paused = (res: { status: number; body: { error?: { code: string; message: string } } }, message = LEDGER.maintenance) => {
       expect(res.status, JSON.stringify(res.body)).toBe(503);
-      expect(res.body.error).toEqual({ code: "ledger_maintenance", message: LEDGER.maintenance });
+      expect(res.body.error).toEqual({ code: "ledger_maintenance", message });
     };
     paused(await pay(supplierPayment()));
     paused(await pay(agentPayment(order.order.id)));
@@ -325,13 +325,147 @@ describe("the write-state guard", () => {
         .set("Cookie", management),
     );
     paused(await http.post("/orders", { supplierId: guangzhou, orderDate: indiaDay(-1), deliveryDate: indiaDay(9), lines: [{ itemId: jeans, quantity: 1, rateCny: 1 }] }).set("Cookie", management));
-    paused(await editLines(order.order.po, order.order.id, 200));
+    paused(await editLines(order.order.po, order.order.id, 200), LEDGER.orderMaintenance);
     paused(await http.delete(`/orders/${order.order.po}`).set("Cookie", management));
-    expect((await http.patch(`/orders/${order.order.po}`, { deliveryDate: indiaDay(40) }).set("Cookie", management)).status).toBe(200);
+    // ORD-5: the order date, PO number and deposit asked are the cutover baseline's fields: refused (and nothing saved).
+    const edit = (body: object) => http.patch(`/orders/${order.order.po}`, body).set("Cookie", management);
+    for (const body of [{ orderDate: indiaDay(-11) }, { po: "MAINT-RENAMED" }, { depositRequiredCny: 50 }, { deliveryDate: indiaDay(41), orderDate: indiaDay(-12) }]) paused(await edit(body), LEDGER.orderMaintenance);
+    expect((await ctx.db.select().from(orders).where(eq(orders.id, order.order.id)))[0]).toMatchObject({ poNumber: order.order.po, orderDate: indiaDay(-10), depositRequiredCny: null });
+    // Delivery date and terms are not; nor is a field sent back unchanged with them (the dialog sends the whole form).
+    expect((await edit({ deliveryDate: indiaDay(40) })).status).toBe(200);
+    expect((await edit({ terms: "FOB" })).status).toBe(200);
+    const unchanged = await edit({ po: order.order.po, orderDate: indiaDay(-10), depositRequiredCny: null, deliveryDate: indiaDay(42), terms: "CNF" });
+    expect(unchanged.status, JSON.stringify(unchanged.body)).toBe(200);
+    expect(unchanged.body.order).toMatchObject({ po: order.order.po, orderDate: indiaDay(-10), deliveryDate: indiaDay(42), terms: "CNF" });
     for (const path of ["/payments", "/orders", `/orders/${order.order.po}`, "/supplier-ledger", `/suppliers/${guangzhou}/ledger`, "/reports/orders", "/deposits", "/orders/options"]) {
       expect((await get(path)).status, path).toBe(200);
     }
     expect(await postingsOf(eq(entries.supplierId, guangzhou))).toHaveLength(2);
+  });
+});
+
+describe("final settlements are kept (pre-release audit M8)", () => {
+  // buildLifecycle: Guangzhou's only order A (40 days ago, ¥3,000) is settled by ¥2,000 @12 and ¥1,000 @13 and its
+  // landed cost is final (stocked, cleared, unloaded).
+  const finalA = async (id: string) => {
+    const cost = ((await get("/landed-cost")).body.orders as { orderId: string; final: boolean; goodsInr: number }[]).find((row) => row.orderId === id)!;
+    expect(cost).toMatchObject({ final: true, goodsInr: 37_000 });
+  };
+  const create = (orderDate: string, quantity = 100) =>
+    http.post("/orders", { supplierId: guangzhou, orderDate, deliveryDate: indiaDay(20), lines: [{ itemId: jeans, quantity, rateCny: 1 }] }).set("Cookie", management);
+  const refused = (res: { status: number; body: { error?: { code: string; fields?: Record<string, string> } } }, po: string, edit = false) => {
+    expect(res.status, JSON.stringify(res.body)).toBe(422);
+    expect(res.body.error?.fields).toEqual({
+      orderDate: edit
+        ? `Changing the order date would change the payments that settle ${po}, whose landed cost is already final. Keep the saved order date.`
+        : `This order date comes before ${po}, whose landed cost is already final: the order would take the payments that settle it. Choose a later order date.`,
+    });
+  };
+
+  it("ORD-3: an order dated before a final order is refused (reopening it, or re-pricing it from other credits); nothing is written", async () => {
+    const data = await buildLifecycle(ctx);
+    const before = { orders: (await ctx.db.select().from(orders)).length, entries: (await postingsOf(eq(entries.supplierId, guangzhou))).length };
+    refused(await create(indiaDay(-41)), data.a.po);
+    // With ¥500 more available, A stays fully paid, but from other credits (@15 instead of part of @12): refused too.
+    await pay(supplierPayment({ amount: 500, paidOn: indiaDay(-1), rateInr: 15 }));
+    refused(await create(indiaDay(-41)), data.a.po);
+    expect((await ctx.db.select().from(orders)).length).toBe(before.orders);
+    expect(await postingsOf(eq(entries.supplierId, guangzhou))).toHaveLength(before.entries + 1);
+    await finalA(data.a.id);
+    // The same day as A (recorded after it, so settled after it) or later: placed, and A keeps its settlement.
+    expect((await create(indiaDay(-40))).status).toBe(201);
+    expect((await create(indiaDay(-1))).status).toBe(201);
+    await finalA(data.a.id);
+  });
+
+  it("ORD-5: moving an open order before a final one is refused and nothing changes; other date moves re-settle by FIFO as before", async () => {
+    const data = await buildLifecycle(ctx);
+    const later = await place(100, { orderDate: indiaDay(-5) });
+    const latest = await place(100, { orderDate: indiaDay(-1) });
+    const move = (po: string, orderDate: string) => http.patch(`/orders/${po}`, { orderDate }).set("Cookie", management);
+    refused(await move(latest.order.po, indiaDay(-41)), data.a.po, true);
+    expect((await ctx.db.select({ orderDate: orders.orderDate }).from(orders).where(eq(orders.id, latest.order.id)))[0]!.orderDate).toBe(indiaDay(-1));
+    await finalA(data.a.id);
+    // ¥100 available: it settles the oldest open order (later); moving latest before it moves the ¥100 (FIFO).
+    await pay(supplierPayment({ amount: 100 }));
+    expect((await get(`/orders/${later.order.po}`)).body).toMatchObject({ settledCny: 100, paymentStatus: "paid" });
+    const moved = await move(latest.order.po, indiaDay(-6));
+    expect(moved.status, JSON.stringify(moved.body)).toBe(200);
+    expect((await get(`/orders/${latest.order.po}`)).body).toMatchObject({ settledCny: 100, paymentStatus: "paid" });
+    expect((await get(`/orders/${later.order.po}`)).body).toMatchObject({ settledCny: 0, paymentStatus: "unpaid" });
+    await finalA(data.a.id);
+  });
+
+  const adjust = (amount: number, entryDate: string, rateInr = 12) =>
+    http
+      .post(`/suppliers/${guangzhou}/ledger/adjustments`, { currency: "CNY", amount, entryDate, rateInr, reason: "Supplier refund", idempotencyKey: randomUUID() })
+      .set("Cookie", management);
+  const adjustmentRefused = (res: { status: number; body: { error?: { fields?: Record<string, string> } } }, po: string) => {
+    expect(res.status, JSON.stringify(res.body)).toBe(422);
+    expect(res.body.error?.fields).toEqual({
+      entryDate: `An adjustment on this date would change the payments that settle ${po}, whose landed cost is already final. Choose a later date.`,
+    });
+  };
+
+  it("LED-3: a backdated adjustment that would change a final order's settlement is refused; nothing is written", async () => {
+    const data = await buildLifecycle(ctx);
+    const adjustments = async () => (await postingsOf(and(eq(entries.supplierId, guangzhou), eq(entries.entryType, "adjustment"))!)).length;
+    // −¥100 dated before A (40 days ago): nothing was free then, and its shortfall, older than A, would take A's money.
+    adjustmentRefused(await adjust(-100, indiaDay(-41)), data.a.po);
+    // +¥100 dated before A: a credit A would take first, re-pricing it.
+    adjustmentRefused(await adjust(100, indiaDay(-41), 15), data.a.po);
+    expect(await adjustments()).toBe(0);
+    await finalA(data.a.id);
+    // Dated after A's settlement: −¥100 finds A's credits taken (¥100 short), +¥100 is left over; both are recorded.
+    expect((await adjust(-100, indiaDay(-20))).status).toBe(201);
+    expect((await adjust(100, indiaDay(-1))).status).toBe(201);
+    expect(await adjustments()).toBe(2);
+    await finalA(data.a.id);
+  });
+
+  it("LED-3 boundaries: on A's date it is allowed; +¥100 between A's credits is refused; the same key with a later date posts", async () => {
+    const data = await buildLifecycle(ctx);
+    // −¥100 on A's own date: recorded after A, so A is settled first and keeps its credits; ¥100 short.
+    expect((await adjust(-100, indiaDay(-40))).status).toBe(201);
+    await finalA(data.a.id);
+    // +¥100 dated −16, between A's credits (−38 and −15): A would take it before the −15 credit, re-priced. Refused.
+    const body = { currency: "CNY", amount: 100, entryDate: indiaDay(-16), rateInr: 15, reason: "Correction", idempotencyKey: randomUUID() };
+    const post = (entryDate: string) => http.post(`/suppliers/${guangzhou}/ledger/adjustments`, { ...body, entryDate }).set("Cookie", management);
+    adjustmentRefused(await post(indiaDay(-16)), data.a.po);
+    // The dialog keeps its key: corrected to the −15th (recorded after that day's credit), the same key posts.
+    expect((await post(indiaDay(-15))).status).toBe(201);
+    expect(await postingsOf(and(eq(entries.supplierId, guangzhou), eq(entries.entryType, "adjustment"))!)).toHaveLength(2);
+    await finalA(data.a.id);
+  });
+
+  it("LED-3: a backdated adjustment may change a later-dated order that is not final (oldest obligation first)", async () => {
+    const data = await buildLifecycle(ctx);
+    const later = await place(100, { orderDate: indiaDay(-5) });
+    await pay(supplierPayment({ amount: 100, paidOn: indiaDay(-6) }));
+    expect((await get(`/orders/${later.order.po}`)).body).toMatchObject({ settledCny: 100, paymentStatus: "paid" });
+    // −¥100 dated the −7th: every credit then was A's, so it is ¥100 short; that shortfall is older than the order (the
+    // −5th), so the −6th's credit settles it first and the order waits for a later credit.
+    const res = await adjust(-100, indiaDay(-7));
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    expect((await get(`/orders/${later.order.po}`)).body).toMatchObject({ settledCny: 0, outstandingCny: 100, paymentStatus: "unpaid" });
+    await finalA(data.a.id);
+  });
+
+  it("ORD-5: a line change sent with a date move is judged on the date move only (a value change is not M8's)", async () => {
+    const data = await buildLifecycle(ctx);
+    // ¥100 more @15, and an open order put before A straight in the database (the API would refuse it): A stays fully
+    // settled and final (re-priced: 1,900 @12, 1,000 @13 and 100 @15).
+    await pay(supplierPayment({ amount: 100, paidOn: indiaDay(-1), rateInr: 15 }));
+    const early = await place(100, { orderDate: indiaDay(-1) });
+    await ctx.db.update(orders).set({ orderDate: indiaDay(-45) }).where(eq(orders.id, early.order.id));
+    const isFinal = async () => ((await get("/landed-cost")).body.orders as { orderId: string; final: boolean }[]).find((row) => row.orderId === data.a.id)!.final;
+    expect(await isFinal()).toBe(true);
+    // Raising it to ¥150 and moving it a day, still before A: the date move alone changes nothing, so it is saved.
+    const [line] = await lines(early.order.id);
+    const res = await http.patch(`/orders/${early.order.po}`, { orderDate: indiaDay(-44), lines: [{ id: line!.id, itemId: jeans, quantity: 150, rateCny: 1 }] }).set("Cookie", management);
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(res.body.order).toMatchObject({ orderDate: indiaDay(-44) });
+    expect((await get(`/orders/${early.order.po}`)).body).toMatchObject({ settledCny: 150, paymentStatus: "paid" });
   });
 });
 

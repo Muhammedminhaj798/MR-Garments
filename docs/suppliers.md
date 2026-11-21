@@ -22,12 +22,13 @@ in place.
 ## Contract
 
 **MD-1 `GET /suppliers?search=&status=`** rows: `{ id, code, name, contactPerson, phone, email, country, city, state,
-postalCode, address, paymentTerms, taxNumber, notes, currency, openOrders, openPos, ytdValue, balance, status }`.
+postalCode, address, paymentTerms, taxNumber, notes, currency, openOrders, openPos, heldOpenPos, ytdValue, balance, status }`.
 `search` matches name, code, country, contact person and phone (contains, ignoring case and spaces).
 
 - `openOrders`: the supplier's orders with `stage < 6`, as before (the Settings tab's "Open orders").
 - `openPos`: the supplier's orders not closed (phase 2 §1): the Suppliers list's "Active POs", the same rule as the
   Open POs card (SUP-1). It differs from `openOrders` only for a stage-6 order whose goods are not all stocked yet.
+  A held account's orders (pending review, docs/unified-ledger.md D4) are left out of it and counted in `heldOpenPos`.
 - `ytdValue`: `{ currency, amount }[]`, the order value of the supplier's orders dated from 1 January of this year
   (India), one entry per order currency present (CNY, USD, INR order). `[]` without such orders.
 - `balance`: `{ currency, amount }[]`, order value less payments paid to the supplier over **every** order, finished
@@ -55,7 +56,7 @@ orders or deposits is refused with 409 `in_use` and is deactivated instead, so h
 
 ```
 { suppliers: { total, active, inactive },
-  openPos: { count, value: MoneyTotal[] },          // orders not closed (phase 2 §1) and their order value
+  openPos: { count, value: MoneyTotal[], heldCount }, // orders not closed (phase 2 §1), their value; held ones apart
   inTransit: { orders, nextEta: date | null, arrivingNext7 },   // orders at stages 3-5; their containers not yet arrived
   unpaid: { amount: MoneyTotal[], suppliers },      // positive supplier balances only, and how many suppliers owe
   upcomingPayments: { windowDays: 7, count, amount: MoneyTotal[] } }   // due supplier payments, today to today + 6

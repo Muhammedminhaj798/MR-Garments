@@ -104,6 +104,7 @@ describe("Suppliers page: MD-1 money, SUP-1 summary and SUP-2 insights", () => {
           { currency: "CNY", amount: 4550 },
           { currency: "USD", amount: 200 },
         ],
+        heldCount: 0,
       },
       inTransit: { orders: 1, nextEta: indiaDay(3), arrivingNext7: 1 },
       // Guangzhou is paid in full: only Foshan's accounts are payable (¥3,250 and $200), so one supplier owes.

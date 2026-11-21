@@ -493,9 +493,10 @@ export async function orderReport(db: Database, po: string, user: CurrentUser) {
           // The FIFO projection of the supplier's account and the credits (slices) that settled the order.
           ...settlementFields(settlement),
           slices,
-          agentPaidCny: header!.agentPaidCny,
-          agentPaidInr: header!.agentPaidInr,
-          dueCny: header!.dueCny,
+          // A held account's order (D4) carries no money figure at all, its sea freight and due rows included (as ORD-4).
+          agentPaidCny: settlement?.held ? null : header!.agentPaidCny,
+          agentPaidInr: settlement?.held ? null : header!.agentPaidInr,
+          dueCny: settlement?.held ? null : header!.dueCny,
           // The Deposit Required milestone (D11): the deposit the supplier asked for against the settled amount.
           ...depositMilestone(row.depositRequiredCny, settlement),
         }

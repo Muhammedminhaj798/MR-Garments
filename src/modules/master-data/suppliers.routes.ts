@@ -147,8 +147,13 @@ export function suppliersRoutes({ db }: RouteContext) {
           hasTransactions: sql<boolean>`count(${orders.id}) > 0 or exists (select 1 from ${supplierDeposits} where ${supplierDeposits.supplierId} = ${suppliers.id})
             or exists (select 1 from ${payments} where ${payments.supplierId} = ${suppliers.id})`,
           openOrders: sql<number>`count(${orders.id}) filter (where ${orders.stage} < 6)`.mapWith(Number),
-          /** Orders not closed (phase 2 §1): the Suppliers page's "Active POs", the same rule as its Open POs card. */
-          openPos: sql<number>`count(${orders.id}) filter (where not ${orderClosed})`.mapWith(Number),
+          /**
+           * Orders not closed (phase 2 §1): the Suppliers page's "Active POs", the same rule as its Open POs card (SUP-1),
+           * so a held account's orders (D4, pending review) are left out, as from the row's value and balance.
+           */
+          openPos: sql<number>`count(${orders.id}) filter (where not ${orderClosed} and not exists (select 1 from supplier_ledger_holds h where h.supplier_id = ${orders.supplierId} and h.currency = ${orders.currency}))`.mapWith(Number),
+          /** The same orders of its held accounts: pending review, counted apart. */
+          heldOpenPos: sql<number>`count(${orders.id}) filter (where not ${orderClosed} and exists (select 1 from supplier_ledger_holds h where h.supplier_id = ${orders.supplierId} and h.currency = ${orders.currency}))`.mapWith(Number),
           status: suppliers.status,
         })
         .from(suppliers)

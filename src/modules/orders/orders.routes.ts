@@ -1,4 +1,4 @@
-import { and, asc, desc, eq, inArray, lte, type SQL, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gt, inArray, lte, type SQL, sql } from "drizzle-orm";
 import { alias } from "drizzle-orm/pg-core";
 import { Router } from "express";
 import { z } from "zod";
@@ -26,7 +26,8 @@ import { parse } from "../../http/validate";
 import { atLeast, effectiveAccess } from "../../permissions/matrix";
 import type { RouteContext } from "../context";
 import { ledgerOverview } from "../ledger/ledger.routes";
-import { assertLedgerLive, balancesOf, heldAccounts, isHeld, loadLedger, MESSAGES as LEDGER, newestPaymentsFirst, paymentQuery, paymentRow, postOrderDebit } from "../ledger/ledger";
+import { guardFinalSettlements } from "../costs/landed-cost";
+import { assertLedgerLive, balancesOf, heldAccounts, isHeld, loadLedger, lockAccount, MESSAGES as LEDGER, newestPaymentsFirst, paymentQuery, paymentRow, postOrderDebit } from "../ledger/ledger";
 import { orderClosed, orderClosedOn } from "./closure";
 import { hiddenSettlement, orderMoney, orderSettlement, round2 } from "./money";
 
@@ -66,6 +67,12 @@ export const MESSAGES = {
   notesTooLong: "Use 1,000 characters or fewer for the notes.",
   /** The order's container terms (0015, docs/order-container-terms.md). */
   terms: "Choose the container terms: FOB or CNF.",
+  /**
+   * Pre-release audit M8: an order that comes first in FIFO order takes the payments of the orders after it, so an
+   * order date may not change the settlement of an order whose landed cost is final (costs/landed-cost.ts).
+   */
+  finalSettled: (pos: string[]) =>
+    `This order date comes before ${pos.join(", ")}, whose landed cost is already final: the order would take the payments that settle ${pos.length > 1 ? "them" : "it"}. Choose a later order date.`,
 };
 const M = MESSAGES;
 /** The PO number column is text; this keeps a typed one readable in lists and URLs. */
@@ -330,7 +337,8 @@ export function ordersRoutes({ db }: RouteContext) {
 
   // ORD-3. The order, its lines, its agent deposits and its debit in the supplier's ledger in one transaction; the PO
   // number is the form's or assigned inside it. Refused while the ledger is in maintenance (503) or the supplier's
-  // account in the order's currency is held (409).
+  // account in the order's currency is held (409), and when its date would change the settlement of an order whose
+  // landed cost is final (422 orderDate, M8).
   router.post("/orders", requirePermission("ordersEdit", "Enter"), async (req, res) => {
     const input = parse(newOrder, req.body);
     const money = await checkRules(db, input);
@@ -346,6 +354,15 @@ export function ordersRoutes({ db }: RouteContext) {
           const [supplier] = await tx.select({ currency: suppliers.currency, exchangeRate: suppliers.exchangeRate }).from(suppliers).where(eq(suppliers.id, input.supplierId)).for("share");
           if (!supplier || supplier.currency !== money.currency) throw validationFailed({ currency: M.supplierCurrency(supplier?.currency ?? money.currency) });
           if (await isHeld(tx, input.supplierId, supplier.currency)) throw conflict("account_held", LEDGER.held);
+          // M8: with the account locked, the final orders' settlements as they stand; checked again once posted. Only an
+          // order dated after this one is settled after it, and only a stage-6 order can be final: without one, skipped.
+          await lockAccount(tx, input.supplierId, supplier.currency);
+          const later = await tx
+            .select({ id: orders.id })
+            .from(orders)
+            .where(and(eq(orders.supplierId, input.supplierId), eq(orders.currency, supplier.currency), eq(orders.stage, 6), gt(orders.orderDate, input.orderDate)))
+            .limit(1);
+          const finalChanged = later.length > 0 ? await guardFinalSettlements(tx, input.supplierId, supplier.currency) : null;
           const exchangeRate = supplier.currency === "INR" ? 1 : supplier.exchangeRate;
           const created = await tx
             .insert(orders)
@@ -385,6 +402,8 @@ export function ordersRoutes({ db }: RouteContext) {
             { id: orderId, po: created[0]!.po, supplierId: input.supplierId, currency: supplier.currency, exchangeRate, orderDate: created[0]!.orderDate },
             userId,
           );
+          const reopened = finalChanged ? await finalChanged() : [];
+          if (reopened.length > 0) throw validationFailed({ orderDate: M.finalSettled(reopened) });
           return {
             order: { id: orderId, po: created[0]!.po },
             ledger: { supplierId: input.supplierId, currency: supplier.currency, debitCny: -posted.changeCny, balanceBefore: posted.balanceBefore, balanceAfter: posted.balanceAfter },

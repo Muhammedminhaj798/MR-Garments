@@ -94,6 +94,8 @@ export async function landedCostList(db: Database, { supplierId, teamId }: { sup
         .filter((split) => split.orderId === row.orderId)
         .map(({ teamId: id, team, pieces }) => ({ teamId: id, team, pieces, costInr: round2(pieces * (cost.perPieceInr ?? 0)) })),
       goodsPayments: goods(ledger.order(row.orderId)?.slices ?? []),
+      /** The order's account is held (D4): listed, its money in no total. */
+      held: ledger.order(row.orderId)?.held ?? false,
     };
   });
   const finished = list.filter((row) => row.final);

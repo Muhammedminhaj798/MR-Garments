@@ -21,8 +21,23 @@ import { parse } from "../../http/validate";
 import type { RouteContext } from "../context";
 import { money } from "../notifications/notify";
 import { isUuid, todayInIndia } from "../stages/common";
+import { guardFinalSettlements } from "../costs/landed-cost";
 import { DEFAULT_RECEIPT_EXCLUSIONS, reconcileLedger } from "./backfill";
-import { accountFields, assertLedgerLive, cents, depositMilestone, fromCents, inrOf, isHeld, type Ledger, loadLedger, MESSAGES as LEDGER, postLedgerEntry, settlementFields } from "./ledger";
+import {
+  accountFields,
+  assertLedgerLive,
+  cents,
+  depositMilestone,
+  fromCents,
+  inrOf,
+  isHeld,
+  type Ledger,
+  loadLedger,
+  lockAccount,
+  MESSAGES as LEDGER,
+  postLedgerEntry,
+  settlementFields,
+} from "./ledger";
 
 // Owner: the unified supplier ledger (docs/unified-ledger.md). LED-1 GET /suppliers/:supplierId/ledger, LED-2 GET
 // /supplier-ledger, LED-3 POST /suppliers/:supplierId/ledger/adjustments, LED-4 GET /supplier-ledger/reconciliation.
@@ -38,6 +53,9 @@ export const MESSAGES = {
   reasonTooLong: "Use 1,000 characters or fewer for the reason.",
   idempotencyKey: "Reload the page and try again.",
   idempotencyConflict: "This adjustment was already recorded with different details. Reload the page.",
+  /** Owner decision 2026-11-21: an adjustment may not alter the settlement of an order whose landed cost is final. */
+  finalSettled: (pos: string[]) =>
+    `An adjustment on this date would change the payments that settle ${pos.join(", ")}, whose landed cost is already final. Choose a later date.`,
 };
 const M = MESSAGES;
 
@@ -303,7 +321,8 @@ export function ledgerRoutes({ db }: RouteContext) {
 
   // LED-3. Management only (payments Full): a signed correction of one account, with a reason, in one transaction under
   // the account lock. The client's idempotency key makes a resubmit return the same entry; the same key with other
-  // details is 409. The actor and the timestamp are the session's and the server's (the body can't carry them).
+  // details is 409. The actor and the timestamp are the session's and the server's (the body can't carry them). Refused
+  // (422 entryDate, nothing written) when it would change the settlement of an order whose landed cost is final.
   router.post("/suppliers/:supplierId/ledger/adjustments", requirePermission("payments", "Full"), async (req, res) => {
     const supplierId = String(req.params.supplierId);
     if (!isUuid(supplierId)) throw notFound("Supplier");
@@ -337,6 +356,10 @@ export function ledgerRoutes({ db }: RouteContext) {
       if (input.currency !== "INR" && input.rateInr === undefined) problems.rateInr = M.rateInr;
       if (Object.keys(problems).length > 0) throw validationFailed(problems);
       const rate = input.currency === "INR" ? 1 : input.rateInr!;
+      // A backdated adjustment counts from its own date and may change later orders' settlement, but never that of an
+      // order whose landed cost is final: with the account locked, those settlements before and after (422 entryDate).
+      await lockAccount(tx, supplierId, input.currency);
+      const finalChanged = await guardFinalSettlements(tx, supplierId, input.currency);
       const posted = await postLedgerEntry(tx, {
         supplierId,
         currency: input.currency,
@@ -348,6 +371,8 @@ export function ledgerRoutes({ db }: RouteContext) {
         notes: input.reason,
         createdBy: req.user!.id,
       });
+      const altered = posted.created ? await finalChanged() : [];
+      if (altered.length > 0) throw validationFailed({ entryDate: M.finalSettled(altered) });
       if (!posted.created) {
         const same =
           posted.entry.supplierId === supplierId &&

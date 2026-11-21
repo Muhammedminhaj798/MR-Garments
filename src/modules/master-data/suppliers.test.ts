@@ -32,7 +32,7 @@ const NINGBO = {
   email: "xu.feng@ningbo-denim.cn",
 };
 // The profile fields a row has when they were never set, and the money lists of a supplier without orders.
-const EXTRAS = { state: "", postalCode: "", paymentTerms: "", taxNumber: "", openPos: 0, ytdValue: [], balance: [], heldCurrencies: [], exchangeRate: null, rateUpdatedAt: null, hasTransactions: false };
+const EXTRAS = { state: "", postalCode: "", paymentTerms: "", taxNumber: "", openPos: 0, heldOpenPos: 0, ytdValue: [], balance: [], heldCurrencies: [], exchangeRate: null, rateUpdatedAt: null, hasTransactions: false };
 
 const UNKNOWN = "00000000-0000-4000-8000-000000000000";
 const list = (query = "") => http.get(`/suppliers${query}`).set("Cookie", management);

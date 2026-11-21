@@ -24,6 +24,7 @@ import { conflict, GENERIC_MESSAGE, HttpError, notFound, validationFailed } from
 import { parse } from "../../http/validate";
 import { atLeast, type Capability, effectiveAccess } from "../../permissions/matrix";
 import type { RouteContext } from "../context";
+import { guardFinalSettlements } from "../costs/landed-cost";
 import { containerOrders } from "../stages/common";
 import { money } from "../notifications/notify";
 import {
@@ -32,6 +33,7 @@ import {
   heldAccounts,
   isHeld,
   loadLedger,
+  lockAccount,
   MESSAGES as LEDGER,
   oldestPaymentsFirst,
   paymentQuery,
@@ -54,6 +56,9 @@ const EDIT = {
   lineChanged: "A line on this order changed. Reload the order and try again.",
   /** Its containers have its terms (CON-3), so they are fixed once it is loaded (unless never set: an older order). */
   termsLoaded: "This order is already loaded in a container, so its container terms can't change.",
+  /** M8 (costs/landed-cost.ts guardFinalSettlements): FIFO order follows the order date. */
+  finalSettled: (pos: string[]) =>
+    `Changing the order date would change the payments that settle ${joined(pos)}, whose landed cost is already final. Keep the saved order date.`,
 };
 const orderEdit = z.strictObject({
   /**
@@ -244,14 +249,16 @@ export function orderDetailRoutes({ db }: RouteContext) {
   // ORD-5. One transaction with the order row locked: REC-3 and CON-3 lock it too, and a new payment's foreign key
   // key-share locks it, so no receipt, load or payment can land between the checks below and the change. New lines
   // are a money change: refused while the ledger is in maintenance (503) or the account is held (409), and the value's
-  // difference is posted as one order_adjustment (nothing when the value is unchanged). Other edits post nothing.
+  // difference is posted as one order_adjustment (nothing when the value is unchanged). Other edits post nothing. A new
+  // order date, PO number or deposit asked is refused in maintenance too (the cutover's baseline holds them: ORD-5 in
+  // docs/unified-ledger.md); delivery date and terms are not. A new order date is refused (422) when it would change the
+  // settlement of an order whose landed cost is final (M8).
   router.patch("/orders/:po", requirePermission("ordersEdit", "Enter"), async (req, res) => {
     const po = String(req.params.po);
     const input = parse(orderEdit, req.body);
     if (Object.keys(input).length === 0) throw new HttpError(400, "bad_request", GENERIC_MESSAGE);
 
     const order = await db.transaction(async (tx) => {
-      if (input.lines) await assertLedgerLive(tx);
       const row = (await tx.select().from(orders).where(byPo(po)).for("update"))[0];
       if (!row) throw notFound("Order");
       if (row.stage === 6) throw conflict("order_locked", EDIT.warehouse);
@@ -273,6 +280,10 @@ export function orderDetailRoutes({ db }: RouteContext) {
       // A new PO number (the same one, as saved, is no change). Taken by another order in any letter case: 422 here;
       // one taken by a concurrent edit or create after this check is caught by the unique index below.
       const newPo = input.po !== undefined && input.po !== row.poNumber ? input.po : undefined;
+      const newDate = input.orderDate !== undefined && input.orderDate !== row.orderDate;
+      const newDeposit = input.depositRequiredCny !== undefined && input.depositRequiredCny !== row.depositRequiredCny;
+      // Read after the row lock: a 404 or locked order says so whatever the ledger's state.
+      if (input.lines || newPo || newDate || newDeposit) await assertLedgerLive(tx, LEDGER.orderMaintenance);
       if (newPo && (await tx.select({ id: orders.id }).from(orders).where(and(byPo(newPo), sql`${orders.id} <> ${row.id}`))).length > 0) problems.po = M.poTaken;
       if ((input.deliveryDate ?? row.deliveryDate) < (input.orderDate ?? row.orderDate)) problems.deliveryDate = M.deliveryBeforeOrder;
       // New terms: refused once a container holds the order (the container has its terms); the same ones are no change.
@@ -317,11 +328,17 @@ export function orderDetailRoutes({ db }: RouteContext) {
         ? await syncOrderValue(tx, { id: row.id, po: newPo ?? row.poNumber, supplierId: row.supplierId, currency: row.currency, exchangeRate: row.exchangeRate, orderDate: row.orderDate }, req.user!.id)
         : null;
       const ledger = posted && { supplierId: row.supplierId, currency: row.currency, changeCny: posted.changeCny, balanceBefore: posted.balanceBefore, balanceAfter: posted.balanceAfter };
+      // M8: with the account locked (as a posting locks it), the final orders' settlements just before the new date, so
+      // only the date move is judged (a line change above is not M8's: docs/unified-ledger.md).
+      if (newDate) await lockAccount(tx, row.supplierId, row.currency);
+      const finalChanged = newDate ? await guardFinalSettlements(tx, row.supplierId, row.currency) : null;
       const updated = await tx
         .update(orders)
         .set({ poNumber: newPo, terms: newTerms, orderDate: input.orderDate, deliveryDate: input.deliveryDate, depositRequiredCny: input.depositRequiredCny, updatedAt: new Date() })
         .where(eq(orders.id, row.id))
         .returning({ id: orders.id, po: orders.poNumber, stage: orders.stage, orderDate: orders.orderDate, deliveryDate: orders.deliveryDate, terms: orders.terms });
+      const reopened = finalChanged ? await finalChanged() : [];
+      if (reopened.length > 0) throw validationFailed({ orderDate: EDIT.finalSettled(reopened) });
       if (newPo) {
         // Everything else links to the order by id. Notifications store a link to the order's pages by its number, so
         // those links follow the new number; their titles keep the number the event happened under (a record of it).

@@ -197,6 +197,35 @@ describe("final review: a held account counts in no figure; replays compare the 
     expect(list.find((row) => row.id === hangzhou)).toMatchObject({ ytdValue: [], heldCurrencies: ["CNY"] });
   });
 
+  it("pre-release audit M3: SUP-1's Open POs card, SUP-2's values and RPT-O1's agent and due figures leave a held order out", async () => {
+    const held = await legacyOrder(hangzhou, "H-8", 900, 100);
+    await legacyOrder(guangzhou, "G-8", 400, 100);
+    await ctx.db.insert(payments).values([
+      { orderId: held.order.id, kind: "Balance", payee: "Sino Freight", payeeRole: "agent", amountCny: 70, status: "paid", paidOn: "2026-10-03", rateInr: 12, mode: "Bank" },
+      { orderId: held.order.id, kind: "Balance", payee: "Supplier", payeeRole: "supplier", amountCny: 50, status: "due", dueDate: indiaDay(3) },
+    ]);
+    await backfillLedger(ctx.db, { apply: true, holds: hold(hangzhou) });
+    // The card counts the orders it totals: G-8 only; MD-1's Active POs follow the same rule, so the rows add up to it.
+    // The held order is counted apart (pending review), never in the actionable count or value.
+    expect((await http.get("/suppliers/summary").set("Cookie", management)).body.openPos).toEqual({ count: 1, value: [{ currency: "CNY", amount: 400 }], heldCount: 1 });
+    const rows = (await http.get("/suppliers").set("Cookie", management)).body as { id: string; openPos: number; heldOpenPos: number }[];
+    expect(rows.find((row) => row.id === hangzhou)).toMatchObject({ openPos: 0, heldOpenPos: 1 });
+    expect(rows.find((row) => row.id === guangzhou)).toMatchObject({ openPos: 1, heldOpenPos: 0 });
+    // RPT-O2's summary: the held order's paid and landed cost in no total either.
+    const orderReports = (await http.get("/reports/orders").set("Cookie", management)).body;
+    expect(orderReports.summary.paidInr).toBe(1_200); // G-8: ¥100 settled at 12
+    const counted = orderReports.rows.filter((row: { held: boolean }) => !row.held);
+    expect(orderReports.summary.landedCostInr).toBe(counted.reduce((sum: number, row: { landedCostInr: number | null }) => sum + (row.landedCostInr ?? 0), 0));
+    const insights = (await http.get("/suppliers/insights").query({ from: "2026-10-01", to: "2026-10-31" }).set("Cookie", management)).body;
+    expect(insights.bySupplier.find((row: { supplierId: string }) => row.supplierId === hangzhou)).toMatchObject({ orders: 1, value: [], balance: [], heldCurrencies: ["CNY"] });
+    expect(insights.monthly.find((row: { month: string }) => row.month === "2026-10").value).toEqual([{ currency: "CNY", amount: 400 }]);
+    expect(insights.summary.orders).toBe(2); // delivery figures still count every order
+    const report = (await http.get("/orders/H-8/report").set("Cookie", management)).body;
+    expect(report.payments).toMatchObject({ held: true, settledCny: null, agentPaidCny: null, agentPaidInr: null, dueCny: null });
+    const live = (await http.get("/orders/G-8/report").set("Cookie", management)).body;
+    expect(live.payments).toMatchObject({ held: false, settledCny: 100, agentPaidCny: 0, agentPaidInr: 0, dueCny: 0 });
+  });
+
   it("PAY-2: replaying an agent payment's key with another agent is 409, nothing written", async () => {
     const order = await http
       .post("/orders", { supplierId: guangzhou, orderDate: indiaDay(-3), deliveryDate: indiaDay(20), lines: [{ itemId: jeans, quantity: 100, rateCny: 1 }] })

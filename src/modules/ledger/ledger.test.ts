@@ -1,4 +1,7 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
+import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 import { and, eq, sql } from "drizzle-orm";
 import { afterAll, beforeEach, describe, expect, it } from "vitest";
@@ -6,7 +9,7 @@ import { afterAll, beforeEach, describe, expect, it } from "vitest";
 import { items, orderLines, orders, payments, supplierAdvanceEntries, supplierLedgerEntries, supplierLedgerHolds, suppliers, users } from "../../db/schema";
 import { api, createTestContext, resetData, SEEDED, signInAs } from "../../test/harness";
 import { indiaDay } from "../stock/fixtures";
-import { backfillLedger, legacyDifferences, legacyFingerprints, reconcileLedger } from "./backfill";
+import { baselineChanges, BASELINE_FORMAT, backfillLedger, legacyDifferences, legacyRecords, parseExpectation, readBaseline, reconcileLedger, unexpectedDifferences, writeBaseline } from "./backfill";
 import { assertLedgerLive, depositMilestone, inrOf, loadLedger, projectAccount } from "./ledger";
 
 // The unified supplier ledger core (docs/unified-ledger.md): the FIFO projection, INR rounding, the milestone, the
@@ -91,22 +94,27 @@ describe("projectAccount (FIFO, oldest order first)", () => {
     expect(settlements.get("o1")!.slices.map((slice) => slice.amount)).toEqual([300]);
   });
 
-  it("a negative adjustment takes the newest money first, and a shortfall is filled by the next credits", () => {
+  it("a negative adjustment takes the newest money first; a shortfall is payable from its date, settled oldest first with the orders", () => {
     const old = entry("payment", 100, "2026-12-01", { exchangeRate: 10 });
     const fresh = entry("payment", 100, "2026-12-02", { exchangeRate: 20 });
-    const { settlements } = projectAccount(
+    const { settlements, shortfallCny } = projectAccount(
       [old, fresh, entry("adjustment", -150, "2026-12-03", { paymentId: null }), debit("o1", 100, "2026-12-01")],
       [order("o1", "2026-12-01")],
     );
-    // 150 comes off the newest lot (100) and then the older one (50): 50 of the oldest money is left.
-    expect(settlements.get("o1")).toMatchObject({ settledCny: 50, outstandingCny: 50 });
-    expect(settlements.get("o1")!.slices).toMatchObject([{ amount: 50, exchangeRate: 10, amountInr: 500 }]);
-    const deficit = projectAccount(
-      [entry("adjustment", -80, "2026-12-01", { paymentId: null }), entry("payment", 100, "2026-12-02"), debit("o1", 100, "2026-12-01")],
-      [order("o1", "2026-12-01")],
+    // o1 had the old lot when the adjustment was recorded: −150 takes the free newer lot (100) and is 50 short. o1 keeps
+    // its settlement (no credit is taken twice).
+    expect(settlements.get("o1")).toMatchObject({ settledCny: 100, outstandingCny: 0 });
+    expect(settlements.get("o1")!.slices).toMatchObject([{ amount: 100, exchangeRate: 10, amountInr: 1_000 }]);
+    expect(shortfallCny).toBe(50);
+    // −¥80 with no credit before it: ¥80 payable from 1 Dec. The order (30 Nov) is older, so the ¥100 of 2 Dec settles
+    // it first; the shortfall stays payable (the balance).
+    const short = projectAccount(
+      [entry("adjustment", -80, "2026-12-01", { paymentId: null }), entry("payment", 100, "2026-12-02"), debit("o1", 100, "2026-11-30")],
+      [order("o1", "2026-11-30")],
     );
-    expect(deficit.settlements.get("o1")!.settledCny).toBe(20);
-    expect(deficit.account.balanceCny).toBe(-80);
+    expect(short.settlements.get("o1")).toMatchObject({ settledCny: 100, outstandingCny: 0 });
+    expect(short.shortfallCny).toBe(80);
+    expect(short.account.balanceCny).toBe(-80);
   });
 
   it("goods INR: each slice at its own credit's rate; a credit without a rate leaves the order's INR unknown", () => {
@@ -224,9 +232,8 @@ const backfill = (apply = true) => backfillLedger(ctx.db, { apply, holds: holdFo
 describe("backfill and reconciliation (plan 9)", () => {
   it("posts debits, supplier payments and receipts once; never allocations, excess, agent, due or held rows", async () => {
     const seeded = await seedLegacy();
-    const heldList = [{ supplierId: foshan, currency: "CNY", reason: "test hold" }];
-    const before = await legacyFingerprints(ctx.db, heldList);
-    expect(before.heldAccounts!.startsWith("4 ")).toBe(true); // the held order, its line, its deposit and its receipt
+    const before = await legacyRecords(ctx.db);
+    expect(Object.values(before).map((rows) => Object.keys(rows).length)).toEqual([5, 5, 4, 5, 0, 0]); // the held account included
     const dry = await backfill(false);
     expect(dry.written).toBe(6); // 4 order debits (A, B, C, H) + 1 payment + 1 receipt
     expect(await ctx.db.select().from(supplierLedgerEntries)).toHaveLength(0);
@@ -245,7 +252,7 @@ describe("backfill and reconciliation (plan 9)", () => {
     const second = await backfill(true);
     expect(second.written).toBe(0);
     expect((await reconcileLedger(ctx.db)).ok).toBe(true);
-    expect(await legacyFingerprints(ctx.db, heldList)).toEqual(before);
+    expect(baselineChanges(before, await legacyRecords(ctx.db))).toEqual([]);
     expect(await legacyDifferences(ctx.db)).toEqual([]);
   });
 
@@ -278,7 +285,7 @@ describe("the owner's receipt exclusion list", () => {
     const genuine = await legacyAdvance(hangzhou, { amount: 25_000, entryDate: "2026-10-01", mode: "CASH" });
     const duplicate = await legacyAdvance(hangzhou, { amount: 25_000, entryDate: "2026-10-01", mode: "CASH" });
     const list = [{ advanceEntryId: duplicate.id, reason: "test duplicate" }];
-    const before = await legacyFingerprints(ctx.db, []);
+    const before = await legacyRecords(ctx.db);
     const run = (apply: boolean) => backfillLedger(ctx.db, { apply, holds: [], excludedReceipts: list });
 
     expect(await run(false)).toMatchObject({ written: 2, unresolvedExclusions: [], excludedReceipts: [{ advanceEntryId: duplicate.id, currency: "CNY", amount: 25_000 }] });
@@ -294,7 +301,7 @@ describe("the owner's receipt exclusion list", () => {
     // Without the list the same journal fails: the duplicate has no credit.
     const unlisted = await reconcileLedger(ctx.db);
     expect(unlisted.checks.find((check) => check.id === "receipts")).toMatchObject({ ok: false, problems: [expect.stringContaining(duplicate.id)] });
-    expect(await legacyFingerprints(ctx.db, [])).toEqual(before); // every legacy row, the duplicate's included, is untouched
+    expect(baselineChanges(before, await legacyRecords(ctx.db))).toEqual([]); // every legacy row, the duplicate's included, is untouched
   });
 
   it("refuses to apply when a listed id is unknown, not a receipt or drawn from; flags a listed receipt that was posted", async () => {
@@ -317,6 +324,104 @@ describe("the owner's receipt exclusion list", () => {
     const result = await reconcileLedger(ctx.db, [], [{ advanceEntryId: drawn, reason: "test" }]);
     expect(result.checks.find((check) => check.id === "excluded-receipts")).toMatchObject({ ok: false, problems: [`excluded receipt ${drawn}: 1 posting(s)`] });
     expect(result.ok).toBe(false);
+  });
+});
+
+describe("the cutover's approved baseline (docs/operator-commands.md)", () => {
+  it("ignores non-financial order, line and payment changes; lists every financial record added, removed or changed", async () => {
+    const seeded = await seedLegacy();
+    const before = await legacyRecords(ctx.db);
+    // Receiving, moving a stage, setting terms, renumbering a line, editing a payment's mode, reference or notes.
+    await ctx.db.update(orders).set({ stage: 3, deliveryDate: indiaDay(90), terms: "CNF", updatedAt: new Date() }).where(eq(orders.id, seeded.a.id));
+    await ctx.db.update(orderLines).set({ position: 5 }).where(eq(orderLines.orderId, seeded.a.id));
+    await ctx.db.update(payments).set({ mode: "Cash", reference: "TX-1", notes: "late note" }).where(eq(payments.id, seeded.paid.id));
+    expect(baselineChanges(before, await legacyRecords(ctx.db))).toEqual([]);
+
+    await ctx.db.update(orderLines).set({ quantity: 2 }).where(eq(orderLines.orderId, seeded.b.id));
+    await ctx.db.update(orders).set({ orderDate: "2026-09-01" }).where(eq(orders.id, seeded.other.id));
+    await ctx.db.delete(payments).where(eq(payments.status, "due"));
+    const receipt = await legacyAdvance(hangzhou, { amount: 500 });
+    const changes = baselineChanges(before, await legacyRecords(ctx.db));
+    expect(changes.map(({ table, change }) => `${table} ${change}`).sort()).toEqual(["order_lines changed", "orders changed", "payments removed", "supplier_advance_entries added"]);
+    expect(changes.find((row) => row.table === "order_lines")).toMatchObject({ before: { quantity: 1 }, after: { quantity: 2 } });
+    expect(changes.find((row) => row.table === "supplier_advance_entries")).toMatchObject({ id: receipt.id, before: null, after: { amount: 500, kind: "receipt" } });
+  });
+
+  it("backfill --apply is refused when anything differs from the approved baseline, and posts nothing", async () => {
+    const seeded = await seedLegacy();
+    const approved = await legacyRecords(ctx.db);
+    const holds = holdFoshan.map((hold) => ({ ...hold, supplierId: foshan }));
+    await legacyPayment(seeded.other.id, 100, "2026-10-10"); // entered after the rehearsal
+    const dry = await backfillLedger(ctx.db, { apply: false, holds, baseline: approved });
+    expect(dry.baselineChanges).toMatchObject([{ table: "payments", change: "added", after: { amount_cny: 100 } }]);
+    await expect(backfillLedger(ctx.db, { apply: true, holds, baseline: approved })).rejects.toThrow("differ from the approved baseline (1 payments added)");
+    expect(await ctx.db.select().from(supplierLedgerEntries)).toHaveLength(0);
+    expect(await ctx.db.select().from(supplierLedgerHolds)).toHaveLength(0);
+    // Re-approved (a new rehearsal of these records): posted.
+    expect(await backfillLedger(ctx.db, { apply: true, holds, baseline: await legacyRecords(ctx.db) })).toMatchObject({ baselineChanges: [], written: 7 });
+  });
+
+  it("reads only the approved file of this format, and never overwrites a baseline", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "ledger-baseline-"));
+    const file = join(dir, "approved.json");
+    const baseline = { format: BASELINE_FORMAT, database: "test", takenAt: new Date().toISOString(), records: await legacyRecords(ctx.db) };
+    const sha256 = writeBaseline(file, baseline);
+    expect(readBaseline(file, sha256)).toMatchObject({ sha256, records: baseline.records });
+    expect(() => readBaseline(file, "0".repeat(64))).toThrow("is not the approved baseline");
+    expect(() => writeBaseline(file, { ...baseline, takenAt: "later" })).toThrow(/EEXIST/);
+    expect(readBaseline(file, sha256).takenAt).toBe(baseline.takenAt); // unchanged
+    const old = join(dir, "before.json");
+    const text = JSON.stringify({ orders: "41 2ecc9a472d4bb50f139dc76a04196bbd" }); // the whole-row format of before
+    writeFileSync(old, text);
+    expect(() => readBaseline(old, createHash("sha256").update(text).digest("hex"))).toThrow(`is not a ${BASELINE_FORMAT} file`);
+  });
+
+  it("--expect: the approved legacy differences must be exactly the ones found, both amounts included", () => {
+    expect(parseExpectation("6423=0:4400")).toEqual({ po: "6423", legacySettled: 0, ledgerSettled: 4_400 });
+    expect(parseExpectation("PO-1134647=0:270.14")).toEqual({ po: "PO-1134647", legacySettled: 0, ledgerSettled: 270.14 });
+    for (const bad of ["6423", "6423=0", "6423=0:x", "=0:1", "6423=0:1:2", "6423=0:1.234"]) expect(() => parseExpectation(bad)).toThrow("<PO>=<legacy settled>:<ledger settled>");
+    const found = [
+      { po: "6422", currency: "USD", legacySettled: 0, ledgerSettled: 20_600 },
+      { po: "6423", currency: "USD", legacySettled: 0, ledgerSettled: 4_400 },
+    ];
+    const list = (...items: string[]) => items.map(parseExpectation);
+    expect(unexpectedDifferences(found, list("6422=0:20600", "6423=0:4400"))).toEqual([]);
+    expect(unexpectedDifferences(found, list("6423=0:4400"))).toEqual(["6422: not expected (legacy 0, ledger 20600)"]);
+    expect(unexpectedDifferences(found, list("6422=0:20600", "6423=0:4500"))).toEqual(["6423: expected legacy 0, ledger 4500; found legacy 0, ledger 4400"]);
+    expect(unexpectedDifferences(found, list("6422=0:20600", "6423=0:4400", "6424=0:1"))).toEqual(["6424: expected difference did not occur"]);
+    expect(unexpectedDifferences(found, list("6422=0:20600", "6423=0:4400", "6423=0:4400"))).toEqual(["6423: listed more than once"]);
+    expect(unexpectedDifferences([{ ...found[0]!, ledgerSettled: null }], list("6422=0:20600"))).toEqual(["6422: expected legacy 0, ledger 20600; found legacy 0, ledger not posted"]);
+  });
+});
+
+describe("rollback script scripts/rollback/0017-down.sql", () => {
+  const script = readFileSync("scripts/rollback/0017-down.sql", "utf8");
+  // Its body (psql's \set, begin and commit left out), run inside a transaction that is always rolled back here.
+  const body = script
+    .split("\n")
+    .filter((line) => !/^(\\set |begin;|commit;)/.test(line))
+    .join("\n");
+  const run = () =>
+    ctx.db.transaction(async (tx) => {
+      await tx.execute(sql.raw(body));
+      tx.rollback(); // it ran through: undo it
+    });
+
+  it("psql stops at the first error (non-zero exit), and every table is locked before the guard reads it", () => {
+    const statements = script.split("\n").filter((line) => line.trim() && !line.startsWith("--"));
+    expect(statements.slice(0, 2)).toEqual(["\\set ON_ERROR_STOP on", "begin;"]);
+    expect(script.indexOf("lock table ledger_state, supplier_ledger_holds, supplier_ledger_entries, payments in access exclusive mode")).toBeLessThan(script.indexOf("do $$"));
+  });
+
+  it("refuses unless the ledger is in maintenance, refuses after an application write, and runs through otherwise", async () => {
+    const seeded = await seedLegacy();
+    await backfill(true);
+    await expect(run()).rejects.toThrow("the ledger is not in maintenance"); // the harness leaves it live
+    await ctx.db.execute(sql`update ledger_state set state = 'maintenance'`);
+    await expect(run()).rejects.toThrow("Rollback"); // drizzle's rollback: the whole body ran
+    expect(await ctx.db.select().from(supplierLedgerEntries)).toHaveLength(6); // and was undone
+    await ctx.db.insert(supplierLedgerEntries).values({ supplierId: hangzhou, currency: "CNY", entryType: "order_adjustment", amount: -1, entryDate: indiaDay(), origin: "app", orderId: seeded.other.id, poNumber: "H-1", idempotencyKey: "test:app" });
+    await expect(run()).rejects.toThrow("application-written records");
   });
 });
 
@@ -367,9 +472,11 @@ describe("LED-3 Management adjustments (D13)", () => {
     expect(down.body).toMatchObject({ balanceBefore: 22_000, balanceAfter: -500, entry: { entryType: "adjustment", amount: -22_500, exchangeRate: 12.5, notes: "Supplier refund by bank", recordedBy: expect.any(String) } });
     const [row] = await ctx.db.select().from(supplierLedgerEntries).where(eq(supplierLedgerEntries.entryType, "adjustment"));
     expect(row).toMatchObject({ createdBy: userId, origin: "app", balanceBefore: 22_000, balanceAfter: -500 });
-    // ¥52,000 of credits less ¥22,500 leaves ¥29,500 for A (15,000), B (5,000) and C (10,000): C is ¥500 short.
+    // ¥52,000 of credits, ¥30,000 settling A (15,000), B (5,000) and C (10,000): −¥22,500 takes the free ¥22,000 and is
+    // ¥500 short. The orders keep their settlement; the ¥500 is payable.
     const ledger = await loadLedger(ctx.db);
-    expect(ledger.order(seeded.c.id)).toMatchObject({ settledCny: 9_500, outstandingCny: 500, paymentStatus: "partly" });
+    expect(ledger.order(seeded.c.id)).toMatchObject({ settledCny: 10_000, outstandingCny: 0, paymentStatus: "paid" });
+    expect(ledger.account(seeded.c.supplierId, "CNY")).toMatchObject({ balanceCny: -500, outstandingCny: 0 });
     const up = await post(adjustment({ amount: 500, reason: "Correction of the refund" }));
     expect(up.body).toMatchObject({ balanceBefore: -500, balanceAfter: 0 });
     expect((await loadLedger(ctx.db)).order(seeded.c.id)).toMatchObject({ outstandingCny: 0, paymentStatus: "paid" });

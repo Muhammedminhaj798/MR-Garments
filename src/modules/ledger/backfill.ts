@@ -1,3 +1,6 @@
+import { createHash } from "node:crypto";
+import { readFileSync, writeFileSync } from "node:fs";
+
 import { eq, sql } from "drizzle-orm";
 
 import type { Database } from "../../db/client";
@@ -51,10 +54,13 @@ class DryRun extends Error {}
 /**
  * Writes the holds (when their supplier exists), then the postings, in one transaction. Without `apply` the same
  * statements run and the transaction is rolled back, so the dry run reports exactly what an apply would write.
+ * `baseline` (the release script requires the approved one): the legacy records are compared with it first, in the
+ * same snapshot the postings are read from (repeatable read), and `apply` is refused on any difference.
  */
-export async function backfillLedger(db: Database, options: { apply: boolean; holds?: Hold[]; excludedReceipts?: ReceiptExclusion[] }) {
+export async function backfillLedger(db: Database, options: { apply: boolean; holds?: Hold[]; excludedReceipts?: ReceiptExclusion[]; baseline?: LegacyRecords }) {
   const excluded = options.excludedReceipts ?? [];
   const report = {
+    baselineChanges: null as BaselineChange[] | null,
     holds: [] as { supplierId: string; code: string | null; currency: string; created: boolean }[],
     skippedHolds: [] as string[],
     excludedReceipts: [] as { advanceEntryId: string; code: string | null; currency: string | null; amount: number | null; problem?: string }[],
@@ -63,6 +69,12 @@ export async function backfillLedger(db: Database, options: { apply: boolean; ho
   };
   try {
     await db.transaction(async (tx) => {
+      if (options.baseline) {
+        report.baselineChanges = baselineChanges(options.baseline, await legacyRecords(tx));
+        if (options.apply && report.baselineChanges.length > 0) {
+          throw new Error(`Refusing to apply: the legacy records differ from the approved baseline (${describeChanges(report.baselineChanges)}); run the dry run to list them`);
+        }
+      }
       // Each listed receipt must exist, be a receipt and have nothing drawn from it (no allocation): a typo would post the
       // receipt it meant to exclude, and a drawn one would leave its allocations' orders settled in the legacy figures only.
       if (excluded.length > 0) {
@@ -126,7 +138,7 @@ export async function backfillLedger(db: Database, options: { apply: boolean; ho
         throw new Error(`Refusing to apply: unresolved receipt exclusion(s): ${report.unresolvedExclusions.join("; ")}`);
       }
       if (!options.apply) throw new DryRun();
-    });
+    }, { isolationLevel: "repeatable read" });
   } catch (error) {
     if (!(error instanceof DryRun)) throw error;
   }
@@ -141,6 +153,7 @@ export async function backfillLedger(db: Database, options: { apply: boolean; ho
   }
   return {
     applied: options.apply,
+    baselineChanges: report.baselineChanges,
     holds: report.holds,
     skippedHolds: report.skippedHolds,
     excludedReceipts: report.excludedReceipts,
@@ -173,7 +186,7 @@ export type Check = { id: string; title: string; ok: boolean; problems: string[]
 const held = (supplier: string, currency: string) => sql.raw(`exists (select 1 from supplier_ledger_holds h where h.supplier_id = ${supplier} and h.currency = ${currency})`);
 
 /**
- * Plan 4.6, invariants 1-6 and 8 (7, the legacy fingerprints, needs a baseline: `legacyFingerprints`). Read-only.
+ * Plan 4.6, invariants 1-6 and 8 (7, the legacy records, needs the approved baseline: `legacyRecords`). Read-only.
  * `expectedHolds` (the release script passes DEFAULT_HOLDS): each must name a supplier and exist as a hold row.
  * `excludedReceipts` (the release script and LED-4 pass DEFAULT_RECEIPT_EXCLUSIONS): never credited, and none may be.
  */
@@ -290,47 +303,86 @@ export async function reconcileLedger(
 }
 
 /**
- * Invariant 7: one fingerprint per legacy table (row count + md5 of every row, by id), and one of the held accounts'
- * own records. The held accounts come from the explicit list (not the holds table), so a baseline taken before 0017
- * compares with one taken after. Compared with a baseline by scripts/ledger-reconcile.ts.
+ * Invariant 7 and the cutover's tie to the rehearsal (docs/operator-commands.md): every legacy record's financial
+ * fields, by table and id, as text. Left out, so harmless work during the cutover never blocks it: what never changes
+ * money or its order (an order's stage, delivery date and terms; a line's item and position; modes, references, notes,
+ * who and when), and the payment columns 0017 added (a baseline taken before the migration compares with one after).
+ * `created_at` is never changed by the application, and its text would depend on the session's time zone.
  */
-export async function legacyFingerprints(db: Pick<Database, "execute">, heldList: Hold[] = DEFAULT_HOLDS) {
-  const tables = ["orders", "order_lines", "supplier_advance_entries", "supplier_deposits", "supplier_deposit_transactions"];
-  const result: Record<string, string> = {};
-  for (const table of tables) {
-    const [row] = (await db.execute<{ fingerprint: string }>(sql.raw(`select count(*) || ' ' || coalesce(md5(string_agg(to_jsonb(t)::text, '|' order by t.id)), '') as fingerprint from ${table} t`))).rows;
-    result[table] = row!.fingerprint;
+const NON_FINANCIAL: Record<string, string[]> = {
+  orders: ["stage", "delivery_date", "terms"],
+  order_lines: ["item_id", "position"],
+  payments: ["supplier_id", "currency", "voided_at", "voided_by", "void_reason", "client_request_id"],
+  supplier_advance_entries: [],
+  supplier_deposits: [],
+  supplier_deposit_transactions: [],
+};
+const NEVER_FINANCIAL = ["mode", "reference", "notes", "created_at", "updated_at", "created_by"];
+
+export type LegacyRecords = Record<string, Record<string, string>>;
+
+export async function legacyRecords(db: Pick<Database, "execute">): Promise<LegacyRecords> {
+  const records: LegacyRecords = {};
+  for (const [table, fields] of Object.entries(NON_FINANCIAL)) {
+    const dropped = [...NEVER_FINANCIAL, ...fields].map((field) => `'${field}'`).join(", ");
+    const { rows } = await db.execute<{ id: string; r: string }>(sql.raw(`select t.id::text as id, (to_jsonb(t) - array[${dropped}])::text as r from ${table} t order by t.id`));
+    records[table] = Object.fromEntries(rows.map((row) => [row.id, row.r]));
   }
-  // Payments: the columns 0017 added are left out, so a baseline taken before the migration still compares equal.
-  const [payments] = (
-    await db.execute<{ fingerprint: string }>(
-      sql.raw(`select count(*) || ' ' || coalesce(md5(string_agg((to_jsonb(t) - 'supplier_id' - 'currency' - 'voided_at' - 'voided_by' - 'void_reason' - 'client_request_id')::text, '|' order by t.id)), '') as fingerprint from payments t`),
-    )
-  ).rows;
-  result.payments = payments!.fingerprint;
-  // The held accounts' own records (orders, their lines and payments, advance entries), row for row.
-  const keys = heldList.map((hold) => `${hold.supplierId ?? hold.supplierCode} ${hold.currency}`);
-  const [heldRows] = (
-    await db.execute<{ fingerprint: string }>(sql`
-      with listed as (select split_part(item, ' ', 1) as ref, split_part(item, ' ', 2) as currency from unnest(array[${sql.join(keys.map((key) => sql`${key}`), sql`, `)}]::text[]) as item),
-           h as (select s.id as supplier_id, listed.currency from listed join suppliers s on s.id::text = listed.ref or s.code = listed.ref)
-      select count(*) || ' ' || coalesce(md5(string_agg(r, '|' order by r)), '') as fingerprint from (
-        select to_jsonb(o)::text as r from orders o join h on h.supplier_id = o.supplier_id and h.currency = o.currency
-        union all select to_jsonb(l)::text from order_lines l join orders o on o.id = l.order_id join h on h.supplier_id = o.supplier_id and h.currency = o.currency
-        union all select (to_jsonb(p) - 'supplier_id' - 'currency' - 'voided_at' - 'voided_by' - 'void_reason' - 'client_request_id')::text from payments p join orders o on o.id = p.order_id join h on h.supplier_id = o.supplier_id and h.currency = o.currency
-        union all select to_jsonb(a)::text from supplier_advance_entries a join h on h.supplier_id = a.supplier_id and h.currency = a.currency
-      ) x`)
-  ).rows;
-  result.heldAccounts = heldRows!.fingerprint;
-  return result;
+  return records;
+}
+
+export const BASELINE_FORMAT = "supplier-ledger-baseline/2" as const;
+/** The approved baseline: written once in the rehearsal (from the restored snapshot), approved by its sha256. */
+export type Baseline = { format: typeof BASELINE_FORMAT; database: string; takenAt: string; records: LegacyRecords };
+export type BaselineChange = { table: string; id: string; change: "added" | "removed" | "changed"; before: unknown; after: unknown };
+
+/** Every legacy record added, removed or changed (in a financial field) since the baseline. */
+export function baselineChanges(baseline: LegacyRecords, now: LegacyRecords): BaselineChange[] {
+  const changes: BaselineChange[] = [];
+  for (const table of Object.keys(NON_FINANCIAL)) {
+    const was = baseline[table] ?? {};
+    const is = now[table] ?? {};
+    for (const id of new Set([...Object.keys(was), ...Object.keys(is)])) {
+      if (was[id] === is[id]) continue;
+      const change = was[id] === undefined ? "added" : is[id] === undefined ? "removed" : "changed";
+      changes.push({ table, id, change, before: was[id] === undefined ? null : JSON.parse(was[id]), after: is[id] === undefined ? null : JSON.parse(is[id]) });
+    }
+  }
+  return changes;
+}
+
+/** "1 orders changed, 2 payments added". */
+export function describeChanges(changes: BaselineChange[]) {
+  const counts = new Map<string, number>();
+  for (const { table, change } of changes) counts.set(`${table} ${change}`, (counts.get(`${table} ${change}`) ?? 0) + 1);
+  return [...counts].map(([key, n]) => `${n} ${key}`).join(", ");
+}
+
+/** Refuses a file that is not the approved one (its sha256) or not this format (a whole-row fingerprint file from before). */
+export function readBaseline(file: string, sha256: string) {
+  const text = readFileSync(file, "utf8");
+  const hash = createHash("sha256").update(text).digest("hex");
+  if (hash !== sha256.trim().toLowerCase()) throw new Error(`${file} is not the approved baseline: sha256 ${hash}, approved ${sha256}`);
+  const baseline = JSON.parse(text) as Baseline;
+  if (baseline.format !== BASELINE_FORMAT || typeof baseline.records !== "object" || baseline.records === null) {
+    throw new Error(`${file} is not a ${BASELINE_FORMAT} file: write the approved baseline again in the rehearsal`);
+  }
+  return { ...baseline, file, sha256: hash };
+}
+
+/** Never overwrites (EEXIST): an approved baseline is replaced only by a new rehearsal writing a new file. */
+export function writeBaseline(file: string, baseline: Baseline) {
+  const text = `${JSON.stringify(baseline, null, 2)}\n`;
+  writeFileSync(file, text, { flag: "wx" });
+  return createHash("sha256").update(text).digest("hex");
 }
 
 /**
  * Plan 9.4 step 3: each order's settled amount under the legacy rules (supplier payments net of excess, plus the
- * advance applied, capped at the value) against the projection's. Read-only; the accepted differences are listed by the
- * caller (PO-1134647 on the 2026-11-18 data).
+ * advance applied, capped at the value) against the projection's. Read-only; the approved differences (`unexpectedDifferences`) are
+ * listed by the caller with both amounts (PO-1134647, 6422 and 6423 on the 2026-11-20 data).
  */
-export async function legacyDifferences(db: Database) {
+export async function legacyDifferences(db: Pick<Database, "execute" | "select">) {
   const legacy = await db.execute<{ id: string; po: string; currency: string; value: string; settled: string }>(sql`
     with v as (select o.id, o.po_number, o.currency, o.supplier_id, round(coalesce((select sum(l.quantity * l.rate_cny) from order_lines l where l.order_id = o.id), 0), 2) as value from orders o),
          paid as (select p.order_id, sum(p.amount_cny) as paid from payments p where p.payee_role = 'supplier' and p.status = 'paid' and p.voided_at is null and p.order_id is not null group by 1),
@@ -346,4 +398,40 @@ export async function legacyDifferences(db: Database) {
   return legacy.rows
     .map((row) => ({ po: row.po, currency: row.currency, legacySettled: Number(row.settled), ledgerSettled: ledger.order(row.id)?.settledCny ?? null }))
     .filter((row) => row.ledgerSettled === null || cents(row.ledgerSettled) !== cents(row.legacySettled));
+}
+
+/** One approved legacy difference, `--expect <PO>=<legacy settled>:<ledger settled>` (both exact, to the cent). */
+export type Expectation = { po: string; legacySettled: number; ledgerSettled: number };
+
+export function parseExpectation(text: string): Expectation {
+  const at = text.lastIndexOf("=");
+  const [legacy, ledger, extra] = text.slice(at + 1).split(":");
+  const amount = (part: string | undefined) => (part !== undefined && /^-?\d+(\.\d{1,2})?$/.test(part.trim()) ? Number(part) : NaN);
+  const parsed = { po: text.slice(0, at).trim(), legacySettled: amount(legacy), ledgerSettled: amount(ledger) };
+  if (at <= 0 || extra !== undefined || !parsed.po || Number.isNaN(parsed.legacySettled) || Number.isNaN(parsed.ledgerSettled)) {
+    throw new Error(`--expect ${text}: write it as <PO>=<legacy settled>:<ledger settled>, for example 6423=0:4400`);
+  }
+  return parsed;
+}
+
+/**
+ * The approved differences must be exactly the ones found: an unlisted difference, a listed one with other amounts and
+ * a listed one that did not occur all fail, so an approval never covers a change it was not given for.
+ */
+export function unexpectedDifferences(differences: Awaited<ReturnType<typeof legacyDifferences>>, expected: Expectation[]) {
+  const problems: string[] = [];
+  const found = new Map(differences.map((row) => [row.po, row]));
+  for (const row of differences) {
+    const approved = expected.find((item) => item.po === row.po);
+    const figures = `legacy ${row.legacySettled}, ledger ${row.ledgerSettled ?? "not posted"}`;
+    if (!approved) problems.push(`${row.po}: not expected (${figures})`);
+    else if (row.ledgerSettled === null || cents(row.legacySettled) !== cents(approved.legacySettled) || cents(row.ledgerSettled) !== cents(approved.ledgerSettled)) {
+      problems.push(`${row.po}: expected legacy ${approved.legacySettled}, ledger ${approved.ledgerSettled}; found ${figures}`);
+    }
+  }
+  expected.forEach((item, at) => {
+    if (!found.has(item.po)) problems.push(`${item.po}: expected difference did not occur`);
+    if (expected.findIndex((other) => other.po === item.po) !== at) problems.push(`${item.po}: listed more than once`);
+  });
+  return problems;
 }

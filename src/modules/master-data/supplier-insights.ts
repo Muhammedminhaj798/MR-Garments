@@ -120,7 +120,10 @@ export async function suppliersSummary(db: Database, today: string) {
       .groupBy(orders.currency),
     loadLedger(db),
   ]);
-  const open = rows.filter((row) => !row.closed);
+  // A held account's orders (D4) add nothing to the Open POs card: neither its value nor its count. They are counted
+  // apart (`heldCount`), so the card can say how many are pending review.
+  const open = rows.filter((row) => !row.closed && !ledger.order(row.id)?.held);
+  const heldOpen = rows.filter((row) => !row.closed && ledger.order(row.id)?.held);
   // Unpaid: the payable (negative) ledger balances, as positive amounts; a held account counts in none.
   const owed = [...ledger.accounts.values()]
     .filter((account) => !account.held && account.balanceCny! < 0)
@@ -129,8 +132,7 @@ export async function suppliersSummary(db: Database, today: string) {
   const active = counts?.active ?? 0;
   return {
     suppliers: { total, active, inactive: total - active },
-    // A held account's orders (D4) add nothing to the value.
-    openPos: { count: open.length, value: byCurrency(open.filter((row) => !ledger.order(row.id)?.held), (row) => row.orderValueCny) },
+    openPos: { count: open.length, value: byCurrency(open, (row) => row.orderValueCny), heldCount: heldOpen.length },
     inTransit: { orders: rows.filter((row) => row.stage >= 3 && row.stage <= 5).length, nextEta: transit?.nextEta ?? null, arrivingNext7: transit?.arrivingNext7 ?? 0 },
     unpaid: { amount: byCurrency(owed, (total) => total.amount), suppliers: distinct(owed.map((total) => total.supplierId)).length },
     upcomingPayments: { windowDays: 7, count: sum(due, (row) => row.count), amount: byCurrency(due, (row) => row.amount) },
@@ -220,6 +222,8 @@ export async function supplierInsights(db: Database, q: InsightsQuery, today: st
   ]);
 
   const byId = new Map(supplierRows.map((supplier) => [supplier.id, supplier]));
+  // A held account's orders (D4) add nothing to any value (as SUP-1 and MD-1); they still count as orders delivered.
+  const valued = (list: OrderRow[]) => list.filter((row) => !ledger.order(row.id)?.held);
   const bySupplier = distinct(rows.map((row) => row.supplierId))
     .map((supplierId) => {
       const own = rows.filter((row) => row.supplierId === supplierId);
@@ -230,7 +234,7 @@ export async function supplierInsights(db: Database, q: InsightsQuery, today: st
         name: supplier.name,
         country: supplier.country,
         ...stats(own, today),
-        value: byCurrency(own, (row) => row.orderValueCny),
+        value: byCurrency(valued(own), (row) => row.orderValueCny),
         ...ledgerBalance(ledger, supplierId),
       };
     })
@@ -257,7 +261,7 @@ export async function supplierInsights(db: Database, q: InsightsQuery, today: st
       const inMonth = paid.filter((row) => row.month === month);
       return {
         month,
-        value: byCurrency(rows.filter((row) => row.orderDate.slice(0, 7) === month), (row) => row.orderValueCny),
+        value: byCurrency(valued(rows).filter((row) => row.orderDate.slice(0, 7) === month), (row) => row.orderValueCny),
         paid: byCurrency(inMonth, (row) => row.amountCny),
         paidInr: round2(sum(inMonth, (row) => row.amountInr)),
       };

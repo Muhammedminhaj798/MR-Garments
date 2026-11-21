@@ -44,6 +44,8 @@ export function inrOf(amountCents: number, rate: number | null) {
 
 export const MESSAGES = {
   maintenance: "Payments and order money are paused for maintenance. Try again later.",
+  /** ORD-5's money fields (the cutover baseline's): the rest of the order can still change. */
+  orderMaintenance: "Order dates, PO numbers, deposits and items are paused for maintenance. The delivery date and container terms can still change.",
   held: "This supplier's account is pending review.",
 };
 
@@ -56,9 +58,9 @@ const accountKey = (supplierId: string, currency: string) => `${supplierId} ${cu
  * Refuses a financial write (503 `ledger_maintenance`) unless the ledger is live. Read inside the write's transaction
  * with the row share-locked, so the state can't flip between this check and the write's commit.
  */
-export async function assertLedgerLive(tx: Pick<Database, "select">) {
+export async function assertLedgerLive(tx: Pick<Database, "select">, message = MESSAGES.maintenance) {
   const [row] = await tx.select({ state: ledgerState.state }).from(ledgerState).where(eq(ledgerState.id, "ledger")).for("share");
-  if (row?.state !== "live") throw new HttpError(503, "ledger_maintenance", MESSAGES.maintenance);
+  if (row?.state !== "live") throw new HttpError(503, "ledger_maintenance", message);
 }
 
 /** The held accounts (D4), as `supplierId currency` keys. */
@@ -360,6 +362,8 @@ type EntryRow = {
   advanceEntryId: string | null;
   orderId: string | null;
   reversesId: string | null;
+  /** `order:<orderId>:...` for an order's postings: the order a deleted order's postings (order_id null) belonged to. */
+  idempotencyKey?: string;
 };
 
 type OrderRow = { id: string; supplierId: string; currency: string; orderDate: string; createdKey: string };
@@ -370,85 +374,99 @@ const chronological = (x: { entryDate: string; createdKey: string; id: string },
   byText(x.entryDate, y.entryDate) || byText(x.createdKey, y.createdKey) || byText(x.id, y.id);
 
 /**
- * The pure projection of one account. Credits (payments, positive adjustments) form lots in chronological order; a void
- * empties its own payment's lot. A negative adjustment takes from the newest lots first (LIFO, owner-approved
- * 2026-11-20): at its own date, from the newest lots that exist then, each lot keeping its rate, so the oldest money
- * keeps settling the oldest orders; any shortfall is carried as a deficit that the next credits fill first. Orders are
- * settled oldest first (order date, then recorded, then id) from the oldest lots. Exported for the unit tests.
+ * The pure projection of one account (docs/unified-ledger.md "Negative adjustments", owner rules of 2026-11-21).
+ * - Credits (payments, positive adjustments) are lots in date order (business date, then recorded, then id), each at
+ *   its own rate. A void cancels its own payment where that payment stands (the lot is its amount less the void), so a
+ *   voided payment is as if never recorded and every negative adjustment is recalculated without it.
+ * - A negative adjustment's take is worked out as of the moment it was recorded. Its credits are those dated on or
+ *   before it and recorded before it, less what adjustments recorded earlier took. The dues of its date as they were
+ *   then recorded (orders, deleted ones included, and earlier shortfalls, dated on or before it, each at its value
+ *   then) are settled from them first, oldest first; the adjustment takes what is left of them, newest first. What it
+ *   can't cover is a shortfall, payable from its date. So no credit is taken twice, an adjustment never takes money
+ *   that settled an order or a shortfall dated on or before it, and a credit dated after it, or recorded after it with
+ *   an earlier date, never changes its take. An order dated after it is a newer obligation: a backdated adjustment
+ *   may take a credit such an order had. Orders are dated by their current order date (no history is kept), so an
+ *   ORD-5 date move can change an earlier adjustment's take.
+ * - Orders and shortfalls are then settled together, oldest first (an order by its order date, a shortfall by its
+ *   adjustment's date; then the moment recorded, then id), from the lots left: a later credit reduces the negative
+ *   balance through this ordinary settlement.
+ * Exported for the unit tests; `shortfallCny` is what the shortfalls still leave payable.
  */
 export function projectAccount(entries: EntryRow[], orderRows: OrderRow[]) {
   type Lot = { entry: EntryRow; left: number };
   const lots: Lot[] = [];
-  const byPayment = new Map<string, Lot>();
-  let deficit = 0;
-  const addLot = (entry: EntryRow, amount: number) => {
-    const fill = Math.min(deficit, amount);
-    deficit -= fill;
-    const lot = { entry, left: amount - fill };
-    lots.push(lot);
-    return lot;
-  };
-  const takeNewest = (amount: number) => {
-    let need = amount;
-    for (let i = lots.length - 1; i >= 0 && need > 0; i--) {
-      const take = Math.min(need, lots[i]!.left);
-      lots[i]!.left -= take;
-      need -= take;
-    }
-    deficit += need;
-  };
-
+  /** Negative adjustments, and (never written by the app) a void that can't be netted into its payment. */
+  const takers: { entry: EntryRow; amount: number }[] = [];
   const credits = entries.filter((row) => row.entryType === "payment" || row.entryType === "payment_void" || row.entryType === "adjustment").sort(chronological);
-  // A void always comes right after its own payment when that payment is dated later (a future-dated legacy deposit):
-  // it then empties its own lot, never other ones.
-  for (let i = 0; i < credits.length; i++) {
-    const row = credits[i]!;
-    if (row.entryType !== "payment_void" || !row.reversesId) continue;
-    const at = credits.findIndex((other) => other.id === row.reversesId);
-    if (at > i) {
-      credits.splice(i, 1);
-      credits.splice(at, 0, row);
-      i--;
-    }
-  }
+  // Each void, by the payment it reverses (one void per payment, schema-enforced).
+  const payments = new Set(credits.filter((row) => row.entryType === "payment").map((row) => row.id));
+  const voidOf = new Map(credits.flatMap((row) => (row.entryType === "payment_void" && row.reversesId && payments.has(row.reversesId) ? [[row.reversesId, cents(row.amount)]] : [])));
   for (const entry of credits) {
     const amount = cents(entry.amount);
     if (entry.entryType === "payment") {
-      const lot = addLot(entry, amount);
-      byPayment.set(entry.id, lot);
+      const net = amount + (voidOf.get(entry.id) ?? 0);
+      if (net > 0) lots.push({ entry, left: net });
+      // A void larger than its payment: never written by the app; kept so the lots always match the balance.
+      else if (net < 0) takers.push({ entry, amount: -net });
     } else if (entry.entryType === "payment_void") {
-      const lot = entry.reversesId ? byPayment.get(entry.reversesId) : undefined;
-      // A void cancels its own payment; what that lot no longer holds was already taken by a negative adjustment.
-      const own = Math.min(-amount, lot?.left ?? 0);
-      if (lot) lot.left -= own;
-      if (-amount > own) takeNewest(-amount - own);
+      // Already netted into its payment; one whose payment is not in the account (never written) takes like an adjustment.
+      if (!entry.reversesId || !payments.has(entry.reversesId)) takers.push({ entry, amount: -amount });
     } else if (amount > 0) {
-      addLot(entry, amount);
+      lots.push({ entry, left: amount });
     } else {
-      takeNewest(-amount);
+      takers.push({ entry, amount: -amount });
     }
   }
 
-  // Net value per order (its order_* postings, negated), for the live orders given.
-  const posted = new Map<string, { value: number; debit: boolean }>();
+  // Each order's postings (its order_* entries), so it can be valued as of any moment recorded. A deleted order's
+  // postings keep its id in their key: it stays in the view of the adjustments recorded while it existed.
+  const postings = new Map<string, EntryRow[]>();
   for (const entry of entries) {
-    if (!entry.orderId || !entry.entryType.startsWith("order_")) continue;
-    const row = posted.get(entry.orderId) ?? { value: 0, debit: false };
-    row.value -= cents(entry.amount);
-    row.debit ||= entry.entryType === "order_debit";
-    posted.set(entry.orderId, row);
+    if (!entry.entryType.startsWith("order_")) continue;
+    const orderId = entry.orderId ?? /^order:([^:]+):/.exec(entry.idempotencyKey ?? "")?.[1];
+    if (orderId) postings.set(orderId, [...(postings.get(orderId) ?? []), entry]);
   }
-  const live = [...orderRows].sort((x, y) => byText(x.orderDate, y.orderDate) || byText(x.createdKey, y.createdKey) || byText(x.id, y.id));
-  const settlements = new Map<string, Omit<OrderSettlement, "supplierId" | "currency" | "held">>();
-  let lotIndex = 0;
-  for (const order of live) {
-    const own = posted.get(order.id);
-    if (!own?.debit) {
-      settlements.set(order.id, { orderId: order.id, posted: false, valueCny: null, settledCny: null, outstandingCny: null, paymentStatus: null, settledInr: null, slices: [] });
-      continue;
+  const live = new Set(orderRows.map((order) => order.id));
+  /** Every order an adjustment may have seen, by its date: live orders, and deleted ones at their debit's date. */
+  const everOrdered = [
+    ...orderRows.map((order) => ({ id: order.id, orderDate: order.orderDate })),
+    ...[...postings].flatMap(([id, rows]) => {
+      const debit = rows.find((row) => row.entryType === "order_debit");
+      return !live.has(id) && debit ? [{ id, orderDate: debit.entryDate }] : [];
+    }),
+  ];
+  /** The order's value in cents (never negative) from its postings recorded up to `upTo` (all without); null before its debit. */
+  const valueOf = (orderId: string, upTo?: string) => {
+    const own = (postings.get(orderId) ?? []).filter((row) => upTo === undefined || row.createdKey <= upTo);
+    if (!own.some((row) => row.entryType === "order_debit")) return null;
+    return Math.max(0, -own.reduce((sum, row) => sum + cents(row.amount), 0));
+  };
+
+  // Each negative adjustment, in the order recorded, takes from the credits that were free when it was recorded.
+  const shortfalls: { entry: EntryRow; amount: number; left: number }[] = [];
+  for (const { entry, amount } of [...takers].sort((x, y) => byText(x.entry.createdKey, y.entry.createdKey) || byText(x.entry.id, y.entry.id))) {
+    const known = lots.filter((lot) => lot.entry.entryDate <= entry.entryDate && lot.entry.createdKey <= entry.createdKey);
+    // The dues of its date as recorded then settle the oldest of those credits first (only their total matters here).
+    let due =
+      everOrdered.reduce((sum, order) => sum + (order.orderDate <= entry.entryDate ? (valueOf(order.id, entry.createdKey) ?? 0) : 0), 0) +
+      shortfalls.reduce((sum, shortfall) => sum + (shortfall.entry.entryDate <= entry.entryDate ? shortfall.amount : 0), 0);
+    const free = known.map((lot) => {
+      const used = Math.min(due, lot.left);
+      due -= used;
+      return lot.left - used;
+    });
+    let need = amount;
+    for (let i = known.length - 1; i >= 0 && need > 0; i--) {
+      const take = Math.min(need, free[i]!);
+      known[i]!.left -= take;
+      need -= take;
     }
-    const value = Math.max(0, own.value);
-    let need = value;
+    if (need > 0) shortfalls.push({ entry, amount: need, left: need });
+  }
+
+  let lotIndex = 0;
+  /** Takes up to `need` from the oldest lots left, as slices (each at its credit's own rate). */
+  const draw = (need: number) => {
     const slices: SettlementSlice[] = [];
     while (need > 0 && lotIndex < lots.length) {
       const lot = lots[lotIndex]!;
@@ -469,7 +487,28 @@ export function projectAccount(entries: EntryRow[], orderRows: OrderRow[]) {
       }
       if (lot.left === 0) lotIndex++;
     }
-    const settled = value - need;
+    return slices;
+  };
+  const settledOf = (slices: SettlementSlice[]) => slices.reduce((sum, slice) => sum + cents(slice.amount), 0);
+  // Orders and shortfalls in one queue, oldest first.
+  const dues = [
+    ...orderRows.map((order) => ({ date: order.orderDate, createdKey: order.createdKey, id: order.id, order, shortfall: null })),
+    ...shortfalls.map((shortfall) => ({ date: shortfall.entry.entryDate, createdKey: shortfall.entry.createdKey, id: shortfall.entry.id, order: null, shortfall })),
+  ].sort((x, y) => byText(x.date, y.date) || byText(x.createdKey, y.createdKey) || byText(x.id, y.id));
+  const settlements = new Map<string, Omit<OrderSettlement, "supplierId" | "currency" | "held">>();
+  for (const due of dues) {
+    if (due.shortfall) {
+      due.shortfall.left -= settledOf(draw(due.shortfall.left));
+      continue;
+    }
+    const order = due.order!;
+    const value = valueOf(order.id);
+    if (value === null) {
+      settlements.set(order.id, { orderId: order.id, posted: false, valueCny: null, settledCny: null, outstandingCny: null, paymentStatus: null, settledInr: null, slices: [] });
+      continue;
+    }
+    const slices = draw(value);
+    const settled = settledOf(slices);
     const inr = slices.some((slice) => slice.amountInr === null) ? null : fromCents(slices.reduce((sum, slice) => sum + cents(slice.amountInr!), 0));
     settlements.set(order.id, {
       orderId: order.id,
@@ -495,6 +534,7 @@ export function projectAccount(entries: EntryRow[], orderRows: OrderRow[]) {
   const open = [...settlements.values()].filter((row) => (row.outstandingCny ?? 0) > 0);
   return {
     settlements,
+    shortfallCny: fromCents(shortfalls.reduce((total, shortfall) => total + shortfall.left, 0)),
     account: {
       creditsCny: fromCents(sum(credits)),
       debitsCny: fromCents(-sum(entries.filter((row) => row.entryType.startsWith("order_")))),
@@ -560,6 +600,7 @@ export async function loadLedger(db: Reader, scope: { supplierIds?: string[] } =
       advanceEntryId: e.advanceEntryId,
       orderId: e.orderId,
       reversesId: e.reversesId,
+      idempotencyKey: e.idempotencyKey,
     })
     .from(e)
     .where(ofSuppliers(e.supplierId))

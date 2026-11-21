@@ -152,8 +152,9 @@ export async function orderReports(db: Database, q: Query) {
           outstandingCny: fromCents(sum(inCurrency, (row) => cents(row.outstandingCny ?? 0))),
         };
       }),
-      paidInr: fromCents(sum(list, (row) => cents(row.paidInr ?? 0))),
-      landedCostInr: round2(sum(list, (row) => row.landedCostInr ?? 0)),
+      // A held account's orders (D4) count in no total, their landed cost included.
+      paidInr: fromCents(sum(list.filter((row) => !row.held), (row) => cents(row.paidInr ?? 0))),
+      landedCostInr: round2(sum(list.filter((row) => !row.held), (row) => row.landedCostInr ?? 0)),
     },
     filter: {
       po: po ?? null,
