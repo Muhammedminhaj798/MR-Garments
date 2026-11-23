@@ -6,7 +6,20 @@ import { join } from "node:path";
 import { and, eq, sql } from "drizzle-orm";
 import { afterAll, beforeEach, describe, expect, it } from "vitest";
 
-import { items, orderLines, orders, payments, supplierAdvanceEntries, supplierLedgerEntries, supplierLedgerHolds, suppliers, users } from "../../db/schema";
+import {
+  items,
+  locations,
+  orderLines,
+  orders,
+  payments,
+  receiptLines,
+  receipts,
+  supplierAdvanceEntries,
+  supplierLedgerEntries,
+  supplierLedgerHolds,
+  suppliers,
+  users,
+} from "../../db/schema";
 import { api, createTestContext, resetData, SEEDED, signInAs } from "../../test/harness";
 import { indiaDay } from "../stock/fixtures";
 import { baselineChanges, BASELINE_FORMAT, backfillLedger, legacyDifferences, legacyRecords, parseExpectation, readBaseline, reconcileLedger, unexpectedDifferences, writeBaseline } from "./backfill";
@@ -186,9 +199,14 @@ beforeEach(async () => {
 });
 
 /** A legacy order written straight to the tables (as before 0017): value = quantity × rate. */
+/** A legacy order of one piece at ¥value, received (so worth ¥value: received quantity x rate), written to the tables. */
 async function legacyOrder(supplierId: string, po: string, value: number, orderDate: string, rate: number | null = 12) {
   const [row] = await ctx.db.insert(orders).values({ poNumber: po, supplierId, orderDate, deliveryDate: indiaDay(60), currency: "CNY", exchangeRate: rate }).returning();
-  await ctx.db.insert(orderLines).values({ orderId: row!.id, itemId: jeans, position: 0, quantity: 1, rateCny: value });
+  const [line] = await ctx.db.insert(orderLines).values({ orderId: row!.id, itemId: jeans, position: 0, quantity: 1, rateCny: value }).returning();
+  const office = (await ctx.db.select({ id: locations.id }).from(locations).where(eq(locations.name, "Guangzhou office")))[0]!.id;
+  const boss = (await ctx.db.select({ id: users.id }).from(users).where(eq(users.email, SEEDED.management)))[0]!.id;
+  const [receipt] = await ctx.db.insert(receipts).values({ orderId: row!.id, receivedOn: orderDate, locationId: office, receivedBy: boss, bundles: 1 }).returning();
+  await ctx.db.insert(receiptLines).values({ receiptId: receipt!.id, orderLineId: line!.id, quantity: 1 });
   return row!;
 }
 const legacyPayment = async (orderId: string, amountCny: number, paidOn: string, extra: object = {}) =>
@@ -259,7 +277,9 @@ describe("backfill and reconciliation (plan 9)", () => {
   it("finds a missing credit, a wrong debit and a posting into a held account", async () => {
     const seeded = await seedLegacy();
     await backfill(true);
-    await ctx.db.update(orderLines).set({ quantity: 16_000 }).where(eq(orderLines.orderId, seeded.a.id));
+    // A wrong debit: A's received quantity changes behind the ledger's back (its value is received x rate).
+    const [aLine] = await ctx.db.select({ id: orderLines.id }).from(orderLines).where(eq(orderLines.orderId, seeded.a.id));
+    await ctx.db.update(receiptLines).set({ quantity: 2 }).where(eq(receiptLines.orderLineId, aLine!.id));
     await legacyPayment(seeded.other.id, 100, "2026-10-08");
     await ctx.db.insert(supplierLedgerEntries).values({
       supplierId: foshan,
@@ -401,11 +421,22 @@ describe("rollback script scripts/rollback/0017-down.sql", () => {
     .split("\n")
     .filter((line) => !/^(\\set |begin;|commit;)/.test(line))
     .join("\n");
-  const run = () =>
-    ctx.db.transaction(async (tx) => {
-      await tx.execute(sql.raw(body));
-      tx.rollback(); // it ran through: undo it
-    });
+  // What the database said (drizzle's error quotes the whole script, refusal texts included, so its message proves
+  // nothing): the refusal, or "ran through" when the body completed (then rolled back here).
+  const outcome = (prelude = "") =>
+    ctx.db
+      .transaction(async (tx) => {
+        if (prelude) await tx.execute(sql.raw(prelude));
+        await tx.execute(sql.raw(body));
+        tx.rollback(); // it ran through: undo it
+      })
+      .then(
+        () => "committed?",
+        (error: { message: string; cause?: { message: string } }) => (error.message === "Rollback" ? "ran through" : (error.cause?.message ?? error.message)),
+      );
+  // The test database is migrated to the latest (0018 and on); this makes it look like 0017 is the last, in the same
+  // transaction that is rolled back.
+  const only0017 = "delete from drizzle.__drizzle_migrations where created_at > 1795155384570";
 
   it("psql stops at the first error (non-zero exit), and every table is locked before the guard reads it", () => {
     const statements = script.split("\n").filter((line) => line.trim() && !line.startsWith("--"));
@@ -413,15 +444,17 @@ describe("rollback script scripts/rollback/0017-down.sql", () => {
     expect(script.indexOf("lock table ledger_state, supplier_ledger_holds, supplier_ledger_entries, payments in access exclusive mode")).toBeLessThan(script.indexOf("do $$"));
   });
 
-  it("refuses unless the ledger is in maintenance, refuses after an application write, and runs through otherwise", async () => {
+  it("refuses unless the ledger is in maintenance, after an application write and after a later migration, and runs through otherwise", async () => {
     const seeded = await seedLegacy();
     await backfill(true);
-    await expect(run()).rejects.toThrow("the ledger is not in maintenance"); // the harness leaves it live
+    expect(await outcome(only0017)).toContain("the ledger is not in maintenance"); // the harness leaves it live
     await ctx.db.execute(sql`update ledger_state set state = 'maintenance'`);
-    await expect(run()).rejects.toThrow("Rollback"); // drizzle's rollback: the whole body ran
+    // 0017 only: the whole body runs (then undone); with a later migration applied it refuses.
+    expect(await outcome(only0017)).toBe("ran through");
+    expect(await outcome()).toContain("a migration after 0017 is applied");
     expect(await ctx.db.select().from(supplierLedgerEntries)).toHaveLength(6); // and was undone
     await ctx.db.insert(supplierLedgerEntries).values({ supplierId: hangzhou, currency: "CNY", entryType: "order_adjustment", amount: -1, entryDate: indiaDay(), origin: "app", orderId: seeded.other.id, poNumber: "H-1", idempotencyKey: "test:app" });
-    await expect(run()).rejects.toThrow("application-written records");
+    expect(await outcome(only0017)).toContain("application-written records");
   });
 });
 

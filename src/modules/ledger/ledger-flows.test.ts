@@ -5,10 +5,12 @@ import { afterAll, beforeEach, describe, expect, it } from "vitest";
 
 import {
   items,
+  locations,
   notifications,
   orderLines,
   orders,
   payments,
+  receipts,
   shippingAgents,
   supplierAdvanceEntries,
   supplierLedgerEntries as entries,
@@ -16,9 +18,10 @@ import {
   suppliers,
   users,
 } from "../../db/schema";
-import { api, createTestContext, resetData, SEEDED, signInAs } from "../../test/harness";
+import { api, createTestContext, receiveOrder, resetData, SEEDED, signInAs } from "../../test/harness";
 import { buildLifecycle } from "../reports/test-data";
 import { indiaDay, receive } from "../stock/fixtures";
+import { MESSAGES as STOCK } from "../stock/stock.routes";
 import { MESSAGES as LEDGER } from "./ledger";
 
 // The unified supplier ledger through the routes (docs/unified-ledger.md): PAY-2's orderless supplier payment and its
@@ -49,13 +52,17 @@ beforeEach(async () => {
 });
 
 const get = (path: string, cookie = management) => http.get(path).set("Cookie", cookie);
-/** ORD-3: `quantity` Denim jeans at ¥1 for the supplier. */
-const place = async (quantity: number, extra: object = {}, supplierId = guangzhou) => {
+/**
+ * ORD-3: `quantity` Denim jeans at ¥1 for the supplier, then (unless `received` is false) received in full, so it is
+ * worth ¥quantity (owner rule of 2026-11-23: received quantity x rate). `goods` is the receipt's posting.
+ */
+const place = async (quantity: number, extra: object = {}, supplierId = guangzhou, received = true) => {
   const res = await http
     .post("/orders", { supplierId, orderDate: indiaDay(-10), deliveryDate: indiaDay(20), lines: [{ itemId: jeans, quantity, rateCny: 1 }], ...extra })
     .set("Cookie", management);
   expect(res.status, JSON.stringify(res.body)).toBe(201);
-  return res.body as { order: { id: string; po: string }; ledger: { debitCny: number; balanceBefore: number; balanceAfter: number } };
+  const body = res.body as { order: { id: string; po: string }; ledger: { debitCny: number; balanceBefore: number; balanceAfter: number } };
+  return { ...body, goods: received ? (await receiveOrder(ctx, body.order.id)).posted : null };
 };
 const supplierPayment = (overrides: object = {}) => ({ supplierId: guangzhou, amount: 600, paidOn: indiaDay(-1), rateInr: 12, mode: "Bank", reference: "TT-1", clientRequestId: randomUUID(), ...overrides });
 const pay = (body: object, cookie = accounts) => http.post("/payments", body).set("Cookie", cookie);
@@ -76,6 +83,14 @@ const balance = async (supplierId = guangzhou, currency = "CNY") =>
   ((await get(`/suppliers/${supplierId}/ledger`)).body.accounts as { currency: string; balanceCny: number | null }[]).find((row) => row.currency === currency)?.balanceCny;
 const postingsOf = (where: ReturnType<typeof eq>) => ctx.db.select().from(entries).where(where);
 const lines = (orderId: string) => ctx.db.select({ id: orderLines.id, itemId: orderLines.itemId, quantity: orderLines.quantity }).from(orderLines).where(eq(orderLines.orderId, orderId));
+/** REC-3 through the API: `quantity` of the order's main line, received yesterday at the Guangzhou office. */
+const recordReceipt = async (orderId: string, quantity: number, extra: object = {}, cookie = management) => {
+  const [line] = await lines(orderId);
+  const office = (await ctx.db.select({ id: locations.id }).from(locations).where(eq(locations.name, "Guangzhou office")))[0]!.id;
+  return http
+    .post("/receipts", { orderId, receivedOn: indiaDay(-1), locationId: office, bundles: 1, shortRemark: "Rest to follow", lines: [{ orderLineId: line!.id, quantity }], ...extra })
+    .set("Cookie", cookie);
+};
 const editLines = async (po: string, orderId: string, quantity: number) => {
   const [line] = await lines(orderId);
   return http.patch(`/orders/${po}`, { lines: [{ id: line!.id, itemId: line!.itemId, quantity, rateCny: 1 }] }).set("Cookie", management);
@@ -84,7 +99,9 @@ const editLines = async (po: string, orderId: string, quantity: number) => {
 describe("PAY-2 orderless supplier payment", () => {
   it("posts a credit to the supplier's account, answers the balance before and after, and links the notification to the ledger", async () => {
     const order = await place(1000);
-    expect(order.ledger).toMatchObject({ debitCny: 1000, balanceBefore: 0, balanceAfter: -1000 });
+    // ORD-3 posts the order at its received value (nothing yet: 0); receiving the goods posts the ¥1,000.
+    expect(order.ledger).toMatchObject({ debitCny: 0, balanceBefore: 0, balanceAfter: 0 });
+    expect(order.goods).toMatchObject({ changeCny: -1000, balanceBefore: 0, balanceAfter: -1000 });
     const res = await pay(supplierPayment());
     expect(res.status, JSON.stringify(res.body)).toBe(201);
     expect(res.body).toMatchObject({
@@ -197,16 +214,16 @@ describe("concurrency", () => {
     expect(await balance()).toBe(500);
   });
 
-  it("a payment while an order edit runs: both land, and the balances add up", async () => {
-    const order = await place(1000);
-    const [edit, paid] = await Promise.all([editLines(order.order.po, order.order.id, 1500), pay(supplierPayment({ amount: 700 }))]);
-    expect(edit.status, JSON.stringify(edit.body)).toBe(200);
+  it("a payment while a receipt is recorded (the order's value changes): both land, and the balances add up", async () => {
+    const order = await place(1500, {}, guangzhou, false);
+    const [received, paid] = await Promise.all([recordReceipt(order.order.id, 1500), pay(supplierPayment({ amount: 700 }))]);
+    expect(received.status, JSON.stringify(received.body)).toBe(201);
     expect(paid.status).toBe(201);
     const steps = [
-      { before: edit.body.ledger.balanceBefore, after: edit.body.ledger.balanceAfter },
+      { before: received.body.ledger.balanceBefore, after: received.body.ledger.balanceAfter },
       { before: paid.body.ledger.balanceBefore, after: paid.body.ledger.balanceAfter },
-    ].sort((x, y) => (x.before === -1000 ? -1 : y.before === -1000 ? 1 : 0));
-    expect(steps[0]!.before).toBe(-1000);
+    ].sort((x, y) => (x.before === 0 ? -1 : y.before === 0 ? 1 : 0));
+    expect(steps[0]!.before).toBe(0);
     expect(steps[1]!.before).toBe(steps[0]!.after);
     expect(steps[1]!.after).toBe(-800);
     expect(await balance()).toBe(-800);
@@ -309,7 +326,7 @@ describe("held accounts (D4, D18)", () => {
 
 describe("the write-state guard", () => {
   it("every financial write is 503 while maintenance; a date-only ORD-5 and every read still work", async () => {
-    const order = await place(100);
+    const order = await place(100, {}, guangzhou, false);
     const paid = (await pay(supplierPayment({ amount: 10 }))).body.payment;
     await ctx.db.execute(sql`update ledger_state set state = 'maintenance'`);
     const paused = (res: { status: number; body: { error?: { code: string; message: string } } }, message = LEDGER.maintenance) => {
@@ -327,6 +344,8 @@ describe("the write-state guard", () => {
     paused(await http.post("/orders", { supplierId: guangzhou, orderDate: indiaDay(-1), deliveryDate: indiaDay(9), lines: [{ itemId: jeans, quantity: 1, rateCny: 1 }] }).set("Cookie", management));
     paused(await editLines(order.order.po, order.order.id, 200), LEDGER.orderMaintenance);
     paused(await http.delete(`/orders/${order.order.po}`).set("Cookie", management));
+    // A receipt changes the order's value (received x rate): paused too, and nothing is recorded.
+    paused(await recordReceipt(order.order.id, 100), STOCK.receiptMaintenance);
     // ORD-5: the order date, PO number and deposit asked are the cutover baseline's fields: refused (and nothing saved).
     const edit = (body: object) => http.patch(`/orders/${order.order.po}`, body).set("Cookie", management);
     for (const body of [{ orderDate: indiaDay(-11) }, { po: "MAINT-RENAMED" }, { depositRequiredCny: 50 }, { deliveryDate: indiaDay(41), orderDate: indiaDay(-12) }]) paused(await edit(body), LEDGER.orderMaintenance);
@@ -351,48 +370,64 @@ describe("final settlements are kept (pre-release audit M8)", () => {
     const cost = ((await get("/landed-cost")).body.orders as { orderId: string; final: boolean; goodsInr: number }[]).find((row) => row.orderId === id)!;
     expect(cost).toMatchObject({ final: true, goodsInr: 37_000 });
   };
+  // Not received (stage 1): worth 0 until a receipt.
   const create = (orderDate: string, quantity = 100) =>
     http.post("/orders", { supplierId: guangzhou, orderDate, deliveryDate: indiaDay(20), lines: [{ itemId: jeans, quantity, rateCny: 1 }] }).set("Cookie", management);
-  const refused = (res: { status: number; body: { error?: { code: string; fields?: Record<string, string> } } }, po: string, edit = false) => {
-    expect(res.status, JSON.stringify(res.body)).toBe(422);
-    expect(res.body.error?.fields).toEqual({
-      orderDate: edit
-        ? `Changing the order date would change the payments that settle ${po}, whose landed cost is already final. Keep the saved order date.`
-        : `This order date comes before ${po}, whose landed cost is already final: the order would take the payments that settle it. Choose a later order date.`,
-    });
-  };
 
-  it("ORD-3: an order dated before a final order is refused (reopening it, or re-pricing it from other credits); nothing is written", async () => {
+  it("ORD-3 places an order dated before a final order (nothing received: worth 0, it takes no credit); its receipt is refused (409) until Management approves it with a reason", async () => {
     const data = await buildLifecycle(ctx);
-    const before = { orders: (await ctx.db.select().from(orders)).length, entries: (await postingsOf(eq(entries.supplierId, guangzhou))).length };
-    refused(await create(indiaDay(-41)), data.a.po);
-    // With ¥500 more available, A stays fully paid, but from other credits (@15 instead of part of @12): refused too.
-    await pay(supplierPayment({ amount: 500, paidOn: indiaDay(-1), rateInr: 15 }));
-    refused(await create(indiaDay(-41)), data.a.po);
-    expect((await ctx.db.select().from(orders)).length).toBe(before.orders);
-    expect(await postingsOf(eq(entries.supplierId, guangzhou))).toHaveLength(before.entries + 1);
+    const early = await create(indiaDay(-41));
+    expect(early.status, JSON.stringify(early.body)).toBe(201);
     await finalA(data.a.id);
-    // The same day as A (recorded after it, so settled after it) or later: placed, and A keeps its settlement.
-    expect((await create(indiaDay(-40))).status).toBe(201);
-    expect((await create(indiaDay(-1))).status).toBe(201);
+    const before = (await postingsOf(eq(entries.supplierId, guangzhou))).length;
+    // Received, it would be worth ¥100 and, older than A, take A's credits: refused, nothing recorded or posted.
+    const blocked = await recordReceipt(early.body.order.id, 100);
+    expect(blocked.status, JSON.stringify(blocked.body)).toBe(409);
+    expect(blocked.body.error).toEqual({ code: "final_settlement_approval", message: STOCK.finalSettlement([data.a.po], false) });
+    expect(await ctx.db.select().from(receipts).where(eq(receipts.orderId, early.body.order.id))).toHaveLength(0);
+    expect(await postingsOf(eq(entries.supplierId, guangzhou))).toHaveLength(before);
     await finalA(data.a.id);
+    // Only Management approves: China staff (receiving Enter) with a reason is 403, and nothing is written.
+    const staff = await recordReceipt(early.body.order.id, 100, { finalSettlementApproval: { reason: "Late delivery" } }, await signInAs(ctx, SEEDED.chinaStaff));
+    expect(staff.status, JSON.stringify(staff.body)).toBe(403);
+    expect(staff.body.error).toEqual({ code: "forbidden", message: STOCK.approvalNotAllowed });
+    expect(await postingsOf(eq(entries.supplierId, guangzhou))).toHaveLength(before);
+    // Approved: recorded and posted; the posting keeps the reason, the approver and the time.
+    const approved = await recordReceipt(early.body.order.id, 100, { finalSettlementApproval: { reason: "Late delivery of the March lot" } });
+    expect(approved.status, JSON.stringify(approved.body)).toBe(201);
+    expect(approved.body.ledger).toMatchObject({ deferred: false, changeCny: -100, finalOrders: [data.a.po] });
+    const [posting] = await postingsOf(and(eq(entries.orderId, early.body.order.id), eq(entries.entryType, "order_adjustment"))!);
+    const boss = (await ctx.db.select({ id: users.id }).from(users).where(eq(users.email, SEEDED.management)))[0]!.id;
+    expect(posting).toMatchObject({ amount: -100, origin: "app", notes: "Management approval (final landed cost): Late delivery of the March lot", createdBy: boss, entryDate: indiaDay() });
+    expect(posting!.createdAt).toBeInstanceOf(Date);
+    // The same day as A (recorded after it, so settled after it) or later: placed and received without approval.
+    const sameDay = await create(indiaDay(-40));
+    expect(sameDay.status).toBe(201);
+    expect((await recordReceipt(sameDay.body.order.id, 100)).status).toBe(201);
   });
 
-  it("ORD-5: moving an open order before a final one is refused and nothing changes; other date moves re-settle by FIFO as before", async () => {
+  it("ORD-5: before goods arrive an order is worth 0, so moving its date (even before a final order) moves no credit; once received the date is locked, and the receipt is what needs approval", async () => {
     const data = await buildLifecycle(ctx);
     const later = await place(100, { orderDate: indiaDay(-5) });
-    const latest = await place(100, { orderDate: indiaDay(-1) });
+    const latest = await place(100, { orderDate: indiaDay(-1) }, guangzhou, false);
     const move = (po: string, orderDate: string) => http.patch(`/orders/${po}`, { orderDate }).set("Cookie", management);
-    refused(await move(latest.order.po, indiaDay(-41)), data.a.po, true);
-    expect((await ctx.db.select({ orderDate: orders.orderDate }).from(orders).where(eq(orders.id, latest.order.id)))[0]!.orderDate).toBe(indiaDay(-1));
-    await finalA(data.a.id);
-    // ¥100 available: it settles the oldest open order (later); moving latest before it moves the ¥100 (FIFO).
+    // ¥100 available: it settles the only order with goods (later).
     await pay(supplierPayment({ amount: 100 }));
     expect((await get(`/orders/${later.order.po}`)).body).toMatchObject({ settledCny: 100, paymentStatus: "paid" });
-    const moved = await move(latest.order.po, indiaDay(-6));
+    // Nothing received: the move changes no settlement, A's included, so it is saved.
+    const moved = await move(latest.order.po, indiaDay(-41));
     expect(moved.status, JSON.stringify(moved.body)).toBe(200);
-    expect((await get(`/orders/${latest.order.po}`)).body).toMatchObject({ settledCny: 100, paymentStatus: "paid" });
-    expect((await get(`/orders/${later.order.po}`)).body).toMatchObject({ settledCny: 0, paymentStatus: "unpaid" });
+    expect((await get(`/orders/${latest.order.po}`)).body).toMatchObject({ orderDate: indiaDay(-41), settledCny: 0, paymentStatus: "awaiting_goods" });
+    expect((await get(`/orders/${later.order.po}`)).body).toMatchObject({ settledCny: 100, paymentStatus: "paid" });
+    await finalA(data.a.id);
+    // Its goods, now older than A, would take A's credits: the receipt needs Management approval (REC-3, 409).
+    const blocked = await recordReceipt(latest.order.id, 100);
+    expect(blocked.status, JSON.stringify(blocked.body)).toBe(409);
+    expect(blocked.body.error.code).toBe("final_settlement_approval");
+    // An order with goods can't move at all (ORD-5 locks the date once goods are received).
+    const locked = await move(later.order.po, indiaDay(-41));
+    expect(locked.status).toBe(409);
+    expect(locked.body.error.code).toBe("order_locked");
     await finalA(data.a.id);
   });
 
@@ -451,12 +486,12 @@ describe("final settlements are kept (pre-release audit M8)", () => {
     await finalA(data.a.id);
   });
 
-  it("ORD-5: a line change sent with a date move is judged on the date move only (a value change is not M8's)", async () => {
+  it("ORD-5: a line change sent with a date move is judged on the date move only (before goods arrive, lines change no value)", async () => {
     const data = await buildLifecycle(ctx);
-    // ¥100 more @15, and an open order put before A straight in the database (the API would refuse it): A stays fully
-    // settled and final (re-priced: 1,900 @12, 1,000 @13 and 100 @15).
+    // ¥100 more @15, and an open order put before A straight in the database, nothing received (worth 0): A stays fully
+    // settled and final.
     await pay(supplierPayment({ amount: 100, paidOn: indiaDay(-1), rateInr: 15 }));
-    const early = await place(100, { orderDate: indiaDay(-1) });
+    const early = await place(100, { orderDate: indiaDay(-1) }, guangzhou, false);
     await ctx.db.update(orders).set({ orderDate: indiaDay(-45) }).where(eq(orders.id, early.order.id));
     const isFinal = async () => ((await get("/landed-cost")).body.orders as { orderId: string; final: boolean }[]).find((row) => row.orderId === data.a.id)!.final;
     expect(await isFinal()).toBe(true);
@@ -465,23 +500,28 @@ describe("final settlements are kept (pre-release audit M8)", () => {
     const res = await http.patch(`/orders/${early.order.po}`, { orderDate: indiaDay(-44), lines: [{ id: line!.id, itemId: jeans, quantity: 150, rateCny: 1 }] }).set("Cookie", management);
     expect(res.status, JSON.stringify(res.body)).toBe(200);
     expect(res.body.order).toMatchObject({ orderDate: indiaDay(-44) });
-    expect((await get(`/orders/${early.order.po}`)).body).toMatchObject({ settledCny: 150, paymentStatus: "paid" });
+    expect(res.body.ledger).toMatchObject({ changeCny: 0 });
+    expect((await get(`/orders/${early.order.po}`)).body).toMatchObject({ orderValueCny: 0, poValueCny: 150, settledCny: 0, paymentStatus: "awaiting_goods" });
+    expect(await isFinal()).toBe(true);
   });
 });
 
 describe("order postings (ORD-3, ORD-5, ORD-6)", () => {
-  it("ORD-3 debits once; ORD-5 posts one adjustment per value change and nothing for the same lines or other edits", async () => {
-    const order = await place(1000, { depositRequiredCny: 100 });
+  it("ORD-3 posts a 0 debit once; ORD-5 line edits before goods arrive post nothing; each receipt posts its value; other edits post nothing", async () => {
+    const order = await place(1000, { depositRequiredCny: 100 }, guangzhou, false);
     const ofOrder = () => postingsOf(eq(entries.orderId, order.order.id));
-    expect(await ofOrder()).toMatchObject([{ entryType: "order_debit", amount: -1000, poNumber: order.order.po }]);
+    expect(await ofOrder()).toMatchObject([{ entryType: "order_debit", amount: 0, poNumber: order.order.po }]);
+    // Nothing received: a line change is a PO value change only (received x rate is still 0).
     const up = await editLines(order.order.po, order.order.id, 1200);
-    expect(up.body.ledger).toEqual({ supplierId: guangzhou, currency: "CNY", changeCny: -200, balanceBefore: -1000, balanceAfter: -1200 });
-    const down = await editLines(order.order.po, order.order.id, 900);
-    expect(down.body.ledger).toMatchObject({ changeCny: 300, balanceAfter: -900 });
-    const same = await editLines(order.order.po, order.order.id, 900);
-    expect(same.body.ledger).toMatchObject({ changeCny: 0, balanceBefore: -900, balanceAfter: -900 });
+    expect(up.body.ledger).toEqual({ supplierId: guangzhou, currency: "CNY", changeCny: 0, balanceBefore: 0, balanceAfter: 0 });
+    // Goods arrive: 1,000 of the 1,200, then 300 more (over the order): each receipt posts its value.
+    const first = await recordReceipt(order.order.id, 1000);
+    expect(first.status, JSON.stringify(first.body)).toBe(201);
+    expect(first.body.ledger).toEqual({ supplierId: guangzhou, currency: "CNY", deferred: false, changeCny: -1000, balanceBefore: 0, balanceAfter: -1000, finalOrders: [] });
+    const second = await recordReceipt(order.order.id, 300);
+    expect(second.body.ledger).toMatchObject({ changeCny: -300, balanceBefore: -1000, balanceAfter: -1300 });
     const patch = (body: object) => http.patch(`/orders/${order.order.po}`, body).set("Cookie", management);
-    for (const body of [{ deliveryDate: indiaDay(45) }, { orderDate: indiaDay(-11) }, { terms: "FOB" }, { depositRequiredCny: 300 }]) {
+    for (const body of [{ deliveryDate: indiaDay(45) }, { terms: "FOB" }, { depositRequiredCny: 300 }]) {
       const res = await patch(body);
       expect(res.status, JSON.stringify(body)).toBe(200);
       expect(res.body.ledger, JSON.stringify(body)).toBeUndefined();
@@ -489,30 +529,33 @@ describe("order postings (ORD-3, ORD-5, ORD-6)", () => {
     const renamed = await patch({ po: "LEDGER-RENAMED" });
     expect(renamed.body.order.po).toBe("LEDGER-RENAMED");
     expect((await ofOrder()).map((row) => [row.entryType, row.amount])).toEqual([
-      ["order_debit", -1000],
-      ["order_adjustment", -200],
-      ["order_adjustment", 300],
+      ["order_debit", 0],
+      ["order_adjustment", -1000],
+      ["order_adjustment", -300],
     ]);
-    expect(await balance()).toBe(-900);
+    expect(await balance()).toBe(-1300);
+    expect((await get("/orders/LEDGER-RENAMED")).body).toMatchObject({ orderValueCny: 1300, poValueCny: 1200, paymentStatus: "unpaid" });
   });
 
-  it("lowering the lines below what was paid is allowed now: the balance turns positive and the order is paid", async () => {
-    const order = await place(1000);
+  it("a payment before the goods is supplier credit; a receipt below it leaves the rest with the supplier and the order is paid", async () => {
+    const order = await place(1000, {}, guangzhou, false);
     await pay(supplierPayment({ amount: 800 }));
-    const res = await editLines(order.order.po, order.order.id, 500);
-    expect(res.status, JSON.stringify(res.body)).toBe(200);
-    expect(res.body.ledger).toMatchObject({ changeCny: 500, balanceBefore: -200, balanceAfter: 300 });
-    expect((await get(`/orders/${order.order.po}`)).body).toMatchObject({ settledCny: 500, outstandingCny: 0, paymentStatus: "paid" });
+    expect((await get(`/orders/${order.order.po}`)).body).toMatchObject({ orderValueCny: 0, settledCny: 0, outstandingCny: 0, paymentStatus: "awaiting_goods" });
+    expect(await balance()).toBe(800);
+    const res = await recordReceipt(order.order.id, 500);
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    expect(res.body.ledger).toMatchObject({ changeCny: -500, balanceBefore: 800, balanceAfter: 300 });
+    expect((await get(`/orders/${order.order.po}`)).body).toMatchObject({ orderValueCny: 500, poValueCny: 1000, settledCny: 500, outstandingCny: 0, paymentStatus: "paid" });
   });
 
   it("ORD-6 posts the cancel (balance back), keeps the postings by PO; refused with payments (voided too) or receipts", async () => {
-    const order = await place(1000);
+    const order = await place(1000, {}, guangzhou, false);
     expect((await http.delete(`/orders/${order.order.po}`).set("Cookie", management)).status).toBe(204);
     expect(await balance()).toBe(0);
     const kept = await postingsOf(eq(entries.poNumber, order.order.po));
     expect(kept.map((row) => [row.entryType, row.amount, row.orderId])).toEqual([
-      ["order_debit", -1000, null],
-      ["order_cancel", 1000, null],
+      ["order_debit", 0, null],
+      ["order_cancel", 0, null],
     ]);
     const statement = (await get(`/suppliers/${guangzhou}/ledger`)).body.entries;
     expect(statement.map((row: { entryType: string; po: string }) => [row.entryType, row.po])).toEqual([
@@ -520,13 +563,13 @@ describe("order postings (ORD-3, ORD-5, ORD-6)", () => {
       ["order_debit", order.order.po],
     ]);
 
-    const withPayment = await place(100);
+    const withPayment = await place(100, {}, guangzhou, false);
     const agent = (await pay(agentPayment(withPayment.order.id))).body.payment;
     await voidIt(agent.id);
     const refused = await http.delete(`/orders/${withPayment.order.po}`).set("Cookie", management);
     expect(refused.status).toBe(409);
     expect(refused.body.error).toMatchObject({ code: "in_use", message: "This order has 1 payment, so it can't be deleted." });
-    const received = await place(100);
+    const received = await place(100, {}, guangzhou, false);
     const [line] = await lines(received.order.id);
     await receive(ctx, received.order.id, [{ orderLineId: line!.id, quantity: 10 }]);
     expect((await http.delete(`/orders/${received.order.po}`).set("Cookie", management)).body.error.code).toBe("in_use");
@@ -548,8 +591,9 @@ describe("the FIFO projection on the screens", () => {
     expect(await status("paid")).toEqual([older.order.po]);
     expect(await status("partly")).toEqual([newer.order.po]);
     expect(await status("unpaid")).toEqual([]);
+    expect(await status("awaiting_goods")).toEqual([]);
     const report = (await get("/reports/orders")).body;
-    expect(report.summary.byCurrency).toEqual([{ currency: "CNY", orderValueCny: 1500, settledCny: 1200, outstandingCny: 300 }]);
+    expect(report.summary.byCurrency).toEqual([{ currency: "CNY", orderValueCny: 1500, poValueCny: 1500, settledCny: 1200, outstandingCny: 300 }]);
     expect(await balance()).toBe(-300);
     await pay(supplierPayment({ amount: 800 }));
     expect(await balance()).toBe(500);

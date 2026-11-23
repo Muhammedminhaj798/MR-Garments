@@ -2,7 +2,7 @@ import { eq } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import { type Currency, items, orders, payments, suppliers } from "../../db/schema";
-import { api, createTestContext, resetData, SEEDED, signInAs } from "../../test/harness";
+import { api, createTestContext, receiveOrder, resetData, SEEDED, signInAs } from "../../test/harness";
 import { idOf, indiaDay, makeOrder, postLegacy } from "../stock/fixtures";
 
 const ctx = createTestContext();
@@ -43,6 +43,8 @@ describe("GET /reports/payments-per-supplier/:supplierId", () => {
     usd = await makeOrder(ctx, { supplier: "Foshan Fabrics", stage: 6, currency: "USD", lines: [{ item: "Track pants", quantity: 100, rateCny: 2 }] });
     await ctx.db.update(orders).set({ orderDate: indiaDay(-10) }).where(eq(orders.id, usd.id));
     const other = await makeOrder(ctx, { lines: [{ item: "Polo shirts", quantity: 10, rateCny: 30 }] });
+    // Received in full: each order is worth its lines (received quantity x rate).
+    for (const made of [cny, usd, other]) await receiveOrder(ctx, made.id);
     const toFoshan = { payee: "Foshan Fabrics", payeeRole: "supplier" } as const;
     await ctx.db.insert(payments).values([
       { ...toFoshan, orderId: cny.id, kind: "Deposit", amountCny: 1000, rateInr: 12, status: "paid", mode: "Bank", paidOn: indiaDay(-28) },
@@ -108,12 +110,13 @@ describe("GET /reports/payments-per-supplier/:supplierId", () => {
         { currency: "USD", held: false, orders: 1, orderValueCny: 200, settledCny: 50, outstandingCny: 150, creditsCny: 50, balanceCny: -150, paidInr: 4400 },
       ],
     });
-    // The supplier's ledger, whole: an account per currency and every posting (two debits, three credits).
+    // The supplier's ledger, whole: an account per currency and every posting (two debits at 0 when placed, the two
+    // receipts' values, three credits).
     expect(body.ledger.accounts.map((row: { currency: string; balanceCny: number }) => [row.currency, row.balanceCny])).toEqual([
       ["CNY", -2750],
       ["USD", -150],
     ]);
-    expect(body.ledger.entries).toHaveLength(5);
+    expect(body.ledger.entries).toHaveLength(7);
 
     expect(body.payments).toMatchObject({ total: 5, page: 1, pageSize: 10 });
     expect(body.payments.rows.map((row: { amountCny: number }) => row.amountCny)).toEqual([2750, 30, 50, 500, 1000]);
@@ -155,7 +158,7 @@ describe("GET /reports/payments-per-supplier/:supplierId", () => {
       currency: "USD",
       quantities: [{ unit: "pcs", quantity: 100 }],
       quantity: 100,
-      received: 0,
+      received: 100,
       unit: "pcs",
       orderValueCny: 200,
       held: false,
@@ -184,7 +187,10 @@ describe("GET /reports/payments-per-supplier/:supplierId", () => {
       unit: "m",
       quantity: 500,
       rateCny: 8,
+      // Received x rate (all 500 received); the PO amount is the ordered quantity x rate.
+      received: 500,
       amountCny: 4000,
+      poAmountCny: 4000,
       currency: "CNY",
     });
   });
@@ -265,6 +271,8 @@ describe("GET /reports/payments-per-supplier/:supplierId on a larger data set", 
   const order = async (supplier: string, currency: Currency, stage: number, daysAgo: number, lines: { item: string; quantity: number; rateCny: number }[]) => {
     const made = await makeOrder(ctx, { supplier, stage, currency, lines });
     await ctx.db.update(orders).set({ orderDate: indiaDay(-daysAgo) }).where(eq(orders.id, made.id));
+    // Received in full: the order is worth its lines (received quantity x rate).
+    await receiveOrder(ctx, made.id);
     return made;
   };
   const paid = (orderId: string, kind: "Deposit" | "Balance", amountCny: number, rateInr: number, day: number, payee = "Yiwu Trims Ltd.") =>

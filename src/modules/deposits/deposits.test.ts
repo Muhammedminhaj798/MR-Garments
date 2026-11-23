@@ -4,7 +4,7 @@ import { eq } from "drizzle-orm";
 import { afterAll, beforeEach, describe, expect, it } from "vitest";
 
 import { payments, shippingAgents, supplierDeposits, supplierDepositTransactions, suppliers } from "../../db/schema";
-import { api, createTestContext, resetData, SEEDED, signInAs } from "../../test/harness";
+import { api, createTestContext, receiveOrder, resetData, SEEDED, signInAs } from "../../test/harness";
 import { UNKNOWN } from "../stages/fixtures";
 import { idOf, makeOrder, postLegacy } from "../stock/fixtures";
 import { MESSAGES } from "./deposits.routes";
@@ -192,9 +192,16 @@ describe("DEP-1 GET /deposits", () => {
 
   it("lists the Deposit Required milestones, newest first, from the FIFO projection; a voided order deposit stays listed, flagged", async () => {
     const jeans = (await http.get("/orders/options").set("Cookie", management)).body.items.find((item: { name: string }) => item.name === "Denim jeans").id;
-    const place = async (orderDate: string, depositRequiredCny?: number) =>
-      (await http.post("/orders", { supplierId: guangzhou, orderDate, deliveryDate: "2026-12-30", lines: [{ itemId: jeans, quantity: 100, rateCny: 10 }], depositRequiredCny }).set("Cookie", management))
-        .body.order as { id: string; po: string };
+    // Each order received in full (worth ¥1,000): only what FIFO settles to an order counts toward its deposit.
+    const place = async (orderDate: string, depositRequiredCny?: number) => {
+      const order = (
+        await http
+          .post("/orders", { supplierId: guangzhou, orderDate, deliveryDate: "2026-12-30", lines: [{ itemId: jeans, quantity: 100, rateCny: 10 }], depositRequiredCny })
+          .set("Cookie", management)
+      ).body.order as { id: string; po: string };
+      await receiveOrder(ctx, order.id);
+      return order;
+    };
     const first = await place("2026-10-01", 400);
     await place("2026-10-02");
     const third = await place("2026-10-03", 300);
@@ -246,6 +253,7 @@ describe("DEP-1 GET /deposits", () => {
 
   it("leaves the order figures alone: PAY-1 ignores the supplier deposits archive and its settlements", async () => {
     const order = await makeOrder(ctx, { lines: [{ item: "Denim jeans", quantity: 100, rateCny: 10 }] });
+    await receiveOrder(ctx, order.id); // worth ¥1,000 (received x rate)
     const pay = await http.post("/payments", { supplierId: guangzhou, amount: 300, paidOn: "2026-10-21", rateInr: 12, mode: "Cash", clientRequestId: randomUUID() }).set("Cookie", accounts);
     expect(pay.status).toBe(201);
     const before = (await get("/payments")).body;

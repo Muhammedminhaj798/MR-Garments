@@ -5,7 +5,7 @@ import supertest from "supertest";
 import { afterAll, beforeEach, describe, expect, it } from "vitest";
 
 import { items, locations, orderLines, orders, payments, receiptLines, receipts, shippingAgents, suppliers, users } from "../../db/schema";
-import { api, createTestContext, resetData, SEEDED, signInAs } from "../../test/harness";
+import { api, createTestContext, receiveOrder, resetData, SEEDED, signInAs } from "../../test/harness";
 import { MESSAGES } from "./orders.routes";
 
 const ctx = createTestContext();
@@ -112,14 +112,15 @@ describe("ORD-3 POST /orders and ORD-1 GET /orders", () => {
   it("creates PO-2050 then PO-2051 with lines and deposits, and lists their figures", async () => {
     const first = await create(orderBody());
     expect(first.status).toBe(201);
-    // The order's value is debited to the supplier's account (docs/unified-ledger.md): it now owes ¥14,975.
+    // The order's value (received quantity x rate, owner rule of 2026-11-23) is debited to the supplier's account
+    // (docs/unified-ledger.md): nothing received yet, so ¥0; its receipts post the rest.
     expect(first.body).toEqual({
       order: { id: expect.any(String), po: "PO-2050" },
-      ledger: { supplierId: ids.supplier, currency: "CNY", debitCny: 14975, balanceBefore: 0, balanceAfter: -14975 },
+      ledger: { supplierId: ids.supplier, currency: "CNY", debitCny: 0, balanceBefore: 0, balanceAfter: 0 },
     });
     const second = await create(orderBody({ orderDate: "2026-10-20", lines: [{ itemId: ids.fabric, quantity: 50, rateCny: 3 }], deposits: [] }));
     expect(second.body.order.po).toBe("PO-2051");
-    expect(second.body.ledger).toMatchObject({ debitCny: 150, balanceBefore: -14975, balanceAfter: -15125 });
+    expect(second.body.ledger).toMatchObject({ debitCny: 0, balanceBefore: 0, balanceAfter: 0 });
     expect((await get("/orders/options")).body.nextPo).toBe("PO-2052");
 
     const id = first.body.order.id;
@@ -154,13 +155,14 @@ describe("ORD-3 POST /orders and ORD-1 GET /orders", () => {
       stocked: 0,
       closed: false,
       closedOn: null,
-      orderValueCny: 14975, // 1000 * 12.5 + 300 * 8.25
+      orderValueCny: 0, // nothing received: received quantity x rate
+      poValueCny: 14975, // 1000 * 12.5 + 300 * 8.25
       terms: null, // no container terms chosen (docs/order-container-terms.md)
-      // Nothing paid to the supplier yet: the ledger's FIFO projection settles none of it.
+      // Nothing received, so nothing is owed yet: awaiting goods (never "paid" for a value of 0).
       held: false,
       settledCny: 0,
-      outstandingCny: 14975,
-      paymentStatus: "unpaid",
+      outstandingCny: 0,
+      paymentStatus: "awaiting_goods",
       settledInr: 0,
       depositRequiredCny: null,
       depositSettledCny: 0,
@@ -171,7 +173,7 @@ describe("ORD-3 POST /orders and ORD-1 GET /orders", () => {
       agentPaidInr: 11900,
       paidInr: 11900,
     });
-    expect(list.body[0]).toMatchObject({ item: "Cotton fabric", quantity: 50, unit: "m", orderValueCny: 150, settledCny: 0, paidInr: 0 });
+    expect(list.body[0]).toMatchObject({ item: "Cotton fabric", quantity: 50, unit: "m", orderValueCny: 0, poValueCny: 150, settledCny: 0, paidInr: 0 });
   });
 
   it("takes an agent deposit to an active agent in any letter case, and refuses one to an inactive agent", async () => {
@@ -328,6 +330,8 @@ describe("PAY-1 GET /payments", () => {
   it("gives every order's settlement, agent payments and next due date, every payment record and the ledger accounts", async () => {
     const withDeposits = (await create(orderBody())).body.order;
     const bare = (await create(orderBody({ deposits: [] }))).body.order;
+    // Received in full: each is worth ¥14,975 (received quantity x rate).
+    for (const made of [withDeposits, bare]) await receiveOrder(ctx, made.id);
     await ctx.db.insert(payments).values([
       { orderId: withDeposits.id, kind: "Balance", payee: "Guangzhou Textile Co.", payeeRole: "supplier", amountCny: 5000, status: "due", dueDate: "2026-12-20" },
       { orderId: withDeposits.id, kind: "Balance", payee: "Guangzhou Textile Co.", payeeRole: "supplier", amountCny: 3000, status: "due", dueDate: "2026-12-05" },
@@ -347,6 +351,7 @@ describe("PAY-1 GET /payments", () => {
         currency: "CNY",
         supplierRate: null,
         orderValueCny: 14975,
+        poValueCny: 14975,
         held: false,
         settledCny: 0,
         outstandingCny: 14975,
@@ -367,6 +372,7 @@ describe("PAY-1 GET /payments", () => {
         currency: "CNY",
         supplierRate: null,
         orderValueCny: 14975,
+        poValueCny: 14975,
         held: false,
         settledCny: 1234.56,
         outstandingCny: 13740.44, // due payments are not paid, the agent deposit is freight
@@ -435,6 +441,7 @@ describe("currencies (migration 0006): CNY, USD and INR orders", () => {
     const shenzhen = await supplierIn("Shenzhen Apparel", "USD", 88.25);
     const usd = (await create(orderBody({ supplierId: shenzhen, currency: "USD", deposits: [] }))).body.order;
     const cny = (await create(orderBody({ deposits: [] }))).body.order;
+    await receiveOrder(ctx, usd.id);
     const stored = await ctx.db.select({ id: orders.id, currency: orders.currency }).from(orders);
     expect(stored).toEqual(expect.arrayContaining([{ id: usd.id, currency: "USD" }, { id: cny.id, currency: "CNY" }]));
     expect((await paySupplier(shenzhen, 1000, 88.25)).body.payment).toMatchObject({ currency: "USD", amountInr: 88250 });
@@ -454,6 +461,7 @@ describe("currencies (migration 0006): CNY, USD and INR orders", () => {
     expect(inr.status).toBe(201);
     const rows = await ctx.db.select({ rateInr: payments.rateInr }).from(payments).where(eq(payments.orderId, inr.body.order.id));
     expect(rows).toEqual([{ rateInr: 1 }, { rateInr: 1 }]);
+    await receiveOrder(ctx, inr.body.order.id);
     // ₹51,000 to the supplier on a ₹14,975 order: settled in full, never more; the rest stays in its account.
     expect((await paySupplier(foshan, 51000, undefined)).body.ledger).toMatchObject({ currency: "INR", balanceBefore: -14975, balanceAfter: 36025 });
     expect((await get("/orders")).body[0]).toMatchObject({ currency: "INR", settledCny: 14975, outstandingCny: 0, paymentStatus: "paid", agentPaidInr: 1500, paidInr: 16475 });

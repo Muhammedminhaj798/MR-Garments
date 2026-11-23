@@ -1,14 +1,15 @@
 import { createHash } from "node:crypto";
 import { readFileSync, writeFileSync } from "node:fs";
 
-import { eq, sql } from "drizzle-orm";
+import { eq, inArray, sql } from "drizzle-orm";
 
 import type { Database } from "../../db/client";
-import { suppliers, supplierLedgerHolds as holds } from "../../db/schema";
+import { orders, suppliers, supplierLedgerHolds as holds } from "../../db/schema";
+import { loadLandedCosts } from "../costs/landed-cost";
 import { cents, fromCents, loadLedger } from "./ledger";
 
 // The ledger backfill and reconciliation (docs/unified-ledger.md, plan section 9.4). History is posted exactly once with
-// origin 'backfill': every live order's debit, every paid supplier payment's credit and every legacy advance receipt's
+// origin 'backfill': every live order's debit (at its received value), every paid supplier payment's credit and every legacy advance receipt's
 // credit, except the receipts on the owner's exclusion list (DEFAULT_RECEIPT_EXCLUSIONS). Allocation, reversal, excess and excess-return rows are never posted (they are internal transfers that cancel
 // out), and neither are shipping-agent payments, due rows or anything in a held account. Every insert is set-based with
 // `on conflict (idempotency_key) do nothing`, so a second run writes 0 rows. Legacy rows are only read, never changed.
@@ -105,7 +106,7 @@ export async function backfillLedger(db: Database, options: { apply: boolean; ho
       }
       const debits = await tx.execute<Written>(sql`
         insert into supplier_ledger_entries (supplier_id, currency, entry_type, amount, exchange_rate, entry_date, origin, order_id, po_number, idempotency_key)
-        select o.supplier_id, o.currency, 'order_debit', -round(coalesce(sum(l.quantity * l.rate_cny), 0), 2), o.exchange_rate, o.order_date,
+        select o.supplier_id, o.currency, 'order_debit', -round(coalesce(sum(coalesce((select sum(r.quantity) from receipt_lines r where r.order_line_id = l.id), 0) * l.rate_cny), 0), 2), o.exchange_rate, o.order_date,
                'backfill', o.id, o.po_number, 'order:' || o.id || ':debit'
         from orders o left join order_lines l on l.order_id = o.id
         where ${notHeld("o.supplier_id", "o.currency")}
@@ -191,7 +192,7 @@ const held = (supplier: string, currency: string) => sql.raw(`exists (select 1 f
  * `excludedReceipts` (the release script and LED-4 pass DEFAULT_RECEIPT_EXCLUSIONS): never credited, and none may be.
  */
 export async function reconcileLedger(
-  db: Pick<Database, "execute">,
+  db: Pick<Database, "execute" | "select">,
   expectedHolds: Hold[] = [],
   excludedReceipts: ReceiptExclusion[] = [],
 ): Promise<{ ok: boolean; checks: Check[] }> {
@@ -235,8 +236,9 @@ export async function reconcileLedger(
   );
   await add(
     "orders",
-    "Every live order outside a held account has one debit and its postings equal minus its value",
-    sql`with v as (select o.id, o.po_number, o.supplier_id, o.currency, round(coalesce(sum(l.quantity * l.rate_cny), 0), 2) as value
+    "Every live order outside a held account has one debit and its postings equal minus its value (received quantity x rate)",
+    // The order's value (owner rule of 2026-11-23): received quantity x rate, from the China receipts.
+    sql`with v as (select o.id, o.po_number, o.supplier_id, o.currency, round(coalesce(sum(coalesce((select sum(r.quantity) from receipt_lines r where r.order_line_id = l.id), 0) * l.rate_cny), 0), 2) as value
                    from orders o left join order_lines l on l.order_id = o.id group by o.id)
         select 'order ' || v.po_number || ': value ' || v.value::text || ', posted ' || coalesce(-sum(e.amount), 0)::text || ', debits ' ||
                count(e.id) filter (where e.entry_type = 'order_debit') as problem
@@ -299,6 +301,29 @@ export async function reconcileLedger(
         from supplier_ledger_holds h join supplier_ledger_entries e on e.supplier_id = h.supplier_id and e.currency = h.currency
         group by h.supplier_id, h.currency`,
   );
+  // Final landed-cost protection (owner review of 2026-11-23, migration 0018): every order whose landed cost is final now
+  // is recorded as protected, and every record names its own order's account.
+  const ledger = await loadLedger(db);
+  const posted = [...ledger.orders.values()].filter((row) => row.posted && !row.held).map((row) => row.orderId);
+  const costs = posted.length > 0 ? await loadLandedCosts(db, posted, ledger, { inTransaction: true }) : new Map<string, { final: boolean }>();
+  const recorded = (
+    await db.execute<{ order_id: string; po: string | null; matches: boolean }>(sql`
+      select f.order_id, o.po_number as po, (o.id is not null and o.supplier_id = f.supplier_id and o.currency = f.currency) as matches
+      from final_cost_protections f left join orders o on o.id = f.order_id`)
+  ).rows;
+  const recordedIds = new Set(recorded.map((row) => row.order_id));
+  const unrecorded = posted.filter((id) => costs.get(id)?.final && !recordedIds.has(id));
+  const pos = unrecorded.length > 0 ? await db.select({ id: orders.id, po: orders.poNumber }).from(orders).where(inArray(orders.id, unrecorded)) : [];
+  const protectionProblems = [
+    ...pos.map((row) => `order ${row.po}: its landed cost is final but it is not recorded as protected`),
+    ...recorded.filter((row) => !row.matches).map((row) => `protection of order ${row.po ?? row.order_id}: not the order's own supplier and currency`),
+  ].slice(0, 50);
+  checks.push({
+    id: "final-protections",
+    title: "Every order whose landed cost is final is recorded as protected, each record on its order's own account",
+    ok: protectionProblems.length === 0,
+    problems: protectionProblems,
+  });
   return { ok: checks.every((check) => check.ok), checks };
 }
 
@@ -378,7 +403,7 @@ export function writeBaseline(file: string, baseline: Baseline) {
 }
 
 /**
- * Plan 9.4 step 3: each order's settled amount under the legacy rules (supplier payments net of excess, plus the
+ * Plan 9.4 step 3: each order's settled amount under the legacy rules (the ordered value; supplier payments net of excess, plus the
  * advance applied, capped at the value) against the projection's. Read-only; the approved differences (`unexpectedDifferences`) are
  * listed by the caller with both amounts (PO-1134647, 6422 and 6423 on the 2026-11-20 data).
  */

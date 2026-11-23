@@ -3,7 +3,7 @@ import { afterAll, beforeEach, describe, expect, it } from "vitest";
 
 import { items, orders } from "../../db/schema";
 import { SEED_ITEMS } from "../../db/seed-data";
-import { api, createTestContext, resetData, SEEDED, signInAs } from "../../test/harness";
+import { api, createTestContext, receiveOrder, resetData, SEEDED, signInAs } from "../../test/harness";
 import { idOf, makeOrder } from "../stock/fixtures";
 import { MESSAGES as M } from "./items.routes";
 
@@ -33,6 +33,7 @@ const fieldsOf = (res: { status: number; body: { error: { code: string; fields: 
 async function orderOf(po: string, itemNames: string[]) {
   const order = await makeOrder(ctx, { lines: itemNames.map((item) => ({ item, quantity: 100, rateCny: 10 })) });
   await ctx.db.update(orders).set({ poNumber: po }).where(eq(orders.id, order.id));
+  await receiveOrder(ctx, order.id); // worth received quantity x rate
 }
 
 describe("access: Management only (B6)", () => {

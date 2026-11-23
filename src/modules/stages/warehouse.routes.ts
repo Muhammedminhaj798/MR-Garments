@@ -20,7 +20,7 @@ import {
 } from "../../db/schema";
 import { conflict, notFound, validationFailed } from "../../http/errors";
 import { parse } from "../../http/validate";
-import { loadLandedCosts } from "../costs/landed-cost";
+import { loadLandedCosts, recordFinalCostsOfContainer } from "../costs/landed-cost";
 import type { RouteContext } from "../context";
 import { notify } from "../notifications/notify";
 import { atLeast, effectiveAccess } from "../../permissions/matrix";
@@ -436,6 +436,8 @@ export function warehouseRoutes({ db }: RouteContext) {
       const kept = lines.filter((line) => line.quantity > 0);
       if (kept.length) await tx.insert(warehouseReceiptLines).values(kept.map((line) => ({ ...line, receiptId })));
       if (done) await moveOrdersToStage(tx, trip.containerId, 6);
+      // Stocking can complete an order's landed cost: protected from now on (costs/landed-cost.ts).
+      if (done) await recordFinalCostsOfContainer(tx, trip.containerId);
       return written[0]!;
     });
     res.json({ receipt });

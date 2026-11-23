@@ -1,8 +1,8 @@
 import { eq } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 
-import { type Currency, locations, orders, payments, suppliers, teams, warehouseReceiptLines, warehouseReceipts } from "../../db/schema";
-import { api, createTestContext, resetData, SEEDED, signInAs } from "../../test/harness";
+import { type Currency, finalCostProtections, locations, orders, payments, suppliers, teams, warehouseReceiptLines, warehouseReceipts } from "../../db/schema";
+import { api, createTestContext, receiveOrder, resetData, SEEDED, signInAs } from "../../test/harness";
 import { loadLandedCosts } from "../costs/landed-cost";
 import { indiaDay, makeOrder, postLegacy } from "../stock/fixtures";
 import { STAGE_MESSAGES } from "./common";
@@ -226,6 +226,8 @@ describe("WH-2 GET /warehouse-receipts/:transportId", () => {
     // Stocked and paid in full: the cost is final.
     expect((await put(trip.tripId, body([{ orderLineId: order!.lineIds[0]!, teamId: m.retail, quantity: 100 }], { complete: true }))).status).toBe(200);
     expect((await get(`/warehouse-receipts/${trip.tripId}`, suresh)).body.cost.final).toBe(true);
+    // Final from this save: protected at once (owner review of 2026-11-23), before any other write touches it.
+    expect((await ctx.db.select({ orderId: finalCostProtections.orderId }).from(finalCostProtections)).map((row) => row.orderId)).toContain(order!.id);
   });
 
   it("returns the saved receipt with its split, keeping a deactivated team's column", async () => {
@@ -377,9 +379,10 @@ describe("WH-2 previous supplier outstanding", () => {
     return { id: row!.id, name };
   }
   const moveTo = (orderId: string, supplierId: string) => ctx.db.update(orders).set({ supplierId }).where(eq(orders.id, orderId));
-  /** An earlier order of `owner`: `quantity` Denim jeans at `rate`, in `currency` (posted to its ledger account). */
+  /** An earlier order of `owner`: `quantity` Denim jeans at `rate`, in `currency`, received in full (posted to its ledger account). */
   async function earlier(owner: { name: string }, quantity: number, rate: number, currency: Currency = "CNY", stage = 1) {
     const order = await makeOrder(ctx, { supplier: owner.name, stage, currency, lines: [{ item: "Denim jeans", quantity, rateCny: rate }] });
+    await receiveOrder(ctx, order.id);
     return order.id;
   }
   /** A legacy order-linked payment, posted to the ledger as the backfill posts it. */

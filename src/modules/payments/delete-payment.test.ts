@@ -4,7 +4,7 @@ import { count, eq } from "drizzle-orm";
 import { afterAll, beforeEach, describe, expect, it } from "vitest";
 
 import { items, notifications, orders, payments, shippingAgents, suppliers } from "../../db/schema";
-import { api, createTestContext, resetData, SEEDED, signInAs } from "../../test/harness";
+import { api, createTestContext, receiveOrder, resetData, SEEDED, signInAs } from "../../test/harness";
 import { loadLandedCosts } from "../costs/landed-cost";
 import { UNKNOWN } from "../stages/fixtures";
 import { idOf, indiaDay, makeOrder } from "../stock/fixtures";
@@ -49,7 +49,20 @@ async function pay(amount: number, rateInr: number, agentOrderId?: string, suppl
   return res.body.payment.id as string;
 }
 /** An order of 100 Denim jeans at ¥10 (¥1,000), stage 1, posted to the ledger. */
-const order = () => makeOrder(ctx, { lines: [{ item: "Denim jeans", quantity: 100, rateCny: 10 }] });
+/**
+ * ¥1,000 of jeans, received in full (worth received quantity x rate), and a ¥0 line still to come, so the order stays in
+ * REC-2 (Record receipt lists orders with goods left to receive).
+ */
+const order = async () => {
+  const made = await makeOrder(ctx, {
+    lines: [
+      { item: "Denim jeans", quantity: 100, rateCny: 10 },
+      { item: "Polo shirts", quantity: 1, rateCny: 0 },
+    ],
+  });
+  await receiveOrder(ctx, made.id, { [made.lineIds[1]!]: 0 });
+  return made;
+};
 
 describe("PAY-3 DELETE /payments/:id (void)", () => {
   it("is 401 signed out and 403 below payments Full (Accounts records payments), and changes nothing", async () => {
@@ -113,6 +126,7 @@ describe("PAY-3 DELETE /payments/:id (void)", () => {
     const created = await http
       .post("/orders", { supplierId: shenzhen, orderDate: indiaDay(-5), deliveryDate: indiaDay(20), lines: [{ itemId: jeans, quantity: 100, rateCny: 10 }] })
       .set("Cookie", suresh);
+    await receiveOrder(ctx, created.body.order.id);
     const po = created.body.order.po as string;
     const first = await pay(100, 83.5, undefined, shenzhen);
     await pay(50, 84.25, undefined, shenzhen);
@@ -164,7 +178,7 @@ describe("PAY-3 DELETE /payments/:id (void)", () => {
   it("an order keeps refusing deletion while it has a payment, voided or not (the payment is history)", async () => {
     const o = await order();
     const id = await pay(30, 12, o.id);
-    const refused = { code: "in_use", message: "This order has 1 payment, so it can't be deleted." };
+    const refused = { code: "in_use", message: "This order has 1 payment and 1 receipt, so it can't be deleted." };
     expect((await http.delete(`/orders/${o.po}`).set("Cookie", suresh)).body.error).toEqual(refused);
     expect((await voidIt(id)).status).toBe(200);
     expect((await http.delete(`/orders/${o.po}`).set("Cookie", suresh)).body.error).toEqual(refused);

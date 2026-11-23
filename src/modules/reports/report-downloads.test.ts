@@ -38,8 +38,9 @@ describe("ORD-7 GET /order-lines", () => {
     const res = await get("/order-lines");
     expect(res.status).toBe(200);
     expect(res.body.filter((line: { po: string }) => line.po === order.po)).toEqual([
-      { orderId: order.id, po: order.po, currency: "CNY", position: 0, item: "Denim jeans", unit: "pcs", quantity: 120, rateCny: 12.5, valueCny: 1500, received: 0, stocked: 0 },
-      { orderId: order.id, po: order.po, currency: "CNY", position: 1, item: "Cotton fabric", unit: "m", quantity: 300, rateCny: 8, valueCny: 2400, received: 250, stocked: 0 },
+      // valueCny: received quantity x rate; poValueCny: ordered quantity x rate.
+      { orderId: order.id, po: order.po, currency: "CNY", position: 0, item: "Denim jeans", unit: "pcs", quantity: 120, rateCny: 12.5, valueCny: 0, poValueCny: 1500, received: 0, stocked: 0 },
+      { orderId: order.id, po: order.po, currency: "CNY", position: 1, item: "Cotton fabric", unit: "m", quantity: 300, rateCny: 8, valueCny: 2000, poValueCny: 2400, received: 250, stocked: 0 },
     ]);
   });
 

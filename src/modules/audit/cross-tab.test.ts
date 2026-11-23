@@ -38,7 +38,9 @@ const patch = (path: string, body: object, cookie = wang) => http.patch(path, bo
 /** ORD-3 takes agent deposits only; the supplier's deposit is a PAY-2 supplier payment. */
 const DEPOSITS = [{ payee: "Sino Freight", payeeRole: "agent", amountCny: 50.55, paidOn: indiaDay(-9), rateInr: 11.91, mode: "Cash" }];
 const SUPPLIER_DEPOSIT = { amount: 100.1, paidOn: indiaDay(-9), rateInr: 11.8765, mode: "Bank transfer" };
+/** The PO value (ordered quantity x rate). The order's value is the received quantity x rate (owner rule of 2026-11-23). */
 const VALUE = 60 * 5.5 + 50 * 4.25; // 542.5
+const valueOf = (received: [number, number]) => round2(received[0] * 5.5 + received[1] * 4.25);
 
 beforeAll(async () => {
   await resetData(ctx);
@@ -76,26 +78,37 @@ async function expectConsistent(want: Expected) {
   const agentPaidCny = round2(toAgent.reduce((sum, p) => sum + p.amountCny, 0));
   const agentPaidInr = round2(toAgent.reduce((sum, p) => sum + inr(p.amountCny, p.rateInr), 0));
   const toSupplier = want.payments.filter((p) => p.payeeRole === "supplier");
-  // The supplier's only order here: the FIFO projection settles it with every supplier payment (all below its value).
-  const settledCny = round2(toSupplier.reduce((sum, p) => sum + p.amountCny, 0));
-  const settledInr = round2(toSupplier.reduce((sum, p) => sum + inr(p.amountCny, p.rateInr), 0));
+  const value = valueOf(want.received);
+  const credits = round2(toSupplier.reduce((sum, p) => sum + p.amountCny, 0));
+  // The supplier's only order here: the FIFO projection settles it with the supplier payments, oldest first, up to its
+  // value (received x rate); the rest stays with the supplier.
+  const slices: { amount: number; rateInr: number }[] = [];
+  for (const p of toSupplier) {
+    const take = Math.min(p.amountCny, round2(value - slices.reduce((sum, slice) => sum + slice.amount, 0)));
+    if (take > 0) slices.push({ amount: take, rateInr: p.rateInr });
+  }
+  const settledCny = round2(slices.reduce((sum, slice) => sum + slice.amount, 0));
+  const settledInr = round2(slices.reduce((sum, slice) => sum + inr(slice.amount, slice.rateInr), 0));
 
   // Stage and the money figures: identical in ORD-1, ORD-4 and PAY-1; outstanding is what the supplier is still owed
   // for the order (agent payments are sea freight, docs/phase2-fixes.md 1).
   expect(ord1.stage).toBe(want.stage);
   expect(detail.stage).toBe(want.stage);
   for (const view of [ord1, detail, pay]) {
-    expect(view.orderValueCny).toBe(VALUE);
+    expect(view.orderValueCny).toBe(value);
+    expect(view.poValueCny).toBe(VALUE);
+    expect(view.paymentStatus).toBe(want.received.every((n) => n === 0) ? "awaiting_goods" : settledCny === value ? "paid" : settledCny === 0 ? "unpaid" : "partly");
     expect(view.settledCny).toBeCloseTo(settledCny, 2);
     expect(view.settledInr).toBeCloseTo(settledInr, 2);
     expect(view.agentPaidCny).toBeCloseTo(agentPaidCny, 2);
     expect(view.agentPaidInr).toBeCloseTo(agentPaidInr, 2);
     expect(view.paidInr).toBeCloseTo(round2(settledInr + agentPaidInr), 2);
   }
-  expect(detail.outstandingCny).toBeCloseTo(round2(VALUE - settledCny), 2);
+  expect(detail.outstandingCny).toBeCloseTo(round2(value - settledCny), 2);
   expect(pay.outstandingCny).toBe(detail.outstandingCny);
-  expect(detail.supplierAccount.balanceCny).toBeCloseTo(round2(settledCny - VALUE), 2);
-  expect(detail.lines.reduce((sum: number, l: { valueCny: number }) => sum + l.valueCny, 0)).toBeCloseTo(VALUE, 2);
+  expect(detail.supplierAccount.balanceCny).toBeCloseTo(round2(credits - value), 2);
+  expect(detail.lines.reduce((sum: number, l: { valueCny: number }) => sum + l.valueCny, 0)).toBeCloseTo(value, 2);
+  expect(detail.lines.reduce((sum: number, l: { poValueCny: number }) => sum + l.poValueCny, 0)).toBeCloseTo(VALUE, 2);
 
   // Main line (position 0): ORD-1 and ORD-4 header, CAL-1.
   expect(ord1.quantity).toBe(60);
@@ -117,7 +130,7 @@ async function expectConsistent(want: Expected) {
   expect(payList.every((p: { po: string; status: string }) => p.po === order.po && p.status === "paid")).toBe(true);
   const supplierList = p1.body.payments.filter((p: { orderId: string | null; supplierId: string }) => p.orderId === null && p.supplierId === ids.supplier);
   expect(supplierList).toHaveLength(toSupplier.length);
-  expect(detail.slices).toHaveLength(toSupplier.length);
+  expect(detail.slices).toHaveLength(slices.length);
 
   // CAL-1: orders at stage 1-2 only, same received and due date.
   const inCal = cal.body.find((row: { orderId: string }) => row.orderId === order.id);
@@ -147,9 +160,10 @@ async function expectConsistent(want: Expected) {
   const left = [60 - want.received[0], 50 - want.received[1]];
   if (want.stage <= 2 && left.some((n) => n > 0)) {
     expect(opt).toBeDefined();
-    expect(opt.orderValueCny).toBe(VALUE);
+    expect(opt.orderValueCny).toBe(value);
+    expect(opt.poValueCny).toBe(VALUE);
     // REC-2 shows the order's outstanding (the ledger's projection): an agent payment is freight.
-    expect(opt.outstandingCny).toBeCloseTo(round2(VALUE - settledCny), 2);
+    expect(opt.outstandingCny).toBeCloseTo(round2(value - settledCny), 2);
     expect(opt.lines.map((l: { orderLineId: string }) => l.orderLineId)).toEqual(order.lines.filter((_, i) => left[i]! > 0));
     for (const l of opt.lines as { orderLineId: string; receivedEarlier: number; ordered: number }[]) {
       const i = order.lines.indexOf(l.orderLineId);

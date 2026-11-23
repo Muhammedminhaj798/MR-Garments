@@ -7,6 +7,7 @@ import { clearingAgents, clearings, containers, transports, warehouseReceipts } 
 import { conflict, notFound, validationFailed } from "../../http/errors";
 import { parse } from "../../http/validate";
 import type { RouteContext } from "../context";
+import { recordFinalCostsOfContainer } from "../costs/landed-cost";
 import { round2 } from "../orders/orders.routes";
 import { moveOrdersToStage, settleStages } from "../stages-shared";
 import {
@@ -242,6 +243,8 @@ export function clearingRoutes({ db }: RouteContext) {
             .returning({ id: clearings.id, status: clearings.status });
       // Every save, not only the first: the move is forward-only, so later saves change nothing.
       await moveOrdersToStage(tx, id, 4);
+      // A save that completes an order's landed cost protects it from now on (costs/landed-cost.ts).
+      await recordFinalCostsOfContainer(tx, id);
       return written[0]!;
     });
     res.json({ clearing });

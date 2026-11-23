@@ -120,3 +120,25 @@ export const ledgerState = pgTable(
   },
   () => [check("ledger_state_single_row_check", sql`id = 'ledger'`), check("ledger_state_state_check", inList("state", LEDGER_STATES))],
 );
+
+/**
+ * Migration 0018 (owner review of 2026-11-23, docs/unified-ledger.md "Final landed-cost protection"): an order that has
+ * reached final landed cost stays protected, even after a Management-approved receipt, receipt delete or rate correction
+ * changes its settlement (it may then no longer be final). Written by the M8 guard (costs/landed-cost.ts
+ * guardFinalSettlements) for every order it sees final; never updated or deleted (trigger).
+ */
+export const finalCostProtections = pgTable(
+  "final_cost_protections",
+  {
+    orderId: uuid("order_id")
+      .primaryKey()
+      .references(() => orders.id, { onDelete: "restrict" }),
+    supplierId: uuid("supplier_id")
+      .notNull()
+      .references(() => suppliers.id),
+    currency: text("currency").$type<Currency>().notNull(),
+    /** When the guard first saw the order's landed cost final. */
+    protectedAt: timestamp("protected_at", { withTimezone: true }).notNull().default(sql`clock_timestamp()`),
+  },
+  (t) => [index("final_cost_protections_account_idx").on(t.supplierId, t.currency), check("final_cost_protections_currency_check", CURRENCY_SHAPE)],
+);

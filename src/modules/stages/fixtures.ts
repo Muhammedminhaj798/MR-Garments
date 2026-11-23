@@ -3,7 +3,7 @@ import { expect } from "vitest";
 
 import { clearingAgents, containerLines, containers, locations, orders, shippingAgents, teams, transportCompanies } from "../../db/schema";
 import { api, type TestContext } from "../../test/harness";
-import { idOf, indiaDay, makeOrder } from "../stock/fixtures";
+import { idOf, indiaDay, makeOrder, receive } from "../stock/fixtures";
 
 // Test-only helpers for the stage tests: containers are written straight to the database (arrived by default), then
 // cleared, moved and received through the API under test.
@@ -35,10 +35,14 @@ export async function makeContainer(
     loadedOn = indiaDay(-20),
     stage = 3,
     orders: lines = [[{ item: "Denim jeans", quantity: 100, rateCny: 10 }]],
-  }: { status?: string; terms?: string; loadedOn?: string; stage?: number; orders?: Line[][] } = {},
+    received = true,
+  }: { status?: string; terms?: string; loadedOn?: string; stage?: number; orders?: Line[][]; received?: boolean } = {},
 ) {
   const made = [];
   for (const orderLines of lines) made.push(await makeOrder(ctx, { stage, lines: orderLines }));
+  // Goods are loaded only once received in China (CON-3), and the receipt sets each order's value (received x rate).
+  // `received: false` for a test that writes its own receipts.
+  if (received) for (const [i, order] of made.entries()) await receive(ctx, order.id, order.lineIds.map((orderLineId, j) => ({ orderLineId, quantity: lines[i]![j]!.quantity })));
   const number = `TCLU${6000000 + numbers++}`;
   const container = (
     await ctx.db

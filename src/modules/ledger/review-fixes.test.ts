@@ -3,8 +3,8 @@ import { randomUUID } from "node:crypto";
 import { eq, sql } from "drizzle-orm";
 import { afterAll, beforeEach, describe, expect, it } from "vitest";
 
-import { items, orderLines, orders, payments, shippingAgents, supplierDeposits, supplierLedgerEntries as entries, suppliers } from "../../db/schema";
-import { api, createTestContext, resetData, SEEDED, signInAs } from "../../test/harness";
+import { items, locations, orderLines, orders, payments, receiptLines, receipts, shippingAgents, supplierDeposits, supplierLedgerEntries as entries, suppliers, users } from "../../db/schema";
+import { api, createTestContext, receiveOrder, resetData, SEEDED, signInAs } from "../../test/harness";
 import { indiaDay } from "../stock/fixtures";
 import { loadLandedCosts } from "../costs/landed-cost";
 import { backfillLedger, reconcileLedger } from "./backfill";
@@ -25,6 +25,8 @@ let guangzhou = "";
 let hangzhou = "";
 let jeans = "";
 let sino = "";
+let office = "";
+let bossId = "";
 beforeEach(async () => {
   await resetData(ctx);
   management = await signInAs(ctx, SEEDED.management);
@@ -34,12 +36,18 @@ beforeEach(async () => {
   hangzhou = await id(suppliers, "Hangzhou Knits");
   jeans = await id(items, "Denim jeans");
   sino = await id(shippingAgents, "Sino Freight");
+  office = (await ctx.db.select({ id: locations.id }).from(locations).where(eq(locations.name, "Guangzhou office")))[0]!.id;
+  bossId = (await ctx.db.select({ id: users.id }).from(users).where(eq(users.email, SEEDED.management)))[0]!.id;
 });
 
 /** A legacy order (before 0017) with one supplier deposit, straight into the tables. */
 async function legacyOrder(supplierId: string, po: string, value: number, deposit: number) {
   const [order] = await ctx.db.insert(orders).values({ poNumber: po, supplierId, orderDate: "2026-10-01", deliveryDate: "2026-12-01", currency: "CNY", exchangeRate: 12 }).returning();
   await ctx.db.insert(orderLines).values({ orderId: order!.id, itemId: jeans, position: 0, quantity: 1, rateCny: value });
+  // Received (written straight to the tables, as a legacy receipt): worth ¥value, received quantity x rate.
+  const [line] = await ctx.db.select({ id: orderLines.id }).from(orderLines).where(eq(orderLines.orderId, order!.id));
+  const [receipt] = await ctx.db.insert(receipts).values({ orderId: order!.id, receivedOn: "2026-10-01", locationId: office, receivedBy: bossId, bundles: 1 }).returning();
+  await ctx.db.insert(receiptLines).values({ receiptId: receipt!.id, orderLineId: line!.id, quantity: 1 });
   const [payment] = await ctx.db
     .insert(payments)
     .values({ orderId: order!.id, kind: "Deposit", payee: "Supplier", payeeRole: "supplier", amountCny: deposit, status: "paid", paidOn: "2026-10-02", rateInr: 12, mode: "Bank" })
@@ -86,7 +94,7 @@ describe("held accounts in payment lists, the backfill and reconciliation", () =
     await legacyOrder(guangzhou, "G-1", 500, 200);
     await backfillLedger(ctx.db, { apply: true, holds: hold(hangzhou) });
     const summary = (await http.get("/reports/orders").set("Cookie", management)).body.summary;
-    expect(summary.byCurrency).toEqual([{ currency: "CNY", orderValueCny: 500, settledCny: 200, outstandingCny: 300 }]);
+    expect(summary.byCurrency).toEqual([{ currency: "CNY", orderValueCny: 500, poValueCny: 500, settledCny: 200, outstandingCny: 300 }]);
   });
 });
 
@@ -98,6 +106,7 @@ describe("replays that survive a change since the first submit", () => {
       .post("/orders", { supplierId: guangzhou, orderDate: indiaDay(-3), deliveryDate: indiaDay(20), lines: [{ itemId: jeans, quantity: 100, rateCny: 1 }] })
       .set("Cookie", management);
     expect(order.status, JSON.stringify(order.body)).toBe(201);
+    await receiveOrder(ctx, order.body.order.id); // worth $100 once received
     await ctx.db.update(suppliers).set({ currency: "CNY", exchangeRate: 12 }).where(eq(suppliers.id, guangzhou));
     const body = { currency: "USD", amount: 100, entryDate: indiaDay(), rateInr: 84, reason: "Old USD balance written off", idempotencyKey: randomUUID() };
     const first = await http.post(`/suppliers/${guangzhou}/ledger/adjustments`, body).set("Cookie", management);
@@ -207,7 +216,12 @@ describe("final review: a held account counts in no figure; replays compare the 
     await backfillLedger(ctx.db, { apply: true, holds: hold(hangzhou) });
     // The card counts the orders it totals: G-8 only; MD-1's Active POs follow the same rule, so the rows add up to it.
     // The held order is counted apart (pending review), never in the actionable count or value.
-    expect((await http.get("/suppliers/summary").set("Cookie", management)).body.openPos).toEqual({ count: 1, value: [{ currency: "CNY", amount: 400 }], heldCount: 1 });
+    expect((await http.get("/suppliers/summary").set("Cookie", management)).body.openPos).toEqual({
+      count: 1,
+      value: [{ currency: "CNY", amount: 400 }],
+      poValue: [{ currency: "CNY", amount: 400 }],
+      heldCount: 1,
+    });
     const rows = (await http.get("/suppliers").set("Cookie", management)).body as { id: string; openPos: number; heldOpenPos: number }[];
     expect(rows.find((row) => row.id === hangzhou)).toMatchObject({ openPos: 0, heldOpenPos: 1 });
     expect(rows.find((row) => row.id === guangzhou)).toMatchObject({ openPos: 1, heldOpenPos: 0 });

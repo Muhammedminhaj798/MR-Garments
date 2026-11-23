@@ -31,7 +31,18 @@ import { atLeast, type Capability, effectiveAccess } from "../../permissions/mat
 import { loadLandedCosts } from "../costs/landed-cost";
 import { depositRows, summarise, toRow } from "../deposits/deposits.routes";
 import { byCurrency } from "../master-data/supplier-insights";
-import { accountsView, depositMilestone, loadLedger, oldestPaymentsFirst, paymentQuery, paymentView, settlementFields, sliceDetails } from "../ledger/ledger";
+import {
+  accountsView,
+  depositMilestone,
+  linePoValue,
+  lineValue,
+  loadLedger,
+  oldestPaymentsFirst,
+  paymentQuery,
+  paymentView,
+  settlementFields,
+  sliceDetails,
+} from "../ledger/ledger";
 import { supplierStatement } from "../ledger/ledger.routes";
 import { orderClosed } from "../orders/closure";
 import { dueToSupplier, orderMoney } from "../orders/money";
@@ -145,7 +156,9 @@ export async function orderReport(db: Database, po: string, user: CurrentUser) {
           loaded,
           stocked,
           rateCny: orderLines.rateCny,
-          valueCny: sql<number>`round(${orderLines.quantity} * ${orderLines.rateCny}, 2)`.mapWith(Number),
+          /** Received quantity × rate (the line's value); poValueCny is the ordered quantity × rate, for reference. */
+          valueCny: lineValue,
+          poValueCny: linePoValue,
         })
         .from(orderLines)
         .innerJoin(items, eq(items.id, orderLines.itemId))
@@ -479,8 +492,10 @@ export async function orderReport(db: Database, po: string, user: CurrentUser) {
       closed: row.closed,
       closedOn: row.closedOn,
       currency: row.currency,
+      /** Received quantity × rate; poValueCny is the ordered quantity × rate, for reference. */
       orderValueCny: row.orderValueCny,
-      /** The rate saved when the order was placed (null for older orders), and the PO value at that rate, never a later one. */
+      poValueCny: row.poValueCny,
+      /** The rate saved when the order was placed (null for older orders), and the order value at that rate, never a later one. */
       exchangeRate: row.exchangeRate,
       orderValueInr: row.orderValueInr,
       products: lines.length,

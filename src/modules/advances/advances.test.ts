@@ -4,7 +4,7 @@ import { eq } from "drizzle-orm";
 import { afterAll, beforeEach, describe, expect, it } from "vitest";
 
 import { orders, supplierAdvanceEntries, supplierLedgerEntries, supplierLedgerHolds, suppliers, users } from "../../db/schema";
-import { api, createTestContext, resetData, SEEDED, signInAs } from "../../test/harness";
+import { api, createTestContext, receiveOrder, resetData, SEEDED, signInAs } from "../../test/harness";
 import { backfillLedger, DEFAULT_RECEIPT_EXCLUSIONS } from "../ledger/backfill";
 import { indiaDay, makeOrder } from "../stock/fixtures";
 import { MESSAGES } from "./advances.routes";
@@ -127,7 +127,8 @@ describe("ADV-5 GET /supplier-advances/suppliers (the Record payment supplier li
     expect((await get("/supplier-advances/suppliers", await signInAs(ctx, SEEDED.chinaStaff))).status).toBe(403);
     // Procurement views payments only: it can't record one, so it gets no list.
     expect((await get("/supplier-advances/suppliers", procurement)).status).toBe(403);
-    await makeOrder(ctx, { lines: [{ item: "Denim jeans", quantity: 100, rateCny: 10 }] }); // Guangzhou owes ¥1,000 in CNY
+    const owed = await makeOrder(ctx, { lines: [{ item: "Denim jeans", quantity: 100, rateCny: 10 }] });
+    await receiveOrder(ctx, owed.id); // received: Guangzhou owes ¥1,000 in CNY
     await ctx.db.update(suppliers).set({ currency: "USD", exchangeRate: 84.25 }).where(eq(suppliers.id, guangzhou));
     await ctx.db.update(suppliers).set({ status: "Inactive" }).where(eq(suppliers.id, hangzhou));
     const foshan = (await ctx.db.select({ id: suppliers.id }).from(suppliers).where(eq(suppliers.name, "Foshan Fabrics")))[0]!.id;

@@ -3,8 +3,8 @@ import { randomUUID } from "node:crypto";
 import { eq } from "drizzle-orm";
 import { afterAll, beforeEach, describe, expect, it } from "vitest";
 
-import { items, orders, shippingAgents, suppliers } from "../../db/schema";
-import { api, createTestContext, resetData, SEEDED, signInAs } from "../../test/harness";
+import { items, orderLines, orders, shippingAgents, suppliers } from "../../db/schema";
+import { api, createTestContext, receiveOrder, resetData, SEEDED, signInAs } from "../../test/harness";
 import { makeOrder } from "../stock/fixtures";
 import { hiddenSettlement, orderSettlement } from "./money";
 import { MESSAGES as M } from "./orders.routes";
@@ -41,9 +41,15 @@ const orderBody = (extra: object = {}) => ({
   deposits: [],
   ...extra,
 });
-const place = async (extra: object = {}) => {
+/**
+ * ORD-3, then received: in full, or `received` per line position. The order is worth what was received (received
+ * quantity x rate).
+ */
+const place = async (extra: object = {}, received?: number[]) => {
   const res = await post("/orders", orderBody(extra));
   expect(res.status, JSON.stringify(res.body)).toBe(201);
+  const lines = await ctx.db.select({ id: orderLines.id, position: orderLines.position }).from(orderLines).where(eq(orderLines.orderId, res.body.order.id));
+  await receiveOrder(ctx, res.body.order.id, received && Object.fromEntries(lines.map((line) => [line.id, received[line.position]!])));
   return res.body.order as { id: string; po: string };
 };
 /** PAY-2: a supplier payment (against the supplier), or with `agentId` a shipping-agent payment on the order. */
@@ -74,10 +80,19 @@ describe("orderSettlement", () => {
 describe("one supplier balance on every screen", () => {
   it("ORD-1, ORD-4, PAY-1, the order report, the order reports, Payments per supplier and REC-2 agree, with agent payments apart", async () => {
     // ¥1,000 order, ¥1,000 deposit asked for, a ¥100 agent deposit at 12; then ¥300 at 12 and ¥200 at 12.5 to the supplier.
-    const order = await place({
-      depositRequiredCny: 1000,
-      deposits: [{ payee: "Sino Freight", payeeRole: "agent", amountCny: 100, paidOn: "2026-10-22", rateInr: 12, mode: "Cash" }],
-    });
+    // The jeans are received; a ¥0 line is still to come, so REC-2 lists the order.
+    const polo = (await ctx.db.select({ id: items.id }).from(items).where(eq(items.name, "Polo shirts")))[0]!.id;
+    const order = await place(
+      {
+        depositRequiredCny: 1000,
+        deposits: [{ payee: "Sino Freight", payeeRole: "agent", amountCny: 100, paidOn: "2026-10-22", rateInr: 12, mode: "Cash" }],
+        lines: [
+          { itemId: ids.jeans, quantity: 100, rateCny: 10 },
+          { itemId: polo, quantity: 1, rateCny: 0 },
+        ],
+      },
+      [100, 0],
+    );
     expect((await pay(order.id, "Deposit", 300, 12)).status).toBe(201);
     expect((await pay(order.id, "Balance", 200, 12.5)).status).toBe(201);
 

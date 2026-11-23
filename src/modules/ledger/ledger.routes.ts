@@ -34,6 +34,7 @@ import {
   type Ledger,
   loadLedger,
   lockAccount,
+  receivedOfLine,
   MESSAGES as LEDGER,
   postLedgerEntry,
   settlementFields,
@@ -179,7 +180,9 @@ async function heldRecords(db: Pick<Database, "select">, supplierId: string, cur
         po: orders.poNumber,
         orderDate: orders.orderDate,
         stage: orders.stage,
-        valueCny: sql<number>`round(coalesce(sum(${orderLines.quantity} * ${orderLines.rateCny}), 0), 2)`.mapWith(Number),
+        // Received quantity x rate (the value the journal holds); poValueCny is the ordered quantity x rate, for reference.
+        valueCny: sql<number>`round(coalesce(sum(${receivedOfLine} * ${orderLines.rateCny}), 0), 2)`.mapWith(Number),
+        poValueCny: sql<number>`round(coalesce(sum(${orderLines.quantity} * ${orderLines.rateCny}), 0), 2)`.mapWith(Number),
       })
       .from(orders)
       .leftJoin(orderLines, eq(orderLines.orderId, orders.id))
@@ -289,7 +292,9 @@ export function ledgerRoutes({ db }: RouteContext) {
           exchangeRate: orders.exchangeRate,
           depositRequiredCny: orders.depositRequiredCny,
           // Joined and grouped: in a single-table select drizzle would drop the table name from a correlated orders.id.
-          valueCny: sql<number>`round(coalesce(sum(${orderLines.quantity} * ${orderLines.rateCny}), 0), 2)`.mapWith(Number),
+          // Received quantity x rate (the value the journal holds); poValueCny is the ordered quantity x rate, for reference.
+          valueCny: sql<number>`round(coalesce(sum(${receivedOfLine} * ${orderLines.rateCny}), 0), 2)`.mapWith(Number),
+          poValueCny: sql<number>`round(coalesce(sum(${orderLines.quantity} * ${orderLines.rateCny}), 0), 2)`.mapWith(Number),
         })
         .from(orders)
         .leftJoin(orderLines, eq(orderLines.orderId, orders.id))

@@ -5,7 +5,19 @@ import { orderedCurrencies } from "../../currencies";
 import type { Database } from "../../db/client";
 import { type Currency, items, orderLines, orders, payments, suppliers } from "../../db/schema";
 import { notFound } from "../../http/errors";
-import { accountsView, cents, fromCents, loadLedger, newestPaymentsFirst, paymentQuery, paymentRow, settlementFields } from "../ledger/ledger";
+import {
+  accountsView,
+  cents,
+  fromCents,
+  linePoValue,
+  lineValue,
+  loadLedger,
+  newestPaymentsFirst,
+  paymentQuery,
+  paymentRow,
+  receivedOfLine,
+  settlementFields,
+} from "../ledger/ledger";
 import { supplierStatement } from "../ledger/ledger.routes";
 import { orderClosed } from "../orders/closure";
 import { orderMoney } from "../orders/money";
@@ -141,7 +153,10 @@ export async function supplierPaymentDetail(db: Database, supplierId: string, q:
         unit: unitSymbol,
         quantity: orderLines.quantity,
         rateCny: orderLines.rateCny,
-        amountCny: sql<number>`round(${orderLines.quantity} * ${orderLines.rateCny}, 2)`.mapWith(Number),
+        /** Received quantity × rate (the line's value); poAmountCny is the ordered quantity × rate, for reference. */
+        received: receivedOfLine,
+        amountCny: lineValue,
+        poAmountCny: linePoValue,
         currency: orders.currency,
       })
       .from(orderLines)

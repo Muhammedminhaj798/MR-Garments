@@ -1,14 +1,16 @@
 import { createHmac, randomBytes } from "node:crypto";
-import { eq, sql } from "drizzle-orm";
+import { and, asc, eq, sql } from "drizzle-orm";
 import supertest from "supertest";
 
 import { createApp } from "../app";
 import { hashPassword } from "../auth/passwords";
 import { IDLE_TTL_SECONDS, SESSION_COOKIE } from "../auth/session";
 import { readConfig } from "../config";
-import { createDatabase, databaseName } from "../db/client";
-import { users } from "../db/schema";
+import { createDatabase, type Database, databaseName } from "../db/client";
+import { locations, orderLines, orders, receiptLines, receipts, users } from "../db/schema";
 import { seed } from "../db/seed";
+import { isHeld, syncOrderValue } from "../modules/ledger/ledger";
+import { todayInIndia } from "../modules/stages/common";
 
 // Shared test helpers. Coordinator-owned. Test files run one at a time (vitest.config.ts) against this worktree's own
 // database, which global-setup rebuilt; call resetData() in beforeEach/beforeAll to start from the seed.
@@ -99,3 +101,45 @@ export const SEEDED = {
   indiaStaff: "anil@mrgarments.com",
   warehouseStaff: "joseph@mrgarments.com",
 } as const;
+
+/**
+ * Receives an order the way REC-3 does (owner rule of 2026-11-23: an order is worth what was received): one receipt at
+ * the first active China office, by the seeded Management user, on the order date (today if that is later), with every
+ * line at its ordered quantity or at `quantities` (by order line id), and the value's difference posted
+ * (ledger.ts syncOrderValue) unless the account is held. The stage is left as it is.
+ */
+export async function receiveOrder(ctx: TestContext, orderId: string, quantities?: Record<string, number>) {
+  return ctx.db.transaction(async (tx) => {
+    const [order] = await tx
+      .select({ id: orders.id, po: orders.poNumber, supplierId: orders.supplierId, currency: orders.currency, exchangeRate: orders.exchangeRate, orderDate: orders.orderDate })
+      .from(orders)
+      .where(eq(orders.id, orderId))
+      .for("update");
+    if (!order) throw new Error(`No order ${orderId}`);
+    const lines = await tx.select({ id: orderLines.id, quantity: orderLines.quantity }).from(orderLines).where(eq(orderLines.orderId, orderId));
+    const [office] = await tx
+      .select({ id: locations.id })
+      .from(locations)
+      .where(and(eq(locations.type, "China office"), eq(locations.status, "Active")))
+      .orderBy(asc(locations.createdAt), asc(locations.name))
+      .limit(1);
+    const [boss] = await tx.select({ id: users.id }).from(users).where(eq(users.email, SEEDED.management));
+    const today = todayInIndia();
+    const [receipt] = await tx
+      .insert(receipts)
+      .values({ orderId, receivedOn: order.orderDate < today ? order.orderDate : today, locationId: office!.id, receivedBy: boss!.id, bundles: 1 })
+      .returning({ id: receipts.id });
+    await tx.insert(receiptLines).values(lines.map((line) => ({ receiptId: receipt!.id, orderLineId: line.id, quantity: quantities?.[line.id] ?? line.quantity })));
+    return { receiptId: receipt!.id, posted: await postOrderValue(tx, orderId, boss!.id) };
+  });
+}
+
+/** Posts an order's value difference (received x rate, ledger.ts syncOrderValue) as REC-3 and REC-4 do, unless held. */
+export async function postOrderValue(tx: Pick<Database, "select" | "insert" | "execute">, orderId: string, userId: string | null = null) {
+  const [order] = await tx
+    .select({ id: orders.id, po: orders.poNumber, supplierId: orders.supplierId, currency: orders.currency, exchangeRate: orders.exchangeRate, orderDate: orders.orderDate })
+    .from(orders)
+    .where(eq(orders.id, orderId));
+  if (!order) throw new Error(`No order ${orderId}`);
+  return (await isHeld(tx, order.supplierId, order.currency)) ? null : syncOrderValue(tx, order, userId);
+}

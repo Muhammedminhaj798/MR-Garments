@@ -5,7 +5,7 @@ import { afterAll, beforeEach, describe, expect, it } from "vitest";
 
 import { compareCurrencies, currencySymbol, ISO_4217, isCurrency, orderedCurrencies, PREFERRED_CURRENCIES } from "../../currencies";
 import { items, orders, payments, suppliers } from "../../db/schema";
-import { api, createTestContext, resetData, SEEDED, signInAs } from "../../test/harness";
+import { api, createTestContext, receiveOrder, resetData, SEEDED, signInAs } from "../../test/harness";
 import { money } from "../notifications/notify";
 import { idOf } from "../stock/fixtures";
 
@@ -95,6 +95,7 @@ describe("any currency of the master, and only those, for suppliers, orders and 
       .post("/orders", { supplierId: aed.body.supplier.id, orderDate: "2026-10-20", deliveryDate: "2026-11-30", lines: [{ itemId: jeans, quantity: 10, rateCny: 4 }], deposits: [] })
       .set("Cookie", management);
     expect(order.status, order.text).toBe(201);
+    await receiveOrder(ctx, order.body.order.id); // worth received quantity x rate: 10 x 4
     expect((await ctx.db.select({ currency: orders.currency, exchangeRate: orders.exchangeRate }).from(orders))[0]).toEqual({ currency: "AED", exchangeRate: 23.5 });
     expect((await get("/reports/orders")).body.rows[0]).toMatchObject({ currency: "AED", orderValueCny: 40, exchangeRate: 23.5, orderValueInr: 940 });
     // A supplier payment in AED (PAY-2, against the supplier): the amount in dirhams at its own typed rate.

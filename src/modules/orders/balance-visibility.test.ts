@@ -2,7 +2,7 @@ import { eq } from "drizzle-orm";
 import { afterAll, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { items, suppliers } from "../../db/schema";
-import { api, createTestContext, resetData, SEEDED, signInAs } from "../../test/harness";
+import { api, createTestContext, receiveOrder, resetData, SEEDED, signInAs } from "../../test/harness";
 import { indiaDay } from "../stock/fixtures";
 
 // ORD-2's `ledgerBalance` and ORD-3's / ORD-5's `ledger` are money: only with payments View (docs/unified-ledger.md).
@@ -56,11 +56,13 @@ describe("supplier balances on ORD-2/3/5 need payments View", () => {
     const options = (await http.get("/orders/options").set("Cookie", management)).body;
     expect(options.suppliers.find((row: { id: string }) => row.id === guangzhou).ledgerBalance).toEqual([]);
 
+    // Nothing received yet: ORD-3 and ORD-5 carry the balance, unchanged (the value is received quantity x rate).
     const created = await http.post("/orders", newOrder(100)).set("Cookie", management);
-    expect(created.body.ledger).toMatchObject({ currency: "CNY", debitCny: 100, balanceBefore: 0, balanceAfter: -100 });
+    expect(created.body.ledger).toMatchObject({ currency: "CNY", debitCny: 0, balanceBefore: 0, balanceAfter: 0 });
 
     const edited = await http.patch(`/orders/${encodeURIComponent(created.body.order.po)}`, { lines: [{ itemId: jeans, quantity: 150, rateCny: 1 }] }).set("Cookie", management);
-    expect(edited.body.ledger).toMatchObject({ changeCny: -50, balanceBefore: -100, balanceAfter: -150 });
+    expect(edited.body.ledger).toMatchObject({ changeCny: 0, balanceBefore: 0, balanceAfter: 0 });
+    await receiveOrder(ctx, created.body.order.id); // the 150 arrive: ¥150 owed
     expect((await http.get("/orders/options").set("Cookie", management)).body.suppliers.find((row: { id: string }) => row.id === guangzhou).ledgerBalance).toEqual([
       { currency: "CNY", balanceCny: -150 },
     ]);

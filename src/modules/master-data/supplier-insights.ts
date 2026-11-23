@@ -52,7 +52,9 @@ function orderRows(db: Database, where?: SQL) {
       deliveryDate: orders.deliveryDate,
       stage: orders.stage,
       closed: orderClosed,
+      // Received quantity x rate; the PO value (ordered x rate) for the Open POs card, whose goods are mostly still due.
       orderValueCny: orderMoney.orderValueCny,
+      poValueCny: orderMoney.poValueCny,
       receivedOn: sql<string | null>`(select min(${receipts.receivedOn})::text from ${receipts} where ${receipts.orderId} = ${orders.id})`,
     })
     .from(orders)
@@ -132,7 +134,7 @@ export async function suppliersSummary(db: Database, today: string) {
   const active = counts?.active ?? 0;
   return {
     suppliers: { total, active, inactive: total - active },
-    openPos: { count: open.length, value: byCurrency(open, (row) => row.orderValueCny), heldCount: heldOpen.length },
+    openPos: { count: open.length, value: byCurrency(open, (row) => row.orderValueCny), poValue: byCurrency(open, (row) => row.poValueCny), heldCount: heldOpen.length },
     inTransit: { orders: rows.filter((row) => row.stage >= 3 && row.stage <= 5).length, nextEta: transit?.nextEta ?? null, arrivingNext7: transit?.arrivingNext7 ?? 0 },
     unpaid: { amount: byCurrency(owed, (total) => total.amount), suppliers: distinct(owed.map((total) => total.supplierId)).length },
     upcomingPayments: { windowDays: 7, count: sum(due, (row) => row.count), amount: byCurrency(due, (row) => row.amount) },

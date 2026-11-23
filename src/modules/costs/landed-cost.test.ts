@@ -17,7 +17,7 @@ import {
   warehouseReceiptLines,
   warehouseReceipts,
 } from "../../db/schema";
-import { createTestContext, resetData } from "../../test/harness";
+import { createTestContext, receiveOrder, resetData } from "../../test/harness";
 import { moveOrdersToStage } from "../stages-shared";
 import { indiaDay, makeOrder, postLegacy } from "../stock/fixtures";
 import { computeLandedCosts, type LandedCostFacts, loadLandedCosts } from "./landed-cost";
@@ -141,6 +141,7 @@ describe("loadLandedCosts (database)", () => {
     const authors = { createdBy: user, updatedBy: user };
     const a = await makeOrder(ctx, { stage: 3, lines: [{ item: "Polo shirts", quantity: 100, rateCny: 30 }] });
     const b = await makeOrder(ctx, { stage: 3, lines: [{ item: "Men's shorts", quantity: 100, rateCny: 10 }] });
+    for (const made of [a, b]) await receiveOrder(ctx, made.id); // worth received quantity x rate
     const paid = { kind: "Deposit", status: "paid", paidOn: indiaDay(-20), mode: "Bank" };
     await ctx.db.insert(payments).values([
       { ...paid, orderId: a.id, payee: "Guangzhou Textile Co.", payeeRole: "supplier", amountCny: 3000, rateInr: 12.3456 },

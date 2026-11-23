@@ -98,7 +98,7 @@ try {
       async (tx) => {
         if (opening) {
           await tx.execute(sql`set local lock_timeout = '10s'`);
-          await tx.execute(sql`lock table orders, order_lines, payments, supplier_advance_entries, supplier_deposits, supplier_deposit_transactions, supplier_ledger_entries, supplier_ledger_holds in share mode`);
+          await tx.execute(sql`lock table orders, order_lines, receipts, receipt_lines, payments, supplier_advance_entries, supplier_deposits, supplier_deposit_transactions, supplier_ledger_entries, supplier_ledger_holds in share mode`);
         }
         return reconcile(tx);
       },

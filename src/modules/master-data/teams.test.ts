@@ -16,7 +16,7 @@ import {
   warehouseReceiptLines,
   warehouseReceipts,
 } from "../../db/schema";
-import { api, createTestContext, resetData, SEEDED, signInAs } from "../../test/harness";
+import { api, createTestContext, receiveOrder, resetData, SEEDED, signInAs } from "../../test/harness";
 import { indiaDay, makeOrder, postLegacy } from "../stock/fixtures";
 
 const ctx = createTestContext();
@@ -149,6 +149,7 @@ describe("stock from stocked warehouse receipts (6.3)", () => {
     const a = await makeOrder(ctx, { stage: 6, lines: [{ item: "Polo shirts", quantity: 100, rateCny: 30 }] });
     const b = await makeOrder(ctx, { stage: 6, lines: [{ item: "Men's shorts", quantity: 100, rateCny: 10 }] });
     const c = await makeOrder(ctx, { stage: 5, lines: [{ item: "Denim jeans", quantity: 10, rateCny: 50 }] });
+    for (const made of [a, b, c]) await receiveOrder(ctx, made.id); // worth received quantity x rate
     const paid = { kind: "Deposit", status: "paid", paidOn: indiaDay(-20), mode: "Bank", payee: "Guangzhou Textile Co.", payeeRole: "supplier", rateInr: 12 };
     await ctx.db.insert(payments).values([
       { ...paid, orderId: a.id, amountCny: 3000 },

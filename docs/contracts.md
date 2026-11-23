@@ -125,6 +125,7 @@ ORD-1 to ORD-4 are in `docs/live-screens-contracts.md`. Both routes are in `src/
 | --- | --- | --- | --- |
 | ORD-5 | `PATCH /orders/:po` | ordersEdit >= Enter (Management, Procurement) | BE-orders |
 | ORD-6 | `DELETE /orders/:po` | admin = Full (Management) | BE-orders |
+| ORD-8 | `POST /orders/:po/rate-corrections` | payments = Full (Management) | BE-orders |
 
 - **ORD-5** body (strict, at least one key; empty or unknown keys 400): `orderDate?`, `deliveryDate?`,
   `lines? {id?, itemId, quantity, rateCny}[]` (1-50, ORD-3 limits and messages). `lines` replaces the list in array
@@ -148,6 +149,25 @@ ORD-1 to ORD-4 are in `docs/live-screens-contracts.md`. Both routes are in `src/
   "An order's supplier can't change: its value is posted to this supplier's account. Place a new order for the other
   supplier." or `currency` "An order's currency can't change: its rates, value and payments are in <currency>. Place a
   new order in the other currency.". One transaction with the order row locked `for update`.
+- **Order value (owner rules of 2026-11-23, docs/unified-ledger.md):** every `orderValueCny` / line `valueCny` is the
+  received quantity x rate; `poValueCny` (and RPT-5D `poAmountCny`) is the ordered quantity x rate, for reference.
+  `paymentStatus` gains `awaiting_goods` (nothing received). REC-3 and REC-4 post the value's difference (503 in
+  maintenance; a held account records the receipt and posts nothing); a change that re-settles a final landed cost
+  answers 409 `final_settlement_approval` unless the body carries `finalSettlementApproval: { reason }` (1-500
+  characters) from a payments Full user (else 403). PAY-2 (supplier body) and PAY-3 take the same optional
+  `finalSettlementApproval` and answer the same 409/403 when a payment (for example one dated before a protected
+  order's credits) or a void would change such a settlement; the reason goes to the `payment` / `payment_void` notes.
+  Every supplier payment and every clearing, transport and warehouse save records the orders it finds final
+  (`final_cost_protections`, migration 0018, append-only).
+- **ORD-8** body (strict): `lines: { id, rateCny }[]` (1-50, distinct, this order's lines with goods received; 422
+  `lines` "Only a line with goods received is corrected here. Change the other lines on Edit order." or "Change the
+  rate of at least one line."), `reason` (1-500, 422 `reason`). 404 unknown PO; 503 in maintenance; 409 `account_held`.
+  Writes the rates and posts received quantity x the rate change as one `order_adjustment` dated today, notes
+  "Rate correction: <reason> (<item> <old> -> <new> (<received> received); ...)". A change to a protected final landed
+  cost's settlement answers 409 `final_settlement_approval` (nothing written) unless the body carries
+  `finalSettlementApproval: { reason }`; its reason is appended to the notes ("; Management approval (final landed
+  cost): <reason>"). 200 `{ order: { id, po }, ledger:
+  { supplierId, currency, changeCny, balanceBefore, balanceAfter, entryId, finalOrders } }`.
 - **ORD-6** 204 when deleted with its own lines. 409 `in_use` "This order has {2 payments, 1 receipt and 1
   container}, so it can't be deleted." when it has payments (any status), receipts (its own, or any holding one of
   its lines), containers or warehouse receipts holding one of its lines. The order row and its lines are locked

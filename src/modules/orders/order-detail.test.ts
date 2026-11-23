@@ -111,13 +111,14 @@ describe("ORD-4 GET /orders/:po", () => {
       stocked: 0,
       closed: false,
       closedOn: null,
-      orderValueCny: 14975, // 1000 * 12.5 + 300 * 8.25
+      orderValueCny: 12075, // received x rate: 900 * 12.5 + 100 * 8.25 (REC-3 posted each receipt)
+      poValueCny: 14975, // ordered: 1000 * 12.5 + 300 * 8.25
       // Taken from its first container (sent CNF before 0015's order terms existed): docs/order-container-terms.md.
       terms: "CNF",
       // The ledger's FIFO projection: the supplier payment settles ¥1,234.56; the ¥1,000 agent deposit is freight.
       held: false,
       settledCny: 1234.56,
-      outstandingCny: 13740.44,
+      outstandingCny: 10840.44,
       paymentStatus: "partly",
       settledInr: 14662.25, // 1234.56 * 11.8765, rounded
       depositRequiredCny: null,
@@ -147,18 +148,18 @@ describe("ORD-4 GET /orders/:po", () => {
         currency: "CNY",
         held: false,
         creditsCny: 1234.56,
-        debitsCny: 14975,
-        balanceCny: -13740.44,
+        debitsCny: 12075,
+        balanceCny: -10840.44,
         paidInr: 14662.25,
         paidInrComplete: true,
-        outstandingCny: 13740.44,
+        outstandingCny: 10840.44,
         openOrders: 1,
         lastPaymentOn: indiaDay(-25),
       },
       exchangeRate: null,
       lines: [
-        { id: jeans, position: 0, item: { id: ids.jeans, name: "Denim jeans" }, unit: "pcs", quantity: 1000, rateCny: 12.5, valueCny: 12500, received: 900, loaded: 700 },
-        { id: fabric, position: 1, item: { id: ids.fabric, name: "Cotton fabric" }, unit: "m", quantity: 300, rateCny: 8.25, valueCny: 2475, received: 100, loaded: 0 },
+        { id: jeans, position: 0, item: { id: ids.jeans, name: "Denim jeans" }, unit: "pcs", quantity: 1000, rateCny: 12.5, valueCny: 11250, poValueCny: 12500, received: 900, loaded: 700 },
+        { id: fabric, position: 1, item: { id: ids.fabric, name: "Cotton fabric" }, unit: "m", quantity: 300, rateCny: 8.25, valueCny: 825, poValueCny: 2475, received: 100, loaded: 0 },
       ],
       // Order-linked rows only: the agent deposit (the supplier payment names no order).
       payments: [
@@ -237,8 +238,9 @@ describe("ORD-4 GET /orders/:po", () => {
     });
     const res = await get(`/orders/${created.order.po}`);
     // Newer than the first order, which the ¥1,234.56 only part settles: nothing is left for this one.
-    expect(res.body).toMatchObject({ stage: 1, received: 0, settledCny: 0, outstandingCny: 150, paymentStatus: "unpaid", slices: [], payments: [], receipts: [], containers: [] });
-    expect(res.body.lines).toEqual([expect.objectContaining({ quantity: 50, valueCny: 150, received: 0, loaded: 0 })]);
+    // Nothing received: worth 0 (received x rate), awaiting goods; the PO value is ¥150.
+    expect(res.body).toMatchObject({ stage: 1, received: 0, orderValueCny: 0, poValueCny: 150, settledCny: 0, outstandingCny: 0, paymentStatus: "awaiting_goods", slices: [], payments: [], receipts: [], containers: [] });
+    expect(res.body.lines).toEqual([expect.objectContaining({ quantity: 50, valueCny: 0, poValueCny: 150, received: 0, loaded: 0 })]);
   });
 
   it("is null for each section the user can't view", async () => {

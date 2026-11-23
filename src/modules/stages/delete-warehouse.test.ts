@@ -1,7 +1,7 @@
 import { count, eq } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
-import { containerLines, containers, payments, shippingAgents, transports, warehouseReceiptLines, warehouseReceipts } from "../../db/schema";
+import { containerLines, containers, payments, receipts, shippingAgents, transports, warehouseReceiptLines, warehouseReceipts } from "../../db/schema";
 import { api, createTestContext, resetData, SEEDED, signInAs } from "../../test/harness";
 import { loadLandedCosts } from "../costs/landed-cost";
 import { idOf, indiaDay, makeOrder } from "../stock/fixtures";
@@ -197,6 +197,10 @@ describe("WH-4 DELETE /warehouse-receipts/:transportId", () => {
     expect((await del(`/clearings/${t.id}`)).status).toBe(204);
     expect(await stageOf(ctx, order.id)).toBe(3);
     expect((await del(`/containers/${t.id}`)).status).toBe(204);
+    // Its China receipt stays (stage 2); deleting it (REC-4) takes the order back to stage 1 and posts its value back.
+    expect(await stageOf(ctx, order.id)).toBe(2);
+    const [receipt] = await ctx.db.select({ id: receipts.id }).from(receipts).where(eq(receipts.orderId, order.id));
+    expect((await del(`/receipts/${receipt!.id}`)).status).toBe(204);
     expect(await stageOf(ctx, order.id)).toBe(1);
     expect((await del(`/orders/${order.po}`)).status).toBe(204);
   });

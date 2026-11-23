@@ -4,7 +4,7 @@ import { eq } from "drizzle-orm";
 import { afterAll, beforeEach, describe, expect, it } from "vitest";
 
 import { items, payments, shippingAgents, supplierLedgerEntries, suppliers } from "../../db/schema";
-import { api, createTestContext, resetData, SEEDED, signInAs } from "../../test/harness";
+import { api, createTestContext, receiveOrder, resetData, SEEDED, signInAs } from "../../test/harness";
 import { indiaDay } from "../stock/fixtures";
 
 // The exchange rate is optional on a supplier (MD-2): left out, it is stored as null ("not set yet"), never 0 or 1. It
@@ -126,6 +126,7 @@ describe("final checks before release", () => {
       .send({ supplierId: supplier.id, orderDate: indiaDay(-2), deliveryDate: indiaDay(30), lines: [{ itemId: jeans, quantity: 100, rateCny: 5 }] });
     expect(placed.status).toBe(201);
     const po = placed.body.order.po as string;
+    await receiveOrder(ctx, placed.body.order.id); // worth received quantity x rate
     expect((await http.post("/payments").set("Cookie", accounts).send({ supplierId: supplier.id, amount: 200, paidOn: indiaDay(), rateInr: 83, mode: "Wire", clientRequestId: randomUUID() })).status).toBe(201);
     const before = { list: (await http.get("/orders").set("Cookie", management)).body.find((o: { po: string }) => o.po === po), detail: (await http.get(`/orders/${po}`).set("Cookie", management)).body, report: (await http.get(`/orders/${po}/report`).set("Cookie", management)).body };
     expect(before.list).toMatchObject({ exchangeRate: null });

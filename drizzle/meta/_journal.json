@@ -127,6 +127,13 @@
       "when": 1795155384570,
       "tag": "0017_supplier_ledger",
       "breakpoints": true
+    },
+    {
+      "idx": 18,
+      "version": "7",
+      "when": 1795423562228,
+      "tag": "0018_final_cost_protections",
+      "breakpoints": true
     }
   ]
 }

@@ -138,14 +138,15 @@ describe("GET /reports/<name> on the lifecycle data", () => {
   });
 
   it("payments-per-supplier: open orders per supplier with the ledger's settlement and signed balance, and the finished POs", async () => {
-    // A and B are paid in full (balance 0, finished): no row. The others owe (negative balances).
+    // A and B are paid in full (balance 0, finished): no row. The others owe (negative balances), at received quantity x
+    // rate: E 150 of 200 received (¥600); D nothing received yet (¥0, awaiting goods).
     expect(await get("/reports/payments-per-supplier")).toMatchObject({
       suppliers: [
         { supplier: "Foshan Fabrics", held: false, orders: [data.c.po], orderValueCny: 4000, settledCny: 1000, outstandingCny: 3000, creditsCny: 1000, balanceCny: -3000, paidInr: 12000 },
-        { supplier: "Yiwu Trims Ltd.", orders: [data.d.po], orderValueCny: 1000, settledCny: 0, outstandingCny: 1000, creditsCny: 0, balanceCny: -1000, paidInr: 0 },
-        { supplier: "Hangzhou Knits", orders: [data.e.po], orderValueCny: 800, settledCny: 0, outstandingCny: 800, balanceCny: -800 },
+        { supplier: "Hangzhou Knits", orders: [data.e.po], orderValueCny: 600, settledCny: 0, outstandingCny: 600, balanceCny: -600 },
+        { supplier: "Yiwu Trims Ltd.", orders: [data.d.po], orderValueCny: 0, settledCny: 0, outstandingCny: 0, creditsCny: 0, balanceCny: 0, paidInr: 0 },
       ],
-      totals: { orders: 3, orderValueCny: 5800, settledCny: 1000, outstandingCny: 4800, balanceCny: -4800, payableCny: 4800, availableCny: 0, paidInr: 12000 },
+      totals: { orders: 3, orderValueCny: 4600, settledCny: 1000, outstandingCny: 3600, balanceCny: -3600, payableCny: 3600, availableCny: 0, paidInr: 12000 },
       dueNext30Cny: 3000,
       finishedPos: [data.b.po, data.a.po],
     });
@@ -188,8 +189,8 @@ describe("reports never add amounts in different currencies (migration 0006)", (
     const body = await get("/reports/payments-per-supplier");
     expect(body.suppliers.map((row: { supplier: string; currency: string }) => `${row.supplier} ${row.currency}`)).toEqual([
       "Foshan Fabrics CNY",
-      "Yiwu Trims Ltd. CNY",
       "Hangzhou Knits CNY",
+      "Yiwu Trims Ltd. CNY",
       "Foshan Fabrics USD",
     ]);
     expect(body.suppliers[3]).toEqual({
@@ -198,18 +199,19 @@ describe("reports never add amounts in different currencies (migration 0006)", (
       currency: "USD",
       held: false,
       orders: [usd.po],
-      orderValueCny: 200,
+      // 80 of the 100 received: $160 (received quantity x rate).
+      orderValueCny: 160,
       settledCny: 50,
-      outstandingCny: 150,
+      outstandingCny: 110,
       creditsCny: 50,
-      balanceCny: -150,
+      balanceCny: -110,
       paidInr: 4400,
     });
-    const cny = { orders: 3, orderValueCny: 5800, settledCny: 1000, outstandingCny: 4800, balanceCny: -4800, payableCny: 4800, availableCny: 0, paidInr: 12000 };
+    const cny = { orders: 3, orderValueCny: 4600, settledCny: 1000, outstandingCny: 3600, balanceCny: -3600, payableCny: 3600, availableCny: 0, paidInr: 12000 };
     expect(body.totals).toEqual(cny);
     expect(body.totalsByCurrency).toEqual([
       { currency: "CNY", ...cny },
-      { currency: "USD", orders: 1, orderValueCny: 200, settledCny: 50, outstandingCny: 150, balanceCny: -150, payableCny: 150, availableCny: 0, paidInr: 4400 },
+      { currency: "USD", orders: 1, orderValueCny: 160, settledCny: 50, outstandingCny: 110, balanceCny: -110, payableCny: 110, availableCny: 0, paidInr: 4400 },
     ]);
     expect(body).toMatchObject({ dueNext30Cny: 3000, dueNext30ByCurrency: [{ currency: "CNY", amount: 3000 }, { currency: "USD", amount: 30 }] });
   });
@@ -227,8 +229,8 @@ describe("reports never add amounts in different currencies (migration 0006)", (
       ],
       // What the business owes suppliers: the negative ledger balances, per currency.
       payableByCurrency: [
-        { currency: "CNY", amount: 4800 },
-        { currency: "USD", amount: 150 },
+        { currency: "CNY", amount: 3600 },
+        { currency: "USD", amount: 110 },
       ],
     });
   });

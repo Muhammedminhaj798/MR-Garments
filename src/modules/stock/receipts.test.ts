@@ -268,8 +268,9 @@ describe("REC-2 GET /receipts/options", () => {
       po: open.po,
       supplier: "Guangzhou Textile Co.",
       currency: "CNY", // not money: China staff get it too
-      orderValueCny: 2750,
-      outstandingCny: 2450, // the ledger's projection: ¥2,750 less the ¥300 paid (the due row is not money paid)
+      orderValueCny: 1610, // received so far x rate
+      poValueCny: 2750, // ordered x rate
+      outstandingCny: 1310, // the ledger's projection: ¥1,610 less the ¥300 paid (the due row is not money paid)
       lines: [{ orderLineId: fabric, item: "Cotton fabric", unit: "m", ordered: 500, receivedEarlier: 120, unitPriceCny: 3 }],
     };
     expect(res.body.orders.find((order: { orderId: string }) => order.orderId === open.id)).toEqual(row);
@@ -280,6 +281,7 @@ describe("REC-2 GET /receipts/options", () => {
     expect(staff.body.orders.find((order: { orderId: string }) => order.orderId === open.id)).toEqual({
       ...row,
       orderValueCny: null,
+      poValueCny: null,
       outstandingCny: null,
       lines: [{ ...row.lines[0], unitPriceCny: null }],
     });

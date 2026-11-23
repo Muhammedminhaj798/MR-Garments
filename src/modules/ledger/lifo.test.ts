@@ -4,7 +4,7 @@ import { and, eq } from "drizzle-orm";
 import { afterAll, beforeEach, describe, expect, it } from "vitest";
 
 import { items, supplierLedgerEntries as entries, suppliers } from "../../db/schema";
-import { api, createTestContext, resetData, SEEDED, signInAs } from "../../test/harness";
+import { api, createTestContext, receiveOrder, resetData, SEEDED, signInAs } from "../../test/harness";
 import { indiaDay } from "../stock/fixtures";
 import { loadLedger, projectAccount } from "./ledger";
 
@@ -355,6 +355,8 @@ const placeOrder = async (value: number, orderDate: string) => {
     .post("/orders", { supplierId: guangzhou, orderDate, deliveryDate: indiaDay(30), lines: [{ itemId: jeans, quantity: value, rateCny: 1 }] })
     .set("Cookie", management);
   expect(res.status, JSON.stringify(res.body)).toBe(201);
+  // Received in full: worth ¥value (received quantity x rate).
+  await receiveOrder(ctx, res.body.order.id);
   return res.body.order as { id: string; po: string };
 };
 const adjustBy = async (amount: number, currency: string, rateInr: number, entryDate = indiaDay()) => {

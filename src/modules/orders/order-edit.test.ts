@@ -18,7 +18,7 @@ import {
   suppliers,
   users,
 } from "../../db/schema";
-import { api, createTestContext, resetData, SEEDED, signInAs } from "../../test/harness";
+import { api, createTestContext, receiveOrder, resetData, SEEDED, signInAs } from "../../test/harness";
 import { MESSAGES } from "./orders.routes";
 
 // ORD-5 PATCH and ORD-6 DELETE /orders/:po. Orders are created through ORD-3; later records are inserted directly.
@@ -139,10 +139,10 @@ describe("ORD-5 PATCH /orders/:po", () => {
       ],
     });
     expect(res.status, JSON.stringify(res.body)).toBe(200);
-    // A lines edit also answers with the value change posted to the supplier's ledger (docs/unified-ledger.md).
+    // A lines edit answers with the ledger's change: none before goods arrive (the value is received quantity x rate).
     expect(res.body).toEqual({
       order: { id: order.id, po: order.po, stage: 1, orderDate: "2026-10-22", deliveryDate: "2026-12-15", terms: null },
-      ledger: { supplierId: ids.supplier, currency: "CNY", changeCny: 3175, balanceBefore: -14975, balanceAfter: -11800 },
+      ledger: { supplierId: ids.supplier, currency: "CNY", changeCny: 0, balanceBefore: 0, balanceAfter: 0 },
     });
     const lines = await linesOf(order.id);
     expect(lines).toEqual([
@@ -151,7 +151,7 @@ describe("ORD-5 PATCH /orders/:po", () => {
     ]);
     expect(lines.map((line) => line.id)).not.toContain(fabric.id);
     // The order page shows the new main line.
-    expect((await http.get(`/orders/${order.po}`).set("Cookie", management)).body).toMatchObject({ item: "Polo shirts", quantity: 50, orderValueCny: 11800 });
+    expect((await http.get(`/orders/${order.po}`).set("Cookie", management)).body).toMatchObject({ item: "Polo shirts", quantity: 50, orderValueCny: 0, poValueCny: 11800, paymentStatus: "awaiting_goods" });
     // Swapping two kept lines doesn't trip the one-line-per-position index.
     const polo = lines[0]!;
     const swap = await edit(order.po, {
@@ -239,29 +239,31 @@ describe("ORD-5 PATCH /orders/:po", () => {
     expect(await linesOf(other.id)).toEqual(other.lines);
   });
 
-  it("takes a total below what the supplier was paid (D9): one adjustment, and the account holds the rest", async () => {
+  it("takes a received value below what the supplier was paid (D9): one adjustment, and the account holds the rest", async () => {
     const order = await createOrder({ lines: [{ itemId: ids.jeans, quantity: 10000, rateCny: 12.5 }] });
     const id = order.lines[0]!.id;
     const paid = await http
       .post("/payments", { supplierId: ids.supplier, amount: 123456.78, paidOn: "2026-10-21", rateInr: 11.8, mode: "Bank transfer", clientRequestId: randomUUID() })
       .set("Cookie", management);
-    expect(paid.body.ledger).toMatchObject({ balanceBefore: -125000, balanceAfter: -1543.22 });
+    // Nothing received yet: the payment is supplier credit, the order awaits its goods.
+    expect(paid.body.ledger).toMatchObject({ balanceBefore: 0, balanceAfter: 123456.78 });
     // A due payment is not paid, so it changes nothing.
     await ctx.db.insert(payments).values({ orderId: order.id, kind: "Balance", payee: "Guangzhou Textile Co.", payeeRole: "supplier", amountCny: 50000, status: "due", dueDate: "2026-12-01" });
-    const lower = await edit(order.po, { lines: [{ id, itemId: ids.jeans, quantity: 9000, rateCny: 12.5 }] });
-    expect(lower.status, JSON.stringify(lower.body)).toBe(200);
-    expect(lower.body.ledger).toEqual({ supplierId: ids.supplier, currency: "CNY", changeCny: 12500, balanceBefore: -1543.22, balanceAfter: 10956.78 });
-    expect((await http.get(`/orders/${order.po}`).set("Cookie", management)).body).toMatchObject({ orderValueCny: 112500, settledCny: 112500, outstandingCny: 0, paymentStatus: "paid" });
+    // 9,000 of the 10,000 arrive: worth ¥112,500, below what was paid.
+    const lower = (await receiveOrder(ctx, order.id, { [id]: 9000 })).posted;
+    expect(lower).toMatchObject({ changeCny: -112500, balanceBefore: 123456.78, balanceAfter: 10956.78 });
+    expect((await http.get(`/orders/${order.po}`).set("Cookie", management)).body).toMatchObject({ orderValueCny: 112500, poValueCny: 125000, settledCny: 112500, outstandingCny: 0, paymentStatus: "paid" });
     const adjustments = await ctx.db.select().from(supplierLedgerEntries).where(eq(supplierLedgerEntries.orderId, order.id));
     expect(adjustments.map((row) => [row.entryType, row.amount])).toEqual([
-      ["order_debit", -125000],
-      ["order_adjustment", 12500],
+      ["order_debit", 0],
+      ["order_adjustment", -112500],
     ]);
   });
 
-  // Owner refinement 2026-11-21: payments never block a financial edit. Quantity, rate (so the order value), order date
-  // and PO number stay editable; a value change is one order_adjustment, earlier postings and payments never change,
-  // and the FIFO projection re-settles. The supplier and currency are blocked, with the reason.
+  // Owner refinement 2026-11-21: payments never block a financial edit. Under the received-value rule (2026-11-23) the
+  // value is the received quantity x rate: before goods arrive, quantity, rate, order date and PO number change and
+  // nothing is posted; each receipt posts its value as one order_adjustment; after receipt a rate changes only through
+  // ORD-8 (a Management correction). Earlier postings and payments never change. The supplier and currency are blocked.
   describe("financial fields with supplier payments", () => {
     const pay = async (amount: number) => {
       const res = await http
@@ -274,7 +276,7 @@ describe("ORD-5 PATCH /orders/:po", () => {
       ctx.db.select().from(supplierLedgerEntries).where(eq(supplierLedgerEntries.orderId, orderId)).orderBy(asc(supplierLedgerEntries.createdAt), asc(supplierLedgerEntries.id));
     const credits = () => ctx.db.select().from(supplierLedgerEntries).where(sql`${supplierLedgerEntries.orderId} is null`).orderBy(asc(supplierLedgerEntries.id));
     const allPayments = () => ctx.db.select().from(payments).orderBy(asc(payments.id));
-    /** Quantity (+¥1,250), rate (+¥225), order date and PO number, one edit each: ¥14,975 becomes ¥16,450. */
+    /** Before goods: quantity (jeans 1,100), rate (fabric ¥9), order date and PO number, one edit each; nothing posted. */
     const editFinancialFields = async (order: Awaited<ReturnType<typeof createOrder>>) => {
       const [jeans, fabric] = order.lines as [(typeof order.lines)[0], (typeof order.lines)[0]];
       const quantity = await edit(order.po, {
@@ -284,7 +286,7 @@ describe("ORD-5 PATCH /orders/:po", () => {
         ],
       });
       expect(quantity.status, JSON.stringify(quantity.body)).toBe(200);
-      expect(quantity.body.ledger).toMatchObject({ changeCny: -1250 });
+      expect(quantity.body.ledger).toMatchObject({ changeCny: 0 });
       const rate = await edit(order.po, {
         lines: [
           { id: jeans.id, itemId: ids.jeans, quantity: 1100, rateCny: 12.5 },
@@ -292,7 +294,7 @@ describe("ORD-5 PATCH /orders/:po", () => {
         ],
       });
       expect(rate.status, JSON.stringify(rate.body)).toBe(200);
-      expect(rate.body.ledger).toMatchObject({ changeCny: -225 });
+      expect(rate.body.ledger).toMatchObject({ changeCny: 0 });
       const date = await edit(order.po, { orderDate: "2026-10-18" });
       expect(date.status, JSON.stringify(date.body)).toBe(200);
       const renamed = await edit(order.po, { po: `${order.po}-R` });
@@ -300,14 +302,17 @@ describe("ORD-5 PATCH /orders/:po", () => {
       return `${order.po}-R`;
     };
 
-    it("no payment: quantity, rate, order date and PO number change; each value change is one adjustment", async () => {
+    it("no payment: quantity, rate, order date and PO number change before goods arrive and post nothing; the receipt posts the value", async () => {
       const order = await createOrder();
       const po = await editFinancialFields(order);
-      expect(await detail(po)).toMatchObject({ orderDate: "2026-10-18", orderValueCny: 16450, settledCny: 0, outstandingCny: 16450, paymentStatus: "unpaid" });
+      expect(await detail(po)).toMatchObject({ orderDate: "2026-10-18", orderValueCny: 0, poValueCny: 16450, settledCny: 0, outstandingCny: 0, paymentStatus: "awaiting_goods" });
+      expect((await postingsOf(order.id)).map((row) => [row.entryType, row.amount])).toEqual([["order_debit", 0]]);
+      // Received in full: worth ¥16,450 (1,100 x 12.5 + 300 x 9), one adjustment.
+      expect((await receiveOrder(ctx, order.id)).posted).toMatchObject({ changeCny: -16450, balanceBefore: 0, balanceAfter: -16450 });
+      expect(await detail(po)).toMatchObject({ orderValueCny: 16450, poValueCny: 16450, settledCny: 0, outstandingCny: 16450, paymentStatus: "unpaid" });
       expect((await postingsOf(order.id)).map((row) => [row.entryType, row.amount])).toEqual([
-        ["order_debit", -14975],
-        ["order_adjustment", -1250],
-        ["order_adjustment", -225],
+        ["order_debit", 0],
+        ["order_adjustment", -16450],
       ]);
     });
 
@@ -318,41 +323,45 @@ describe("ORD-5 PATCH /orders/:po", () => {
       const creditsBefore = await credits();
       const [debitBefore] = await postingsOf(order.id);
       const po = await editFinancialFields(order);
-      // FIFO re-settles: the ¥5,000 credit settles ¥5,000 of the new ¥16,450.
+      // Before goods: the ¥5,000 is supplier credit; nothing settled.
+      expect(await detail(po)).toMatchObject({ orderValueCny: 0, settledCny: 0, paymentStatus: "awaiting_goods", agentPaidCny: 100, supplierAccount: { balanceCny: 5000 } });
+      await receiveOrder(ctx, order.id);
+      // FIFO settles: the ¥5,000 credit settles ¥5,000 of the received ¥16,450.
       expect(await detail(po)).toMatchObject({ orderValueCny: 16450, settledCny: 5000, outstandingCny: 11450, paymentStatus: "partly", agentPaidCny: 100 });
       expect(await allPayments()).toEqual(paymentsBefore);
       expect(await credits()).toEqual(creditsBefore);
       const after = await postingsOf(order.id);
-      // The debit is the same row, PO number included (a renumbering never rewrites a posting).
+      // The debit is the same row, PO number included (a renumbering never rewrites a posting); the receipt's posting
+      // carries the number the order has now.
       expect(after[0]).toEqual(debitBefore);
-      expect(after.slice(1).map((row) => [row.entryType, row.amount, row.poNumber])).toEqual([
-        ["order_adjustment", -1250, order.po],
-        ["order_adjustment", -225, order.po],
-      ]);
+      expect(after.slice(1).map((row) => [row.entryType, row.amount, row.poNumber])).toEqual([["order_adjustment", -16450, po]]);
       // What locks the order date and the items is received goods, never a payment.
       await setStage(order.id, 2);
       expectConflict(await edit(po, { lines: [{ id: order.lines[0]!.id, itemId: ids.jeans, quantity: 1, rateCny: 1 }] }), "order_locked", LOCKED_RECEIVED);
       expect((await edit(po, { deliveryDate: "2026-12-05" })).status).toBe(200);
     });
 
-    it("fully paid: lower the value below what was paid (the account holds the rest), then raise it past it (outstanding again)", async () => {
+    it("fully paid: a receipt below what was paid (the account holds the rest), then more goods and a rate correction past it (outstanding again)", async () => {
       const order = await createOrder();
       await pay(14975);
-      expect(await detail(order.po)).toMatchObject({ settledCny: 14975, paymentStatus: "paid" });
+      expect(await detail(order.po)).toMatchObject({ settledCny: 0, paymentStatus: "awaiting_goods", supplierAccount: { balanceCny: 14975 } });
       const paymentsBefore = await allPayments();
       const [jeans, fabric] = order.lines as [(typeof order.lines)[0], (typeof order.lines)[0]];
-      const lines = (jeansQuantity: number, fabricRate: number) => [
-        { id: jeans.id, itemId: ids.jeans, quantity: jeansQuantity, rateCny: 12.5 },
-        { id: fabric.id, itemId: ids.fabric, quantity: 300, rateCny: fabricRate },
-      ];
-      const lower = await edit(order.po, { lines: lines(800, 8.25) });
-      expect(lower.body.ledger).toMatchObject({ changeCny: 2500, balanceBefore: 0, balanceAfter: 2500 });
+      // 800 of the 1,000 jeans and all the fabric: worth ¥12,475.
+      const lower = (await receiveOrder(ctx, order.id, { [jeans.id]: 800 })).posted;
+      expect(lower).toMatchObject({ changeCny: -12475, balanceBefore: 14975, balanceAfter: 2500 });
       expect(await detail(order.po)).toMatchObject({ orderValueCny: 12475, settledCny: 12475, outstandingCny: 0, paymentStatus: "paid" });
-      const higher = await edit(order.po, { lines: lines(1200, 10) });
-      expect(higher.body.ledger).toMatchObject({ changeCny: -5525, balanceBefore: 2500, balanceAfter: -3025 });
+      // 400 more jeans (over the order: 1,200) and the fabric rate corrected from 8.25 to 10 by Management (ORD-8).
+      const more = (await receiveOrder(ctx, order.id, { [jeans.id]: 400, [fabric.id]: 0 })).posted;
+      expect(more).toMatchObject({ changeCny: -5000, balanceBefore: 2500, balanceAfter: -2500 });
+      const corrected = await http
+        .post(`/orders/${order.po}/rate-corrections`, { lines: [{ id: fabric.id, rateCny: 10 }], reason: "Supplier invoice rate" })
+        .set("Cookie", management);
+      expect(corrected.status, JSON.stringify(corrected.body)).toBe(200);
+      expect(corrected.body.ledger).toMatchObject({ changeCny: -525, balanceBefore: -2500, balanceAfter: -3025 });
       expect(await detail(order.po)).toMatchObject({ orderValueCny: 18000, settledCny: 14975, outstandingCny: 3025, paymentStatus: "partly" });
       expect(await allPayments()).toEqual(paymentsBefore);
-      expect((await postingsOf(order.id)).map((row) => row.amount)).toEqual([-14975, 2500, -5525]);
+      expect((await postingsOf(order.id)).map((row) => row.amount)).toEqual([0, -12475, -5000, -525]);
     });
 
     it("the supplier and the currency are blocked with the reason (422, nothing written); the saved ones are no change", async () => {
@@ -444,6 +453,8 @@ describe("ORD-6 DELETE /orders/:po", () => {
     expect(found.rows.map((row) => String(row.name)).sort()).toEqual(
       [
         "container_lines.order_line_id -> order_lines", // containers
+        // ON DELETE RESTRICT (0018): a protected final landed cost; such an order has receipts, so ORD-6 refuses it first.
+        "final_cost_protections.order_id -> orders",
         "order_lines.order_id -> orders", // the order's own lines, deleted with it
         "payments.order_id -> orders", // payments (ON DELETE RESTRICT since 0017: a payment never disappears)
         "receipt_lines.order_line_id -> order_lines", // receipts

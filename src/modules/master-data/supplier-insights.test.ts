@@ -76,18 +76,20 @@ describe("Suppliers page: MD-1 money, SUP-1 summary and SUP-2 insights", () => {
     const rows: { name: string; code: string; ytdValue: unknown; balance: unknown }[] = await get("/suppliers");
     const jan1 = `${indiaDay().slice(0, 4)}-01-01`;
     const thisYear = (day: string) => day >= jan1;
+    // Values are received quantity x rate: A has 100 pants received (¥250, its fabric not yet), B nothing ($0).
     const foshanYtd = [
-      ...(thisYear(indiaDay(-30)) ? [{ currency: "CNY", amount: 4250 }] : []),
-      ...(thisYear(indiaDay(-10)) ? [{ currency: "USD", amount: 200 }] : []),
+      ...(thisYear(indiaDay(-30)) ? [{ currency: "CNY", amount: 250 }] : []),
+      ...(thisYear(indiaDay(-10)) ? [{ currency: "USD", amount: 0 }] : []),
     ];
     expect(rows.find((row) => row.name === "Foshan Fabrics")).toMatchObject({
       code: "SUP-003",
       openOrders: 2,
       openPos: 2,
       ytdValue: foshanYtd,
+      // ¥1,000 paid against ¥250 received: ¥750 available with the supplier; nothing received in USD, nothing owed.
       balance: [
-        { currency: "CNY", amount: -3250 },
-        { currency: "USD", amount: -200 },
+        { currency: "CNY", amount: 750 },
+        { currency: "USD", amount: 0 },
       ],
       heldCurrencies: [],
     });
@@ -98,23 +100,22 @@ describe("Suppliers page: MD-1 money, SUP-1 summary and SUP-2 insights", () => {
   it("SUP-1: counts suppliers, open and in-transit orders, what is unpaid and what falls due within 7 days", async () => {
     expect(await get("/suppliers/summary")).toEqual({
       suppliers: { total: 5, active: 5, inactive: 0 },
+      // The open orders' value (received x rate) and their PO value (ordered x rate).
       openPos: {
         count: 3,
         value: [
+          { currency: "CNY", amount: 550 },
+          { currency: "USD", amount: 0 },
+        ],
+        poValue: [
           { currency: "CNY", amount: 4550 },
           { currency: "USD", amount: 200 },
         ],
         heldCount: 0,
       },
       inTransit: { orders: 1, nextEta: indiaDay(3), arrivingNext7: 1 },
-      // Guangzhou is paid in full: only Foshan's accounts are payable (¥3,250 and $200), so one supplier owes.
-      unpaid: {
-        amount: [
-          { currency: "CNY", amount: 3250 },
-          { currency: "USD", amount: 200 },
-        ],
-        suppliers: 1,
-      },
+      // Guangzhou is paid in full and Foshan has ¥750 available (paid before its goods arrived): nobody is owed.
+      unpaid: { amount: [], suppliers: 0 },
       upcomingPayments: { windowDays: 7, count: 1, amount: [{ currency: "CNY", amount: 2750 }] },
     });
   });
@@ -125,30 +126,8 @@ describe("Suppliers page: MD-1 money, SUP-1 summary and SUP-2 insights", () => {
     expect(body.suppliers).toEqual({ total: 5, active: 5 });
     // A on time, C late, B not delivered and past due: 2 delivered, 1 on time, 2 delayed, 25 days each.
     expect(body.summary).toEqual({ orders: 3, completed: 0, completionRate: 0, delivered: 2, onTime: 1, onTimeRate: 50, delayed: 2, averageDeliveryDays: 25 });
+    // Ranked by value (received x rate): Guangzhou ¥300, Foshan ¥250 (its USD order has nothing received).
     expect(body.bySupplier).toEqual([
-      {
-        supplierId: foshan,
-        code: "SUP-003",
-        name: "Foshan Fabrics",
-        country: "China",
-        orders: 2,
-        completed: 0,
-        completionRate: 0,
-        delivered: 1,
-        onTime: 1,
-        onTimeRate: 100,
-        delayed: 1,
-        averageDeliveryDays: 25,
-        value: [
-          { currency: "CNY", amount: 4250 },
-          { currency: "USD", amount: 200 },
-        ],
-        balance: [
-          { currency: "CNY", amount: -3250 },
-          { currency: "USD", amount: -200 },
-        ],
-        heldCurrencies: [],
-      },
       {
         supplierId: guangzhou,
         code: "SUP-001",
@@ -166,7 +145,31 @@ describe("Suppliers page: MD-1 money, SUP-1 summary and SUP-2 insights", () => {
         balance: [{ currency: "CNY", amount: 0 }],
         heldCurrencies: [],
       },
+      {
+        supplierId: foshan,
+        code: "SUP-003",
+        name: "Foshan Fabrics",
+        country: "China",
+        orders: 2,
+        completed: 0,
+        completionRate: 0,
+        delivered: 1,
+        onTime: 1,
+        onTimeRate: 100,
+        delayed: 1,
+        averageDeliveryDays: 25,
+        value: [
+          { currency: "CNY", amount: 250 },
+          { currency: "USD", amount: 0 },
+        ],
+        balance: [
+          { currency: "CNY", amount: 750 },
+          { currency: "USD", amount: 0 },
+        ],
+        heldCurrencies: [],
+      },
     ]);
+    // Top performers rank by on-time rate, not value: Foshan first.
     expect(body.top.map((row: { name: string }) => row.name)).toEqual(["Foshan Fabrics", "Guangzhou Textile Co."]);
     expect(body.byCountry).toEqual([{ country: "China", suppliers: 5 }]);
     // Twelve months ending this month; the orders' value and the supplier payments (agent ones never) fall in them.
@@ -174,8 +177,8 @@ describe("Suppliers page: MD-1 money, SUP-1 summary and SUP-2 insights", () => {
     expect(body.monthly.at(-1).month).toBe(indiaDay().slice(0, 7));
     const total = (currency: string, pick: "value" | "paid") =>
       body.monthly.reduce((sum: number, month: { value: { currency: string; amount: number }[]; paid: { currency: string; amount: number }[] }) => sum + (month[pick].find((t) => t.currency === currency)?.amount ?? 0), 0);
-    expect(total("CNY", "value")).toBe(4550);
-    expect(total("USD", "value")).toBe(200);
+    expect(total("CNY", "value")).toBe(550);
+    expect(total("USD", "value")).toBe(0);
     expect(total("CNY", "paid")).toBe(1300);
     expect(body.monthly.reduce((sum: number, month: { paidInr: number }) => sum + month.paidInr, 0)).toBe(15600);
   });

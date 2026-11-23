@@ -58,9 +58,10 @@ Management user it can only be recovered with direct database access.
 
 ## Unified supplier ledger (0017, docs/unified-ledger.md)
 
-**Status (2026-11-21): the rehearsal and the rollback rehearsal are done on local copies of the 2026-11-21
-production snapshot. The production cutover is NOT approved.** Every production step below needs the owner's separate,
-written approval, given for that step.
+**Status (2026-11-23): the production cutover is done** (owner-approved; the ledger opened 2026-11-23 06:30:38 UTC;
+evidence and SUMMARY.txt in `backups/prod-pre-0017-20261123`; the owner waived the Neon backup branch, the read-only
+JSON snapshot is the backup). Sections 1-5 are the procedure as it was run. Every further production step needs the
+owner's separate, written approval, given for that step.
 
 Four kinds of work, never mixed:
 
@@ -104,8 +105,12 @@ nothing written, any of these that would change such an order's settling credits
 - a change of an existing order's date (ORD-5, `orderDate`);
 - a Management adjustment, of either sign and any date (LED-3, `entryDate`).
 
-Remaining limitations (details in docs/unified-ledger.md, "M8"): a void, a payment recorded with a past date, a raised
-value of an earlier open order, or the delete of an earlier open order can still change a final order's settlement;
+Since the owner review of 2026-11-23 (migration 0018), a receipt, a receipt delete, a rate correction, a supplier
+payment or a void that would change a protected order's settlement answers 409 `final_settlement_approval` and needs a
+Management reason; an order stays protected once recorded final (docs/unified-ledger.md, "Order value" item 6).
+
+Remaining limitations (details in docs/unified-ledger.md, "M8"): a raised value of an earlier open order, or the
+delete of an earlier open order, can still change a final order's settlement;
 "final" is read without a lock (a narrow window); a final order dated in the future blocks the negative adjustments
 that would take its credits until its date is corrected; a held account's orders are not checked while held.
 
@@ -172,7 +177,7 @@ show that anything ran in production.
   (PO-1134647: the 270.14 excess; 6422 and 6423: SUP-004's genuine 25,000 receipt settles them oldest first.)
 - **Rollback rehearsal:** `rollback-a8/SUMMARY.txt` in the snapshot folder (section 5).
 
-### 4. Production cutover (in this order; owner approval required, not given yet)
+### 4. Production cutover (in this order; owner-approved and run on 2026-11-23)
 
 `<approved>` is the approved baseline file, `<sha>` its approved sha256, `<expect>` the approved list (one
 `--expect <PO>=<legacy settled>:<ledger settled>` per difference; for the 2026-11-21 rehearsal the three above), and
@@ -261,3 +266,44 @@ refused (exit 3) the first five and changed nothing.
 
 **Limits.** The rollback removes the ledger tables and every posting in them (a later cutover backfills again from
 the legacy records). It does not undo deploys: steps 5 and 6 do. It cannot recover from anything past the boundary.
+
+### 6. Revaluation to received quantity (owner rules of 2026-11-23; production NOT approved yet)
+
+Order value becomes received quantity x rate (docs/unified-ledger.md). The release posts one `order_adjustment` per
+changed order. **Fix-forward only:** once applied, nothing rolls it back (the rollback boundary of section 5 was
+crossed when the ledger opened).
+
+Local rehearsal (no production access), as section 2, on a new isolated local database restored from a fresh read-only
+snapshot:
+
+1. Restore at 0016, migrate 0017, run the **released** backfill and `--open` (production's state), then switch to the
+   new release's checkout.
+2. `npx tsx scripts/ledger-revalue-received.ts` (preview, rolled back): every order's value before and after and the
+   postings; it must match the impact report re-run on that snapshot.
+3. `--close`, then `npx tsx scripts/ledger-revalue-received.ts --apply --database <name> --note "who, why"`; a rerun
+   posts 0; `scripts/ledger-reconcile.ts --baseline ... --compare-legacy` lists the legacy differences under the new
+   values: they are the `--expect` list the owner approves with both amounts; `--open` with it.
+
+Migration 0018 (`final_cost_protections`, additive) is applied with the same `npm run db:migrate` before the
+deploy; `db-status` then shows 19 migrations. It changes no existing row and starts empty: the revaluation `--apply`
+records every order final before or after it, in every account not held, so the reconciliation's
+`final-protections` check passes. Reconcile before that apply fails that check (expected). After 0018,
+`scripts/rollback/0017-down.sql` refuses (roll forward only).
+
+Production, in a maintenance window (data entry paused; the owner approves the expect list first):
+
+1. Pause data entry; fresh read-only snapshot; rehearse it locally as above (new isolated database).
+2. `npx tsx scripts/ledger-reconcile.ts --close "reason" --database <name>`: money writes and receipts answer 503.
+   Then `npm run db:migrate` (0018) and `scripts/db-status.ts`: 19 migrations.
+3. Deploy the backend (merge to `main`), wait for Render; deploy the frontend, wait for Vercel.
+4. Preview, then `--apply --database <name> --note "who, why"`; it refuses unless the ledger is in maintenance and
+   when a final landed-cost settlement would change. A rerun posts 0.
+5. Reconcile with the approved baseline and the approved `--expect` list, then `--open` with them.
+6. Resume data entry.
+
+**Rehearsed 2026-11-23** on `mr_garments_a11` (the cutover snapshot, released backfill, opened), evidence in
+`backups/prod-pre-0017-20261123/validation-a11`: preview 40 postings, every order as the impact report; apply refused
+while live and without `--note`; 40 postings dated 2026-11-23; rerun 0; payments, receipts, orders, lines, advance
+entries, holds and the 51 backfill postings unchanged; reconcile 10/10, baseline unchanged; 7 legacy differences
+(`--expect 6422=0:19821.32 --expect PO-11218=8350:8620.14 --expect 6423=0:5178.68 --expect 0001970=2484:0
+--expect 0010018=10197:0 --expect 0000817=126650:0 --expect 0001971=4641:0`); `--open` with them opened.

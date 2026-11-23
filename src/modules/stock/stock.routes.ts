@@ -19,11 +19,15 @@ import {
   TERMS,
   users,
 } from "../../db/schema";
-import { conflict, notFound, validationFailed } from "../../http/errors";
+import { conflict, HttpError, notFound, validationFailed } from "../../http/errors";
 import { parse } from "../../http/validate";
 import { atLeast, effectiveAccess } from "../../permissions/matrix";
 import type { RouteContext } from "../context";
-import { loadLedger } from "../ledger/ledger";
+import type { Database } from "../../db/client";
+import type { Role } from "../../db/schema";
+import { guardFinalSettlements } from "../costs/landed-cost";
+import { assertLedgerLive, isHeld, loadLedger, lockAccount, syncOrderValue } from "../ledger/ledger";
+import { orderMoney } from "../orders/money";
 import { unitSymbol } from "../orders/orders.routes";
 import { day, notify, qty } from "../notifications/notify";
 import { joined } from "../orders/order-detail.routes";
@@ -34,6 +38,12 @@ import { isUuid } from "../stages/common";
 // CON-1 GET /containers, CON-2 GET /containers/options, CON-3 POST /containers (docs/live-screens-contracts.md).
 
 export const MESSAGES = {
+  /** A receipt changes the order's value (received quantity x rate, owner rule of 2026-11-23): a money write. */
+  receiptMaintenance: "Receipts change what the supplier is owed, and supplier money is paused for maintenance. Try again later.",
+  finalSettlement: (pos: string[], deleting: boolean) =>
+    `${deleting ? "Deleting this receipt" : "This receipt"} changes the payments that settle ${joined(pos)}, whose landed cost is already final. A Management user must approve it with a reason.`,
+  approvalNotAllowed: "Only Management can approve a change to a final landed cost.",
+  approvalReason: "Enter the reason for approving this change (up to 500 characters).",
   order: "Choose an order from the list.",
   receivedOn: "Enter the date received.",
   receivedOnFuture: "The received date can't be after today.",
@@ -95,7 +105,50 @@ const newReceipt = z.strictObject({
     .max(50, MESSAGES.notOnOrder)
     .refine(distinctLines, MESSAGES.duplicateLine)
     .refine((lines) => lines.some((line) => line.quantity > 0), MESSAGES.nothingReceived),
+  /** Only after a 409 final_settlement_approval: a Management user's reason (owner rule of 2026-11-23, 6). */
+  finalSettlementApproval: z.strictObject({ reason: z.string({ error: MESSAGES.approvalReason }).trim().min(1, MESSAGES.approvalReason).max(500, MESSAGES.approvalReason) }).optional(),
 });
+const receiptDelete = z.strictObject({ finalSettlementApproval: newReceipt.shape.finalSettlementApproval });
+
+type ValueOrder = { id: string; po: string; supplierId: string; currency: string; exchangeRate: number | null; orderDate: string };
+type Approver = { id: string; role: Role; stages: readonly number[] };
+
+/**
+ * REC-3 and REC-4: a receipt changes its order's value (received quantity x rate, owner rule of 2026-11-23), so the
+ * receipt and the value's difference (one order_adjustment, ledger.ts syncOrderValue, dated today) commit together;
+ * `write` adds or deletes the receipt. A held account (D4) keeps the receipt and posts nothing: the deferred value is
+ * posted once the hold is released (scripts/ledger-revalue-received.ts). M8: a change that re-settles an order whose
+ * landed cost is final needs a Management approval; its reason is kept on the posting with the approver and the time
+ * (notes, created_by, created_at), and is refused (409) without one.
+ */
+async function withReceiptValue(
+  tx: Pick<Database, "select" | "insert" | "execute">,
+  order: ValueOrder,
+  user: Approver,
+  approval: { reason: string } | undefined,
+  deleting: boolean,
+  write: () => Promise<void>,
+) {
+  if (await isHeld(tx, order.supplierId, order.currency)) {
+    await write();
+    return { deferred: true as const };
+  }
+  await assertLedgerLive(tx, MESSAGES.receiptMaintenance);
+  if (approval && !atLeast(effectiveAccess(user.role, user.stages, "payments"), "Full")) throw new HttpError(403, "forbidden", MESSAGES.approvalNotAllowed);
+  await lockAccount(tx, order.supplierId, order.currency);
+  const finalChanged = await guardFinalSettlements(tx, order.supplierId, order.currency);
+  await write();
+  const posted = await syncOrderValue(tx, order, user.id, approval ? `Management approval (final landed cost): ${approval.reason}` : "");
+  const changed = await finalChanged();
+  if (changed.length > 0 && !approval) throw conflict("final_settlement_approval", MESSAGES.finalSettlement(changed, deleting));
+  return { deferred: false as const, changeCny: posted.changeCny, balanceBefore: posted.balanceBefore, balanceAfter: posted.balanceAfter, finalOrders: changed };
+}
+/** The ledger part of a REC-3/REC-4 response, for a user with payments View only. */
+const ledgerOf = (order: ValueOrder, result: Awaited<ReturnType<typeof withReceiptValue>>) =>
+  result.deferred
+    ? { supplierId: order.supplierId, currency: order.currency, deferred: true }
+    : { supplierId: order.supplierId, currency: order.currency, deferred: false, changeCny: result.changeCny, balanceBefore: result.balanceBefore, balanceAfter: result.balanceAfter, finalOrders: result.finalOrders };
+const orderForValue = { id: orders.id, po: orders.poNumber, supplierId: orders.supplierId, currency: orders.currency, exchangeRate: orders.exchangeRate, orderDate: orders.orderDate };
 
 const newContainer = z.strictObject({
   number: z.string({ error: MESSAGES.number }).trim().min(1, MESSAGES.number),
@@ -146,7 +199,6 @@ const loadedFrom = <L extends { quantity: number | null; received: number; loade
 
 // Aliases render as their bare name inside sql``, so their FROM clauses name the table first.
 const earlier = alias(receipts, "earlier");
-const allLines = alias(orderLines, "all_lines");
 const mainLine = and(eq(orderLines.orderId, orders.id), eq(orderLines.position, 0));
 
 export function stockRoutes({ db }: RouteContext) {
@@ -247,10 +299,9 @@ export function stockRoutes({ db }: RouteContext) {
         supplierId: orders.supplierId,
         // Not money: the currency of the (possibly withheld) amounts.
         currency: orders.currency,
-        orderValueCny: money
-          ? sql<number>`(select coalesce(round(sum(${allLines.quantity} * ${allLines.rateCny}), 2), 0) from ${orderLines} ${allLines}
-          where ${allLines.orderId} = ${orders.id})`.mapWith(Number)
-          : hidden(),
+        // Received quantity x rate (orders/money.ts orderMoney, the one definition), and the PO value for reference.
+        orderValueCny: money ? orderMoney.orderValueCny : hidden(),
+        poValueCny: money ? orderMoney.poValueCny : hidden(),
         orderLineId: orderLines.id,
         item: items.name,
         unit: unitSymbol,
@@ -276,10 +327,12 @@ export function stockRoutes({ db }: RouteContext) {
 
   // REC-3. One transaction with the order row locked (CON-3 and REC-4 lock it too). A line may receive more than was
   // ordered, since suppliers deliver more at times (2026-11-06): nothing caps the quantity, and short is never negative.
+  // The receipt raises the order's value: its difference is posted in the same transaction (withReceiptValue).
   router.post("/receipts", requirePermission("receiving", "Enter"), async (req, res) => {
     const input = parse(newReceipt, req.body);
-    const id = await db.transaction(async (tx) => {
-      const order = (await tx.select({ id: orders.id, stage: orders.stage }).from(orders).where(eq(orders.id, input.orderId)).for("update"))[0];
+    const money = atLeast(effectiveAccess(req.user!.role, req.user!.stages, "payments"), "View");
+    const { id, order, value } = await db.transaction(async (tx) => {
+      const order = (await tx.select({ ...orderForValue, stage: orders.stage }).from(orders).where(eq(orders.id, input.orderId)).for("update"))[0];
       if (!order) throw validationFailed({ orderId: MESSAGES.order });
       if (order.stage > 2) throw conflict("order_not_receivable", MESSAGES.notReceivable);
 
@@ -304,9 +357,12 @@ export function stockRoutes({ db }: RouteContext) {
       if (!problems.lines && short.length > 0 && !input.shortRemark) problems.shortRemark = MESSAGES.shortRemark;
       if (Object.keys(problems).length > 0) throw validationFailed(problems);
 
-      const { lines: bodyLines, ...values } = input;
-      const created = (await tx.insert(receipts).values({ ...values, receivedBy: req.user!.id }).returning({ id: receipts.id }))[0]!;
-      await tx.insert(receiptLines).values(bodyLines.map((line) => ({ ...line, receiptId: created.id })));
+      const { lines: bodyLines, finalSettlementApproval, ...values } = input;
+      let created = { id: "" };
+      const value = await withReceiptValue(tx, order, req.user!, finalSettlementApproval, false, async () => {
+        created = (await tx.insert(receipts).values({ ...values, receivedBy: req.user!.id }).returning({ id: receipts.id }))[0]!;
+        await tx.insert(receiptLines).values(bodyLines.map((line) => ({ ...line, receiptId: created.id })));
+      });
       if (order.stage === 1) await tx.update(orders).set({ stage: 2 }).where(eq(orders.id, order.id));
       if (short.length > 0) {
         const { po, supplier } = (
@@ -326,9 +382,9 @@ export function stockRoutes({ db }: RouteContext) {
           href: (canView) => (canView("ordersView") ? `/orders/${encodeURIComponent(po)}/receiving` : "/receiving"),
         });
       }
-      return created.id;
+      return { id: created.id, order, value };
     });
-    res.status(201).json({ receipt: { id } });
+    res.status(201).json({ receipt: { id }, ...(money ? { ledger: ledgerOf(order, value) } : {}) });
   });
 
   // REC-4. Management only (receiving Full). One transaction with the order row locked, as REC-3 and CON-3 lock it, so
@@ -338,10 +394,11 @@ export function stockRoutes({ db }: RouteContext) {
   router.delete("/receipts/:id", requirePermission("receiving", "Full"), async (req, res) => {
     const id = String(req.params.id);
     if (!isUuid(id)) throw notFound("Receipt");
+    const input = parse(receiptDelete, req.body ?? {});
     const po = await db.transaction(async (tx) => {
       const found = (await tx.select({ orderId: receipts.orderId }).from(receipts).where(eq(receipts.id, id)))[0];
       if (!found) throw notFound("Receipt");
-      const order = (await tx.select({ id: orders.id, po: orders.poNumber }).from(orders).where(eq(orders.id, found.orderId)).for("update"))[0]!;
+      const order = (await tx.select(orderForValue).from(orders).where(eq(orders.id, found.orderId)).for("update"))[0]!;
       // Read again under the lock: a delete of the same receipt that got there first leaves nothing (404).
       const lines = await tx
         .select({ quantity: receiptLines.quantity, orderLineId: orderLines.id, received: receivedOf(), loaded: loadedOf(), item: items.name, unit: unitSymbol })
@@ -363,7 +420,10 @@ export function stockRoutes({ db }: RouteContext) {
         const goods = inContainers.map((line) => `${qty(line.fromIt, line.unit!)} of ${line.item}`);
         throw conflict("in_use", MESSAGES.receiptLoaded(goods, holding.map((container) => container.number)));
       }
-      await tx.delete(receipts).where(eq(receipts.id, id));
+      // The order's value falls by this receipt's goods: posted with the delete (withReceiptValue).
+      await withReceiptValue(tx, order, req.user!, input.finalSettlementApproval, true, async () => {
+        await tx.delete(receipts).where(eq(receipts.id, id));
+      });
       await settleStages(tx, [order.id]);
       return order.po;
     });

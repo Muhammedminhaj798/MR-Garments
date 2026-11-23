@@ -9,7 +9,9 @@ import { orders, payments, shippingAgents, supplierLedgerEntries, suppliers } fr
 import { conflict, HttpError, notFound, validationFailed } from "../../http/errors";
 import { parse } from "../../http/validate";
 import type { RouteContext } from "../context";
-import { assertLedgerLive, cents, fromCents, isHeld, loadLedger, MESSAGES as LEDGER, paymentQuery, paymentRow, postPaymentCredit, postPaymentVoid } from "../ledger/ledger";
+import { atLeast, effectiveAccess } from "../../permissions/matrix";
+import { guardFinalSettlements } from "../costs/landed-cost";
+import { assertLedgerLive, cents, fromCents, isHeld, loadLedger, lockAccount, MESSAGES as LEDGER, paymentQuery, paymentRow, postPaymentCredit, postPaymentVoid } from "../ledger/ledger";
 import { currencyOptions } from "../ledger/ledger.routes";
 import { money, notify } from "../notifications/notify";
 import { rateProblem } from "../orders/orders.routes";
@@ -66,7 +68,26 @@ const common = {
   /** The client's key for this submit (kept across its retries): a repeat returns the payment already recorded. */
   clientRequestId: z.uuid({ error: M.clientRequestId }),
 };
-const supplierPayment = z.strictObject({ supplierId: z.uuid({ error: M.supplier }), amount, currency: currencyCode(M.currency).optional(), ...common });
+const FINAL = {
+  payment: (pos: string[]) =>
+    `This payment's date puts it before the payments that settle ${joinedPos(pos)}, whose landed cost is already final, so it changes them. A Management user must approve it with a reason.`,
+  void: (pos: string[]) => `Voiding this payment changes the payments that settle ${joinedPos(pos)}, whose landed cost is already final. Give the reason for approving it.`,
+  notAllowed: "Only Management can approve a change to a final landed cost.",
+  approvalReason: "Enter the reason for approving this change (up to 500 characters).",
+};
+const joinedPos = (pos: string[]) => (pos.length > 1 ? `${pos.slice(0, -1).join(", ")} and ${pos.at(-1)}` : pos[0]!);
+const approvalNote = (approval: { reason: string } | undefined) => (approval ? `Management approval (final landed cost): ${approval.reason}` : "");
+/** A change to a protected final landed cost: 409 without the approval (the transaction rolls back), 403 from a non-Management approver. */
+function requireFinalApproval(changed: string[], approval: { reason: string } | undefined, approver: boolean, message: (pos: string[]) => string) {
+  if (changed.length === 0) return;
+  if (!approval) throw conflict("final_settlement_approval", message(changed));
+  if (!approver) throw new HttpError(403, "forbidden", FINAL.notAllowed);
+}
+/** Only after a 409 final_settlement_approval: a Management user's reason (owner review of 2026-11-23). */
+const finalSettlementApproval = z
+  .strictObject({ reason: z.string({ error: FINAL.approvalReason }).trim().min(1, FINAL.approvalReason).max(500, FINAL.approvalReason) })
+  .optional();
+const supplierPayment = z.strictObject({ supplierId: z.uuid({ error: M.supplier }), amount, currency: currencyCode(M.currency).optional(), ...common, finalSettlementApproval });
 const agentPayment = z.strictObject({
   orderId: z.uuid({ error: M.order }),
   payeeRole: z.literal("agent", { error: M.payeeRole }),
@@ -75,9 +96,10 @@ const agentPayment = z.strictObject({
   amountCny: amount,
   ...common,
 });
-const voidPayment = z.strictObject({ reason: z.string({ error: M.reason }).trim().min(1, M.reason).max(1000, M.reasonTooLong) });
+const voidPayment = z.strictObject({ reason: z.string({ error: M.reason }).trim().min(1, M.reason).max(1000, M.reasonTooLong), finalSettlementApproval });
 
 type Tx = Parameters<Parameters<Database["transaction"]>[0]>[0];
+
 type Stored = typeof payments.$inferSelect;
 
 /** One submit at a time per client key, so a double click can't record two payments (the second waits, then replays). */
@@ -115,7 +137,7 @@ export function paymentsRoutes({ db }: RouteContext) {
   const view = async (id: string) => paymentRow((await paymentQuery(db, eq(payments.id, id)))[0]!);
 
   /** PAY-2, supplier body: an orderless payment credited to the supplier's account in the payment's currency (D10). */
-  async function recordSupplierPayment(input: z.infer<typeof supplierPayment>, userId: string) {
+  async function recordSupplierPayment(input: z.infer<typeof supplierPayment>, userId: string, approver: boolean) {
     return db.transaction(async (tx) => {
       await assertLedgerLive(tx);
       await lockRequest(tx, input.clientRequestId);
@@ -147,6 +169,10 @@ export function paymentsRoutes({ db }: RouteContext) {
       const rate = rateProblem(currency, input.rateInr, M.rateInr);
       if (rate) problems.rateInr = rate;
       if (Object.keys(problems).length > 0) throw validationFailed(problems);
+      // M8 (owner review of 2026-11-23): a payment dated before the credits that settle a protected final landed cost
+      // re-prices it; that needs a Management approval with a reason, kept on the posting. A payment of today does not.
+      await lockAccount(tx, supplier.id, currency);
+      const finalChanged = await guardFinalSettlements(tx, supplier.id, currency);
       const [created] = await tx
         .insert(payments)
         .values({
@@ -166,7 +192,8 @@ export function paymentsRoutes({ db }: RouteContext) {
           createdBy: userId,
         })
         .returning({ id: payments.id });
-      await postPaymentCredit(tx, { id: created!.id, supplierId: supplier.id, currency, amount: input.amount, exchangeRate: rateInr, paidOn: input.paidOn }, userId);
+      await postPaymentCredit(tx, { id: created!.id, supplierId: supplier.id, currency, amount: input.amount, exchangeRate: rateInr, paidOn: input.paidOn }, userId, approvalNote(input.finalSettlementApproval));
+      requireFinalApproval(await finalChanged(), input.finalSettlementApproval, approver, FINAL.payment);
       await notify(tx, {
         kind: "payment-recorded",
         actorId: userId,
@@ -259,7 +286,7 @@ export function paymentsRoutes({ db }: RouteContext) {
   router.post("/payments", requirePermission("payments", "Enter"), async (req, res) => {
     const body = (req.body ?? {}) as Record<string, unknown>;
     if (typeof body === "object" && "supplierId" in body) {
-      const result = await recordSupplierPayment(parse(supplierPayment, body), req.user!.id);
+      const result = await recordSupplierPayment(parse(supplierPayment, body), req.user!.id, atLeast(effectiveAccess(req.user!.role, req.user!.stages, "payments"), "Full"));
       res.status(result.created ? 201 : 200).json({ payment: await view(result.id), ledger: await postedBalances(db, result.id) });
       return;
     }
@@ -274,7 +301,7 @@ export function paymentsRoutes({ db }: RouteContext) {
   router.delete("/payments/:id", requirePermission("payments", "Full"), async (req, res) => {
     const id = String(req.params.id);
     if (!isUuid(id)) throw notFound("Payment");
-    const { reason } = parse(voidPayment, req.body);
+    const { reason, finalSettlementApproval: approval } = parse(voidPayment, req.body);
     const userId = req.user!.id;
     const result = await db.transaction(async (tx) => {
       await assertLedgerLive(tx);
@@ -285,8 +312,13 @@ export function paymentsRoutes({ db }: RouteContext) {
       const supplierId = row.supplierId ?? order!.supplierId;
       const currency = row.currency ?? order!.currency;
       if (await isHeld(tx, supplierId, currency)) throw conflict("account_held", LEDGER.held);
+      // A supplier payment's void can take the credits that settle a protected final landed cost: approved or refused.
+      const supplierMoney = row.payeeRole === "supplier" && row.status === "paid";
+      if (supplierMoney) await lockAccount(tx, supplierId, currency);
+      const finalChanged = supplierMoney ? await guardFinalSettlements(tx, supplierId, currency) : null;
       await tx.update(payments).set({ voidedAt: new Date(), voidedBy: userId, voidReason: reason, updatedAt: new Date() }).where(eq(payments.id, id));
-      const posted = await postPaymentVoid(tx, id, userId, reason);
+      const posted = await postPaymentVoid(tx, id, userId, approval ? `${reason}; ${approvalNote(approval)}` : reason);
+      if (finalChanged) requireFinalApproval(await finalChanged(), approval, true, FINAL.void);
       return { row, po: order?.po ?? null, currency, posted };
     });
     // The voided row and its reversal are the record; this line says who voided it, as deletions were logged before.

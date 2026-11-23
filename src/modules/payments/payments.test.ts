@@ -4,7 +4,7 @@ import { eq } from "drizzle-orm";
 import { afterAll, beforeEach, describe, expect, it } from "vitest";
 
 import { items, notifications, payments, shippingAgents, supplierLedgerEntries, suppliers, users } from "../../db/schema";
-import { api, createTestContext, resetData, SEEDED, signInAs } from "../../test/harness";
+import { api, createTestContext, receiveOrder, resetData, SEEDED, signInAs } from "../../test/harness";
 import { MESSAGES } from "./payments.routes";
 
 // PAY-2 POST /payments (docs/unified-ledger.md): a supplier payment is recorded against the supplier and posted to its
@@ -38,6 +38,8 @@ beforeEach(async () => {
     .set("Cookie", management);
   expect(order.status).toBe(201);
   orderId = order.body.order.id;
+  // Received in full: worth ¥10,000 (received quantity x rate).
+  await receiveOrder(ctx, orderId);
 });
 
 const body = (overrides: object = {}) => ({

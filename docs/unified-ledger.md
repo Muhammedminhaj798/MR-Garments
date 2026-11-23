@@ -15,8 +15,8 @@ the backend implements and the frontend consumes. Where an older doc (supplier-a
   | --- | --- | --- | --- |
   | `payment` | + | PAY-2 (supplier), backfill (legacy supplier payments, legacy advance receipts) | `payment:<paymentId>` / `advance:<advanceEntryId>` |
   | `payment_void` | − | PAY-3 void | `payment:<paymentId>:void` |
-  | `order_debit` | − value | ORD-3, backfill | `order:<orderId>:debit` |
-  | `order_adjustment` | ± | ORD-5 when the lines change the value | `order:<orderId>:adj:<n>` |
+  | `order_debit` | − value (0 for a new order: nothing received) | ORD-3, backfill, a held account's order once released | `order:<orderId>:debit` |
+  | `order_adjustment` | ± | REC-3/REC-4 receipts, ORD-8 rate corrections, ORD-5 line changes, the revaluation script | `order:<orderId>:adj:<n>` |
   | `order_cancel` | + | ORD-6 before the delete | `order:<orderId>:cancel` |
   | `adjustment` | ± | LED-3 (Management) | `adjustment:<client uuid>` |
 
@@ -29,12 +29,97 @@ the backend implements and the frontend consumes. Where an older doc (supplier-a
   - Payments are never deleted, only **voided** (`voided_at`, `voided_by`, `void_reason`).
 - **Archive, read-only:** `supplier_advance_entries` (receipts are posted by link; allocation, reversal, excess and
   excess_return rows are never posted) and `supplier_deposits` + transactions.
-- **Order value** = round(Σ ordered quantity × line rate, 2), unchanged. Receiving never posts anything.
+- **Order value** (owner rules of 2026-11-23; supersedes D17): see "Order value: received quantity x rate" below.
 - Every posting goes through `postLedgerEntry` (`src/modules/ledger/ledger.ts`). It takes a per-account advisory lock,
   so the before/after balances it returns are exact.
 - **Exchange rates.** A posting copies its source's rate as it is: order snapshot for debits, adjustments and
   cancels; payment or receipt rate for credits and voids. **NULL stays NULL**, and INR shows as not set. A new
   non-INR payment or adjustment needs a rate; INR stores 1.
+
+### Order value: received quantity x rate (owner rules of 2026-11-23)
+
+Approved by the owner on 2026-11-23 for every order, historical and future, PO-11218 included; it supersedes D17
+("ordered quantity x rate, receiving never posts").
+
+1. **Order value** = round(Σ received quantity x line rate, 2). Received is every China goods receipt of the line
+   (`receipt_lines`, REC-3) added up; over-receipts count; India warehouse quantities never do. One SQL definition:
+   `src/modules/ledger/received.ts` (`receivedOfLine`, `lineValue`), used by the journal (`orderValueCents`), every
+   API (`orderMoney.orderValueCny`), landed cost, the reports, the backfill and the reconciliation.
+2. **PO value** = round(Σ ordered quantity x line rate, 2), reference only (`poValueCny` beside every `orderValueCny`,
+   `poValueCny` on lines, `poAmountCny` on RPT-5D lines, `openPos.poValue` on SUP-1). Never posted or settled.
+3. **Status `awaiting_goods`** ("Awaiting goods") for an order with nothing received, never "paid" because its value
+   is 0. Then unpaid / partly / paid as before.
+4. **Payments before goods** stay supplier credit (the account's positive balance). The Deposit Required milestone
+   counts only what FIFO settles to the order, so nothing counts before goods are received.
+5. **Held account** (D4): a receipt is recorded and posts nothing. The account's order values are posted when the
+   hold is released (its debit at the then received value, ledger.ts `syncAccountOrders`, the revaluation script).
+   Releasing a hold itself is not implemented: it needs the D4 decision on SUP-010's legacy deposits and receipt.
+6. **Final landed cost (M8):** a receipt added or deleted, an ORD-8 rate correction, a supplier payment (PAY-2,
+   for example one dated before the credits that settle a protected order) or a void (PAY-3) that would change the
+   settlement of a protected order is refused (409 `final_settlement_approval`, nothing written) unless a Management
+   user (payments Full) approves it with a reason (`finalSettlementApproval: { reason }`); the reason is in the
+   posting's `notes`, with the approver (`created_by`) and the time (`created_at`) on that immutable
+   `order_adjustment`, `payment` or `payment_void`. A non-Management approval answers 403. **Protected for good**
+   (owner review of 2026-11-23, migration 0018): an order is recorded in `final_cost_protections` (append-only: a
+   trigger refuses UPDATE and DELETE) by the write that makes it final, or the first write that finds it final:
+   every supplier payment, every clearing, transport and warehouse save of its container
+   (`recordFinalCostsOfContainer`), every guarded write of its account, and the revaluation script (every account).
+   The guard protects the recorded orders too. So an approved change that takes an order out of final (for example a
+   receipt on an earlier order that takes some of its credits, or a void) never removes its protection: every later
+   receipt, receipt delete, rate correction, void or payment that changes its settlement needs an approval again,
+   even one that settles it again. The reconciliation's `final-protections` check fails on any final order (of an
+   account not held) that is not recorded, and on a record whose supplier or currency is not its order's.
+7. **Rate corrections after receipt**: only ORD-8 (Management, a reason), posting received quantity x the rate change;
+   receipts and payments never change. Before any receipt, ORD-5 changes rates and quantities and posts nothing.
+8. **Revaluation postings** are dated the day they are posted, never backdated to a receipt date.
+9. **Fix-forward only:** a committed revaluation is not rolled back.
+
+Postings:
+
+- ORD-3 posts the order's `order_debit` at its value, which is 0 for a new order (nothing received). **Zero-value
+  postings are kept** (owner review of 2026-11-23): the journal holds one debit per live order and one cancellation per
+  deleted order (the reconciliation's "orders" and "deleted-orders" checks), keeping the order's journal history and
+  rate snapshot. They move no money; the statement shows them as "Order placed, nothing received" / "Order deleted,
+  nothing received" with "No change", and every statement export says so in its notes. None is rewritten.
+- REC-3 and REC-4 post the value's difference as one `order_adjustment` (key `order:<id>:adj:<n>`), dated today, in
+  the receipt's transaction: refused with 503 while the ledger is in maintenance ("Receipts change what the supplier
+  is owed, and supplier money is paused for maintenance. Try again later."). Response `ledger` (payments View only):
+  `{ supplierId, currency, deferred, changeCny?, balanceBefore?, balanceAfter?, finalOrders? }`.
+- An order whose debit was never posted (a held account's) gets its debit at its full value when synced.
+- The historical revaluation (`scripts/ledger-revalue-received.ts`) brings every non-held order to its received value
+  with one `order_adjustment` each (origin `app`, `created_by` null, notes "Revaluation to received quantity (owner
+  rule of 2026-11-23): <note>").
+
+On the 2026-11-23 cutover data (validated on a local copy, docs/operator-commands.md): 40 adjustments, SUP-010's
+order 0000066 has nothing posted to adjust (its received value is 0), every payment, receipt and backfill posting
+unchanged, and the balances of the impact report (`D:/SDEC/MR Garments/docs/received-value-impact-20261123`).
+
+### SUP-010 CNY: what is still undecided (D4, unchanged by the received-value rules)
+
+The whole account stays held: nothing of it is posted, it counts in no total, and new orders, payments and adjustments
+for it are refused (D18, 409 `account_held`). A receipt for it is recorded and posts nothing (rule 5). Its records, as
+the 2026-11-23 cutover snapshot holds them, are untouched:
+
+| Record | Details |
+| --- | --- |
+| Order 0000066 | 24 Oct 2026, stage 1, 6 lines, 26 pcs, PO value ¥189.40, nothing received (order value ¥0) |
+| Deposit payment 90aaf606 | ¥1,050, paid 24 Oct 2026, by hand, rate 12.2, on order 0000066 |
+| Deposit payment b8ffb1a0 | ¥12,000, paid 18 Nov 2026, Alipay, rate 12.2, on order 0000066 |
+| Deposit payment 619e56c7 | ¥15,000, paid 18 Nov 2026, Alipay, rate 12.2, on order 0000066 |
+| Legacy advance receipt 4611a606 | ¥12,000, 19 Nov 2026, Alipay, rate 12.2, no order |
+
+Undecided, for the owner (each needs a written decision before any release):
+
+1. Which of the three deposits are genuine payments to the supplier, and whether any is a duplicate or a test entry.
+2. Whether receipt 4611a606 (¥12,000, 19 Nov) is a separate payment or a second record of deposit b8ffb1a0 (¥12,000,
+   18 Nov), both by Alipay.
+3. Whether order 0000066's lines and rates are right: ¥189.40 for 26 pcs against up to ¥40,050 of recorded credits.
+   A correction needs the hold lifted first (ORD-5 refuses line changes on a held account).
+4. How the genuine credits are posted at release (as payment credits at their own dates and rate 12.2, as the backfill
+   posts history) and how the others are kept out (the receipt exclusion list, or voids), with the expected balance.
+5. The release itself, which no code path performs yet: removing the hold row, posting the account's legacy credits,
+   then the order values (`scripts/ledger-revalue-received.ts` posts 0000066's debit at its received value then), and a
+   reconciliation with an approved expect list for the account.
 
 ### Write-state guard
 
@@ -240,12 +325,18 @@ one, ordered CNY, USD, INR, then the rest.
 
 - **PAY-2 `POST /payments`.** Payments Enter. Guard. One of two bodies:
   - **Supplier** (the unified Record payment):
-    - Body: `{ supplierId, amount, currency?, paidOn, rateInr?, mode, reference?, notes?, clientRequestId /* uuid */ }`.
+    - Body: `{ supplierId, amount, currency?, paidOn, rateInr?, mode, reference?, notes?, clientRequestId /* uuid */, finalSettlementApproval?: { reason } }`.
     - Rules:
       - the currency defaults to the supplier's; it must be in `currencyOptions` (else 422 `currency`);
       - rate: none or 1 for INR, required otherwise (422 `rateInr`);
       - `paidOn` is not in the future;
-      - a held account answers 409 `account_held`.
+      - a held account answers 409 `account_held`;
+      - a payment that changes the settlement of a protected final landed cost (M8, "Order value" item 6) answers 409
+        `final_settlement_approval` ("This payment's date puts it before the payments that settle <POs>, whose landed
+        cost is already final, so it changes them. A Management user must approve it with a reason."), nothing
+        written, unless `finalSettlementApproval` is given by a payments Full user (403 otherwise); its reason is the
+        posting's `notes`. A payment of today never changes them (FIFO settles oldest first).
+    - Records every order of the account that is final after it (`final_cost_protections`).
     - Writes a `payments` row (`order_id` null, `supplier_id`, `currency`, `kind 'Payment'`, `payee` = supplier name,
       `payee_role 'supplier'`) and its `payment` posting.
     - Response: 201 `{ payment: PaymentRow, ledger: { supplierId, currency, balanceBefore, balanceAfter } }`.
@@ -257,7 +348,7 @@ one, ordered CNY, USD, INR, then the rest.
     - Never posted. Held order account answers 409.
   - An order-linked **supplier** body (`orderId` with `payeeRole: "supplier"`) answers **422** with
     `payeeRole: "Supplier payments are now recorded against the supplier. Reload the page."`.
-- **PAY-3 `DELETE /payments/:id`.** Payments Full. Guard. JSON body `{ reason }`.
+- **PAY-3 `DELETE /payments/:id`.** Payments Full. Guard. JSON body `{ reason, finalSettlementApproval?: { reason } }`.
   - Voids the payment. The row stays, with `voided_at`, `voided_by` and the reason. A posted payment also gets one
     `payment_void`.
   - Response: 200 `{ payment: PaymentRow, ledger: { supplierId, currency, balanceBefore, balanceAfter } | null }`.
@@ -265,8 +356,12 @@ one, ordered CNY, USD, INR, then the rest.
     - an already voided payment: 409 `already_voided`, nothing written;
     - a blank reason: 422 `reason`;
     - a held account: 409 `account_held`;
-    - an unknown id: 404.
-  - There are no cross-order effects.
+    - an unknown id: 404;
+    - a void of a supplier payment that changes the settlement of a protected final landed cost: 409
+      `final_settlement_approval` ("Voiding this payment changes the payments that settle <POs>, whose landed cost is
+      already final. Give the reason for approving it."), nothing written, unless `finalSettlementApproval` is given;
+      the `payment_void` notes are then "<reason>; Management approval (final landed cost): <approval reason>".
+  - Its only cross-order effect is the FIFO re-settlement of the account (guarded as above).
 - **PAY-1 `GET /payments`.** Payments View. `{ orders, payments, accounts, totals }`:
   - `orders`: `{ orderId, po, supplierId, supplier, currency, supplierRate, orderValueCny, ...SettlementFields, ...MilestoneFields, agentPaidCny, agentPaidInr, paidInr, nextDue }` (newest first);
   - `payments`: PaymentRow[], including orderless and voided rows, latest date first;
@@ -285,7 +380,7 @@ one, ordered CNY, USD, INR, then the rest.
 - **ORD-3 `POST /orders`.** Guard. A held supplier-currency answers 409 `account_held`.
   - `deposits[]` takes **agent payees only**. A supplier payee answers 422 `deposits`: "Record supplier payments with
     Record payment."
-  - Posts the order's debit in the same transaction.
+  - Posts the order's debit in the same transaction: its value, 0 for a new order (received quantity x rate).
   - Refused with 422 `orderDate` when the order would change the settlement of an order whose landed cost is final
     (M8, below): "This order date comes before <POs>, whose landed cost is already final: the order would take the
     payments that settle it. Choose a later order date." Nothing is written.
@@ -456,9 +551,8 @@ The release and rollback order is in `docs/operator-commands.md` ("Unified suppl
   refused (422 `entryDate`, nothing written) when it would change a final order's settlement; a backdated one may
   still change later-dated orders that are not final (owner decision 2026-11-21). Remaining limitations (not covered
   by these checks; known to the owner at the approval):
-  - an ORD-5 value increase or an ORD-6 delete of an earlier open order, a void, or a payment recorded with a past
-    date (PAY-2) can still move a final order's settlement. A void removes its payment and every adjustment is
-    recalculated without it, which can re-price or reopen orders, final ones included;
+  - an ORD-5 value increase or an ORD-6 delete of an earlier open order can still move a final order's settlement
+    (voids and payments are guarded since the owner review of 2026-11-23: item 6 of "Order value");
   - "final" is read from the clearing, transport and warehouse rows without locking them: a write that makes an order
     final while an ORD-3, ORD-5 or LED-3 is between its two projections is not seen by that check (a narrow window);
   - an order may be dated in the future (ORD-3 has no upper bound). A final order dated after today, settled by

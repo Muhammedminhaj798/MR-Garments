@@ -27,7 +27,21 @@ import { atLeast, effectiveAccess } from "../../permissions/matrix";
 import type { RouteContext } from "../context";
 import { ledgerOverview } from "../ledger/ledger.routes";
 import { guardFinalSettlements } from "../costs/landed-cost";
-import { assertLedgerLive, balancesOf, heldAccounts, isHeld, loadLedger, lockAccount, MESSAGES as LEDGER, newestPaymentsFirst, paymentQuery, paymentRow, postOrderDebit } from "../ledger/ledger";
+import {
+  assertLedgerLive,
+  balancesOf,
+  heldAccounts,
+  isHeld,
+  linePoValue,
+  lineValue,
+  loadLedger,
+  lockAccount,
+  MESSAGES as LEDGER,
+  newestPaymentsFirst,
+  paymentQuery,
+  paymentRow,
+  postOrderDebit,
+} from "../ledger/ledger";
 import { orderClosed, orderClosedOn } from "./closure";
 import { hiddenSettlement, orderMoney, orderSettlement, round2 } from "./money";
 
@@ -193,7 +207,7 @@ export const orderColumns = {
   currency: orders.currency,
   /** INR per 1 of `currency` when the order was placed (0012); null for older orders or a supplier without a rate then. */
   exchangeRate: orders.exchangeRate,
-  /** orderValueCny at the order's own rate, rounded in SQL as the payments' INR is; null without a rate. */
+  /** orderValueCny (received quantity × rate) at the order's own rate, rounded in SQL as the payments' INR is; null without a rate. */
   orderValueInr: sql<number | null>`round(${orderMoney.orderValueCny} * ${orders.exchangeRate}, 2)`.mapWith((value) => (value === null ? null : Number(value))),
   /** The supplier's rate now (null while not set): a new payment's default rate, never the order's. */
   supplierRate: suppliers.exchangeRate,
@@ -257,7 +271,9 @@ export function ordersRoutes({ db }: RouteContext) {
         stocked: row.stocked,
         closed: row.closed,
         closedOn: row.closedOn,
+        /** Received quantity × rate; poValueCny ordered quantity × rate (reference). */
         orderValueCny: row.orderValueCny,
+        poValueCny: row.poValueCny,
         ...(ledger ? orderSettlement(ledger.order(row.id), row) : hiddenSettlement(held!.has(`${row.supplierId} ${row.currency}`), row.depositRequiredCny)),
       })),
     );
@@ -279,7 +295,9 @@ export function ordersRoutes({ db }: RouteContext) {
         unit: unitSymbol,
         quantity: orderLines.quantity,
         rateCny: orderLines.rateCny,
-        valueCny: sql<number>`round(${orderLines.quantity} * ${orderLines.rateCny}, 2)`.mapWith(Number),
+        /** Received quantity × rate (the line's value); poValueCny is quantity × rate, for reference. */
+        valueCny: lineValue,
+        poValueCny: linePoValue,
         received: sql<number>`(select coalesce(sum(${receiptLines.quantity}), 0) from ${receiptLines} where ${ofLine})`.mapWith(Number),
         stocked: sql<number>`(select coalesce(sum(${warehouseReceiptLines.quantity}), 0) from ${warehouseReceiptLines}
           join ${warehouseReceipts} on ${warehouseReceipts.id} = ${warehouseReceiptLines.receiptId} and ${warehouseReceipts.status} = 'stocked'
@@ -465,6 +483,7 @@ export function ordersRoutes({ db }: RouteContext) {
         currency: row.currency,
         supplierRate: row.supplierRate,
         orderValueCny: row.orderValueCny,
+        poValueCny: row.poValueCny,
         ...orderSettlement(ledger.order(row.id), row),
         nextDue: row.nextDue,
       })),

@@ -19,6 +19,11 @@ begin
      or exists (select 1 from payments where order_id is null or voided_at is not null or client_request_id is not null) then
     raise exception 'rollback refused: the ledger has application-written records (roll forward only)';
   end if;
+  -- This script reverts 0017 only: with a later migration applied (0018 final_cost_protections, ...) it would leave the
+  -- migrator's history broken.
+  if exists (select 1 from drizzle.__drizzle_migrations where created_at > 1795155384570) then
+    raise exception 'rollback refused: a migration after 0017 is applied (roll forward only)';
+  end if;
 end
 $$;
 

@@ -11,6 +11,7 @@ import {
   orderLines,
   orders,
   payments,
+  receiptLines,
   supplierAdvanceEntries as advances,
   supplierLedgerEntries as e,
   supplierLedgerHolds as holds,
@@ -19,6 +20,7 @@ import {
 } from "../../db/schema";
 import { conflict, HttpError } from "../../http/errors";
 import { todayInIndia } from "../stages/common";
+import { receivedOfLine } from "./received";
 
 // The unified supplier ledger (migration 0017, docs/unified-ledger.md). The one place that writes the journal, holds the
 // write-state guard and the account holds, and derives every supplier balance and per-order settlement (the FIFO
@@ -169,24 +171,36 @@ export async function postLedgerEntry(tx: Tx, posting: Posting): Promise<PostRes
 export type LedgerOrder = { id: string; po: string; supplierId: string; currency: string; exchangeRate: number | null; orderDate: string };
 
 /** The order's value from its lines as they are now (round(Σ quantity × rate, 2)), in cents. */
+// The received-value SQL lives in a leaf module (./received), so orders/money.ts can use it at load time whichever
+// module a script enters first (ledger.ts and money.ts import each other through the routes).
+export { linePoValue, lineValue, receivedOfLine } from "./received";
+
+/** The order's value, the only one the journal holds: round(Σ received quantity × line rate, 2), in cents. */
 export async function orderValueCents(tx: Reader, orderId: string) {
   const [row] = await tx
-    .select({ total: sql<number>`round(coalesce(sum(${orderLines.quantity} * ${orderLines.rateCny}), 0), 2)`.mapWith(Number) })
+    .select({ total: sql<number>`round(coalesce(sum(${receivedOfLine} * ${orderLines.rateCny}), 0), 2)`.mapWith(Number) })
     .from(orderLines)
     .where(eq(orderLines.orderId, orderId));
   return cents(row!.total);
 }
 
-/** What the journal holds for the order (Σ of its order_* postings, negative), in cents. */
+/** What the journal holds for the order (Σ of its order_* postings, negative), in cents, and whether its debit exists. */
 async function postedOrderCents(tx: Reader, orderId: string) {
   const [row] = await tx
-    .select({ total: sql<number>`coalesce(sum(${e.amount}), 0)`.mapWith(Number), adjustments: sql<number>`count(*) filter (where ${e.entryType} = 'order_adjustment')`.mapWith(Number) })
+    .select({
+      total: sql<number>`coalesce(sum(${e.amount}), 0)`.mapWith(Number),
+      adjustments: sql<number>`count(*) filter (where ${e.entryType} = 'order_adjustment')`.mapWith(Number),
+      debits: sql<number>`count(*) filter (where ${e.entryType} = 'order_debit')`.mapWith(Number),
+    })
     .from(e)
     .where(and(eq(e.orderId, orderId), like(e.entryType, "order_%")));
-  return { cents: cents(row!.total), adjustments: row!.adjustments };
+  return { cents: cents(row!.total), adjustments: row!.adjustments, debits: row!.debits };
 }
 
-/** ORD-3: the order's debit, once (key `order:<id>:debit`), at the order's own rate snapshot (NULL kept). */
+/**
+ * ORD-3: the order's debit, once (key `order:<id>:debit`), at the order's own rate snapshot (NULL kept). A new order has
+ * nothing received, so its debit is 0; each receipt then posts the difference (`syncOrderValue`).
+ */
 export async function postOrderDebit(tx: Tx, order: LedgerOrder, userId: string) {
   const value = await orderValueCents(tx, order.id);
   const result = await postLedgerEntry(tx, {
@@ -205,13 +219,32 @@ export async function postOrderDebit(tx: Tx, order: LedgerOrder, userId: string)
 }
 
 /**
- * ORD-5 after its lines are written: posts the difference between the order's value now and what the journal holds, as
- * one `order_adjustment` (key `order:<id>:adj:<n>`, n counted under the order's row lock the caller holds). Nothing is
- * written when the value is unchanged, so a repeated edit posts nothing.
+ * After anything that changes the order's value (a receipt added or deleted, REC-3/REC-4; a line or rate change, ORD-5
+ * and ORD-8): posts the difference between the order's value now and what the journal holds, as one `order_adjustment`
+ * (key `order:<id>:adj:<n>`, n counted under the order's row lock the caller holds), dated the day it is posted (never
+ * backdated). Nothing is written when the value is unchanged, so a repeat posts nothing. An order whose debit was never
+ * posted (a held account's, deferred until the hold is released) gets its debit at its full value instead. `notes`
+ * carries an approval or correction reason; `userId` is the actor (null for an operator script).
  */
-export async function syncOrderValue(tx: Tx, order: LedgerOrder, userId: string) {
+export async function syncOrderValue(tx: Tx, order: LedgerOrder, userId: string | null, notes = "") {
   const value = await orderValueCents(tx, order.id);
   const posted = await postedOrderCents(tx, order.id);
+  if (posted.debits === 0) {
+    const result = await postLedgerEntry(tx, {
+      supplierId: order.supplierId,
+      currency: order.currency,
+      entryType: "order_debit",
+      amount: fromCents(-value),
+      exchangeRate: order.exchangeRate,
+      entryDate: order.orderDate,
+      orderId: order.id,
+      poNumber: order.po,
+      idempotencyKey: `order:${order.id}:debit`,
+      notes,
+      createdBy: userId,
+    });
+    return { changeCny: fromCents(-value), balanceBefore: result.balanceBefore, balanceAfter: result.balanceAfter, entry: result.entry };
+  }
   const delta = -value - posted.cents;
   if (delta === 0) {
     const balance = await accountBalance(tx, order.supplierId, order.currency);
@@ -227,9 +260,31 @@ export async function syncOrderValue(tx: Tx, order: LedgerOrder, userId: string)
     orderId: order.id,
     poNumber: order.po,
     idempotencyKey: `order:${order.id}:adj:${posted.adjustments + 1}`,
+    notes,
     createdBy: userId,
   });
   return { changeCny: fromCents(delta), balanceBefore: result.balanceBefore, balanceAfter: result.balanceAfter, entry: result.entry };
+}
+
+/**
+ * Brings every order of one account to its received value (`syncOrderValue` per order, oldest first), under the
+ * account lock: the historical revaluation (scripts/ledger-revalue-received.ts) and, once a hold is released, the
+ * deferred receipts of that account. Idempotent: a second run posts nothing. The caller checks the hold and the state.
+ */
+export async function syncAccountOrders(tx: Tx, supplierId: string, currency: string, userId: string | null, notes: string) {
+  await lockAccount(tx, supplierId, currency);
+  const rows = await tx
+    .select({ id: orders.id, po: orders.poNumber, exchangeRate: orders.exchangeRate, orderDate: orders.orderDate })
+    .from(orders)
+    .where(and(eq(orders.supplierId, supplierId), eq(orders.currency, currency)))
+    .orderBy(asc(orders.orderDate), asc(orders.createdAt), asc(orders.id))
+    .for("update");
+  const changes: { orderId: string; po: string; changeCny: number; entryId: string | null; idempotencyKey: string | null }[] = [];
+  for (const row of rows) {
+    const result = await syncOrderValue(tx, { ...row, supplierId, currency }, userId, notes);
+    if (result.entry) changes.push({ orderId: row.id, po: row.po, changeCny: result.changeCny, entryId: result.entry.id, idempotencyKey: result.entry.idempotencyKey });
+  }
+  return changes;
 }
 
 /** ORD-6 before the delete: gives back everything the journal holds for the order (key `order:<id>:cancel`). */
@@ -253,7 +308,7 @@ export async function postOrderCancel(tx: Tx, order: LedgerOrder, userId: string
 export type LedgerPayment = { id: string; supplierId: string; currency: string; amount: number; exchangeRate: number | null; paidOn: string };
 
 /** PAY-2: a supplier payment's credit, once (key `payment:<id>`), at the payment's typed rate. */
-export function postPaymentCredit(tx: Tx, payment: LedgerPayment, userId: string) {
+export function postPaymentCredit(tx: Tx, payment: LedgerPayment, userId: string, notes = "") {
   return postLedgerEntry(tx, {
     supplierId: payment.supplierId,
     currency: payment.currency,
@@ -263,6 +318,7 @@ export function postPaymentCredit(tx: Tx, payment: LedgerPayment, userId: string
     entryDate: payment.paidOn,
     paymentId: payment.id,
     idempotencyKey: `payment:${payment.id}`,
+    notes,
     createdBy: userId,
   });
 }
@@ -295,7 +351,8 @@ export async function postPaymentVoid(tx: Tx, paymentId: string, userId: string,
 // ---------------------------------------------------------------------------------------------------------------------
 // The FIFO settlement projection (read-only, never stored)
 
-export type PaymentStatus = "unpaid" | "partly" | "paid";
+/** `awaiting_goods`: nothing received yet (owner rule of 2026-11-23), never "paid" just because its value is 0. */
+export type PaymentStatus = "awaiting_goods" | "unpaid" | "partly" | "paid";
 
 /** One piece of a credit that settles (part of) an order: the landed cost's goods payments and the order's "settled by". */
 export type SettlementSlice = {
@@ -366,7 +423,8 @@ type EntryRow = {
   idempotencyKey?: string;
 };
 
-type OrderRow = { id: string; supplierId: string; currency: string; orderDate: string; createdKey: string };
+/** `received`: the order's total received quantity (0: awaiting goods); left out, the status follows the value only. */
+type OrderRow = { id: string; supplierId: string; currency: string; orderDate: string; createdKey: string; received?: number };
 
 /** Chronological: business date, then the moment recorded, then id (stable). */
 const byText = (x: string, y: string) => (x < y ? -1 : x > y ? 1 : 0);
@@ -516,7 +574,7 @@ export function projectAccount(entries: EntryRow[], orderRows: OrderRow[]) {
       valueCny: fromCents(value),
       settledCny: fromCents(settled),
       outstandingCny: fromCents(value - settled),
-      paymentStatus: value === 0 || settled === value ? "paid" : settled === 0 ? "unpaid" : "partly",
+      paymentStatus: order.received === 0 ? "awaiting_goods" : value === 0 || settled === value ? "paid" : settled === 0 ? "unpaid" : "partly",
       settledInr: inr,
       slices,
     });
@@ -605,7 +663,7 @@ export async function loadLedger(db: Reader, scope: { supplierIds?: string[] } =
     .from(e)
     .where(ofSuppliers(e.supplierId))
     .orderBy(asc(e.entryDate), asc(e.createdAt), asc(e.id));
-  const orderRowList = await db
+  const orderSelect = await db
     .select({
       id: orders.id,
       supplierId: orders.supplierId,
@@ -615,6 +673,16 @@ export async function loadLedger(db: Reader, scope: { supplierIds?: string[] } =
     })
     .from(orders)
     .where(ofSuppliers(orders.supplierId));
+  // Each order's received quantity (0 = awaiting goods), from the same China receipts as its value.
+  const receivedRows = await db
+    .select({ orderId: orderLines.orderId, received: sql<number>`coalesce(sum(${receiptLines.quantity}), 0)`.mapWith(Number) })
+    .from(receiptLines)
+    .innerJoin(orderLines, eq(orderLines.id, receiptLines.orderLineId))
+    .innerJoin(orders, eq(orders.id, orderLines.orderId))
+    .where(ofSuppliers(orders.supplierId))
+    .groupBy(orderLines.orderId);
+  const receivedOf = new Map(receivedRows.map((row) => [row.orderId, row.received]));
+  const orderRowList = orderSelect.map((row) => ({ ...row, received: receivedOf.get(row.id) ?? 0 }));
   const holdRows = await db.select({ supplierId: holds.supplierId, currency: holds.currency }).from(holds).where(ofSuppliers(holds.supplierId));
   const held = new Set(holdRows.map((row) => accountKey(row.supplierId, row.currency)));
   const keys = new Set([...entryRows.map((row) => accountKey(row.supplierId, row.currency)), ...held]);

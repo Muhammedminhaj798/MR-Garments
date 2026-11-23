@@ -1,7 +1,7 @@
 import { eq } from "drizzle-orm";
 
 import { items, locations, orderLines, orders, receiptLines, receipts, shippingAgents, suppliers, users } from "../../db/schema";
-import type { TestContext } from "../../test/harness";
+import { postOrderValue, type TestContext } from "../../test/harness";
 import { backfillLedger } from "../ledger/backfill";
 
 // Test-only helpers: the orders endpoint lives in another module, so stock tests insert orders and receipts directly.
@@ -50,7 +50,10 @@ export async function makeOrder(
   return { id: order.id, po, lineIds };
 }
 
-/** A receipt written straight to the database (for container tests); returns its id. */
+/**
+ * A receipt written straight to the database (for container tests); returns its id. As REC-3 does, the order's value
+ * difference (received quantity x rate) is posted with it, unless the account is held.
+ */
 export async function receive(ctx: TestContext, orderId: string, lines: { orderLineId: string; quantity: number }[]) {
   const receipt = (
     await ctx.db
@@ -65,5 +68,6 @@ export async function receive(ctx: TestContext, orderId: string, lines: { orderL
       .returning({ id: receipts.id })
   )[0]!;
   await ctx.db.insert(receiptLines).values(lines.map((line) => ({ ...line, receiptId: receipt.id })));
+  await postOrderValue(ctx.db, orderId);
   return receipt.id;
 }

@@ -2,10 +2,12 @@ import { type SQL, sql } from "drizzle-orm";
 
 import { orderLines, orders, payments } from "../../db/schema";
 import { cents, depositMilestone, fromCents, type OrderSettlement, settlementFields } from "../ledger/ledger";
+import { receivedOfLine } from "../ledger/received";
 
 // The money of the order in the row (`orders.id`), as correlated subqueries. Supplier money is the unified ledger's
 // (docs/unified-ledger.md): every order's settled, outstanding and payment status come from the FIFO projection
-// (`loadLedger`), never from payments named on the order. What stays here is the order's value, its shipping-agent
+// (`loadLedger`), never from payments named on the order. What stays here is the order's value (received quantity ×
+// rate) and PO value (ordered quantity × rate, reference only), its shipping-agent
 // payments (sea freight: never in the ledger) and its due rows. A voided payment counts in none of them.
 //
 // The fragments correlate on `orders.id`, so they belong in a select FROM orders that has at least one join (in a
@@ -30,7 +32,13 @@ const sumInr = (where: SQL) =>
 const linesOfOrder = sql`${orderLines.orderId} = ${orders.id}`;
 
 export const orderMoney = {
-  orderValueCny: sql<number>`(select round(coalesce(sum(${orderLines.quantity} * ${orderLines.rateCny}), 0), 2) from ${orderLines} where ${linesOfOrder})`.mapWith(Number),
+  /**
+   * The order's value (owner rule of 2026-11-23): round(Σ received quantity × line rate, 2), received from the China
+   * goods receipts (ledger.ts `receivedOfLine`, the one definition). It is what the journal holds for the order.
+   */
+  orderValueCny: sql<number>`(select round(coalesce(sum(${receivedOfLine} * ${orderLines.rateCny}), 0), 2) from ${orderLines} where ${linesOfOrder})`.mapWith(Number),
+  /** The PO value, for reference only: round(Σ ordered quantity × line rate, 2). Never posted, never settled. */
+  poValueCny: sql<number>`(select round(coalesce(sum(${orderLines.quantity} * ${orderLines.rateCny}), 0), 2) from ${orderLines} where ${linesOfOrder})`.mapWith(Number),
   /** Paid to shipping agents for the order: sea freight (landed cost), never the supplier's money. */
   agentPaidCny: sumCny(paidToAgent),
   agentPaidInr: sumInr(paidToAgent),

@@ -33,6 +33,8 @@ import {
   assertLedgerLive,
   heldAccounts,
   isHeld,
+  linePoValue,
+  lineValue,
   loadLedger,
   lockAccount,
   MESSAGES as LEDGER,
@@ -66,7 +68,24 @@ const EDIT = {
    */
   supplierFixed: "An order's supplier can't change: its value is posted to this supplier's account. Place a new order for the other supplier.",
   currencyFixed: (currency: string) => `An order's currency can't change: its rates, value and payments are in ${currency}. Place a new order in the other currency.`,
+  /** ORD-8 (owner rule of 2026-11-23, 7): a Management rate correction once goods are received. */
+  correctionReason: "Enter the reason for this rate correction (up to 500 characters).",
+  correctionUnchanged: "Change the rate of at least one line.",
+  correctionNotReceived: "Only a line with goods received is corrected here. Change the other lines on Edit order.",
+  correctionFinal: (pos: string[]) =>
+    `This rate correction changes the payments that settle ${joined(pos)}, whose landed cost is already final. A Management user must approve it with a reason.`,
+  approvalReason: "Enter the reason for approving this change (up to 500 characters).",
 };
+const rateCorrection = z.strictObject({
+  lines: z
+    .array(z.strictObject({ id: z.uuid({ error: EDIT.lineChanged }), rateCny: line.shape.rateCny }), { error: EDIT.lineChanged })
+    .min(1, EDIT.correctionUnchanged)
+    .max(50, EDIT.lineChanged)
+    .refine((lines) => new Set(lines.map((entry) => entry.id)).size === lines.length, EDIT.lineChanged),
+  reason: z.string({ error: EDIT.correctionReason }).trim().min(1, EDIT.correctionReason).max(500, EDIT.correctionReason),
+  /** Only after a 409 final_settlement_approval: the approval of a change to a protected final landed cost. */
+  finalSettlementApproval: z.strictObject({ reason: z.string({ error: EDIT.approvalReason }).trim().min(1, EDIT.approvalReason).max(500, EDIT.approvalReason) }).optional(),
+});
 const orderEdit = z.strictObject({
   /**
    * The order's new PO number (docs/contracts.md ORD-5), as ORD-3 takes one: any format, trimmed, 1-50 characters,
@@ -120,7 +139,9 @@ export function orderDetailRoutes({ db }: RouteContext) {
           unit: unitSymbol,
           quantity: orderLines.quantity,
           rateCny: orderLines.rateCny,
-          valueCny: sql<number>`round(${orderLines.quantity} * ${orderLines.rateCny}, 2)`.mapWith(Number),
+          /** Received quantity × rate (the line's value); poValueCny is quantity × rate, for reference. */
+          valueCny: lineValue,
+          poValueCny: linePoValue,
           received,
           loaded,
         })
@@ -241,7 +262,10 @@ export function orderDetailRoutes({ db }: RouteContext) {
       stocked: row.stocked,
       closed: row.closed,
       closedOn: row.closedOn,
+      /** Received quantity × rate: the value the ledger holds and settles. */
       orderValueCny: row.orderValueCny,
+      /** Ordered quantity × rate, for reference only (never posted or settled). */
+      poValueCny: row.poValueCny,
       // The FIFO projection of the supplier's account (settled, outstanding, status, goods INR), the Deposit Required
       // milestone, the agent payments (sea freight) and paidInr; null without payments View.
       ...(ledger ? orderSettlement(settlement, row) : hiddenSettlement(held!.has(`${row.supplierId} ${row.currency}`), row.depositRequiredCny)),
@@ -373,6 +397,60 @@ export function orderDetailRoutes({ db }: RouteContext) {
     // The account's balances are money: only with payments View (ORD-5 itself needs ordersEdit Enter).
     const canPay = atLeast(effectiveAccess(req.user!.role, req.user!.stages, "payments"), "View");
     res.json(order.ledger ? { order: order.order, ledger: canPay ? order.ledger : null } : { order: order.order });
+  });
+
+  // ORD-8. Management (payments Full): a rate correction once goods are received (owner rule of 2026-11-23, 7), when
+  // ORD-5 no longer changes the lines. Only received lines; the corrected rates are written and the value's difference
+  // (received quantity x the rate change) is posted as one order_adjustment, dated today, whose notes keep the reason
+  // and each rate before and after; the posting keeps the actor and the time (created_by, created_at). Receipts and
+  // payments never change. Refused in maintenance (503) and while the account is held (409). A correction that changes
+  // the settlement of a protected final landed-cost order answers 409 final_settlement_approval unless the body carries
+  // finalSettlementApproval { reason }, kept in the posting's notes; the response names those orders.
+  router.post("/orders/:po/rate-corrections", requirePermission("payments", "Full"), async (req, res) => {
+    const po = String(req.params.po);
+    const input = parse(rateCorrection, req.body);
+    const result = await db.transaction(async (tx) => {
+      const row = (await tx.select().from(orders).where(byPo(po)).for("update"))[0];
+      if (!row) throw notFound("Order");
+      await assertLedgerLive(tx);
+      if (await isHeld(tx, row.supplierId, row.currency)) throw conflict("account_held", LEDGER.held);
+      const saved = await tx
+        .select({ id: orderLines.id, rateCny: orderLines.rateCny, received, item: items.name })
+        .from(orderLines)
+        .innerJoin(items, eq(items.id, orderLines.itemId))
+        .where(eq(orderLines.orderId, row.id));
+      const byId = new Map(saved.map((entry) => [entry.id, entry]));
+      if (input.lines.some((entry) => !byId.has(entry.id))) throw validationFailed({ lines: EDIT.lineChanged });
+      if (input.lines.some((entry) => byId.get(entry.id)!.received === 0)) throw validationFailed({ lines: EDIT.correctionNotReceived });
+      const changed = input.lines.filter((entry) => Math.round(byId.get(entry.id)!.rateCny * 10_000) !== Math.round(entry.rateCny * 10_000));
+      if (changed.length === 0) throw validationFailed({ lines: EDIT.correctionUnchanged });
+
+      await lockAccount(tx, row.supplierId, row.currency);
+      const finalChanged = await guardFinalSettlements(tx, row.supplierId, row.currency);
+      for (const entry of changed) await tx.update(orderLines).set({ rateCny: entry.rateCny }).where(eq(orderLines.id, entry.id));
+      const detail = changed.map((entry) => `${byId.get(entry.id)!.item} ${byId.get(entry.id)!.rateCny} -> ${entry.rateCny} (${byId.get(entry.id)!.received} received)`).join("; ");
+      const order = { id: row.id, po: row.poNumber, supplierId: row.supplierId, currency: row.currency, exchangeRate: row.exchangeRate, orderDate: row.orderDate };
+      const approval = input.finalSettlementApproval ? `; Management approval (final landed cost): ${input.finalSettlementApproval.reason}` : "";
+      const posted = await syncOrderValue(tx, order, req.user!.id, `Rate correction: ${input.reason} (${detail})${approval}`);
+      await tx.update(orders).set({ updatedAt: new Date() }).where(eq(orders.id, row.id));
+      // A protected final landed cost (M8, final_cost_protections) changes only with an explicit approval (rolled back otherwise).
+      const finalOrders = await finalChanged();
+      if (finalOrders.length > 0 && !input.finalSettlementApproval) throw conflict("final_settlement_approval", EDIT.correctionFinal(finalOrders));
+      return { order, posted, finalOrders, detail };
+    });
+    console.info(`Order ${result.order.po} rates corrected by user ${req.user!.id}: ${result.detail}.`);
+    res.json({
+      order: { id: result.order.id, po: result.order.po },
+      ledger: {
+        supplierId: result.order.supplierId,
+        currency: result.order.currency,
+        changeCny: result.posted.changeCny,
+        balanceBefore: result.posted.balanceBefore,
+        balanceAfter: result.posted.balanceAfter,
+        entryId: result.posted.entry?.id ?? null,
+        finalOrders: result.finalOrders,
+      },
+    });
   });
 
   // ORD-6. Only an order nothing depends on is deleted, with its own lines (the order_lines cascade). The order and its

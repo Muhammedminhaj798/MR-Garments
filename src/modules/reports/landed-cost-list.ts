@@ -33,7 +33,9 @@ export async function landedCostList(db: Database, { supplierId, teamId }: { sup
       // The PO in its own currency and the rate saved on the order (0012; null for older orders), for the report
       // download (docs/report-downloads.md). The landed cost's goods stay the credits at their own rates.
       orderDate: orders.orderDate,
+      // Received quantity x rate; poValueCny the ordered quantity x rate, for reference.
       orderValueCny: orderMoney.orderValueCny,
+      poValueCny: orderMoney.poValueCny,
       exchangeRate: orders.exchangeRate,
     })
     .from(orders)

@@ -16,7 +16,7 @@ import { orderFilter } from "./reports";
 // value - settled = outstanding on every row (never negative); agent payments are sea freight, apart.
 
 export const ORDER_STATES = ["pending", "active", "closed"] as const;
-export const PAYMENT_STATES = ["unpaid", "partly", "paid"] as const;
+export const PAYMENT_STATES = ["awaiting_goods", "unpaid", "partly", "paid"] as const;
 
 export const orderReportsQuery = z
   .strictObject({
@@ -131,7 +131,9 @@ export async function orderReports(db: Database, q: Query) {
       quantities: units.map((total) => ({ unit: total.unit, quantity: total.quantity })),
       closed: row.closed,
       closedOn: row.closedOn,
+      /** Received quantity × rate; poValueCny is the ordered quantity × rate, for reference. */
       orderValueCny: row.orderValueCny,
+      poValueCny: row.poValueCny,
       ...withoutAgentCny(orderSettlement(ledger.order(row.id), row)),
       /** null until the order has any cost (as the Landed Cost list hides costless orders). */
       landedCostInr: cost.totalInr > 0 ? cost.totalInr : null,
@@ -148,6 +150,7 @@ export async function orderReports(db: Database, q: Query) {
         return {
           currency,
           orderValueCny: round2(sum(inCurrency, (row) => row.orderValueCny)),
+          poValueCny: round2(sum(inCurrency, (row) => row.poValueCny)),
           settledCny: fromCents(sum(inCurrency, (row) => cents(row.settledCny ?? 0))),
           outstandingCny: fromCents(sum(inCurrency, (row) => cents(row.outstandingCny ?? 0))),
         };

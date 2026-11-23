@@ -1,7 +1,7 @@
 import { afterAll, beforeEach, describe, expect, it } from "vitest";
 
 import { items, orders, supplierLedgerEntries, suppliers } from "../../db/schema";
-import { api, createTestContext, resetData, SEEDED, signInAs } from "../../test/harness";
+import { api, createTestContext, receiveOrder, resetData, SEEDED, signInAs } from "../../test/harness";
 import { idOf } from "../stock/fixtures";
 import { RATE_MESSAGES } from "./suppliers.routes";
 
@@ -121,19 +121,30 @@ describe("new orders and deposits take the supplier's currency and snapshot its 
     expect(rows).toEqual(expect.arrayContaining([{ supplierId: shenzhen, currency: "CNY", exchangeRate: null }, { supplierId: foshan, currency: "INR", exchangeRate: 1 }]));
   });
 
-  it("the order's ledger debit copies the rate snapshot; a later rate change leaves it; SD-2 is retired (410)", async () => {
+  it("the order's ledger postings copy the rate snapshot; a later rate change leaves them; SD-2 is retired (410)", async () => {
     await edit(guangzhou, { currency: "USD", exchangeRate: 88.25 });
-    expect((await placeOrder(orderBody(guangzhou))).status).toBe(201);
+    const placed = await placeOrder(orderBody(guangzhou));
+    expect(placed.status).toBe(201);
     await edit(guangzhou, { exchangeRate: 90 });
-    const posted = await ctx.db.select({ entryType: supplierLedgerEntries.entryType, currency: supplierLedgerEntries.currency, amount: supplierLedgerEntries.amount, exchangeRate: supplierLedgerEntries.exchangeRate }).from(supplierLedgerEntries);
-    expect(posted).toEqual([{ entryType: "order_debit", currency: "USD", amount: -25, exchangeRate: 88.25 }]);
+    // Placed: a 0 debit (nothing received); received: its value, both at the order's rate snapshot.
+    await receiveOrder(ctx, placed.body.order.id);
+    const posted = await ctx.db
+      .select({ entryType: supplierLedgerEntries.entryType, currency: supplierLedgerEntries.currency, amount: supplierLedgerEntries.amount, exchangeRate: supplierLedgerEntries.exchangeRate })
+      .from(supplierLedgerEntries)
+      .orderBy(supplierLedgerEntries.createdAt);
+    expect(posted).toEqual([
+      { entryType: "order_debit", currency: "USD", amount: 0, exchangeRate: 88.25 },
+      { entryType: "order_adjustment", currency: "USD", amount: -25, exchangeRate: 88.25 },
+    ]);
     const opened = await openDeposit(guangzhou, { direction: "give", amount: 100, openedOn: "2026-10-20" });
     expect([opened.status, opened.body.error.code]).toEqual([410, "gone"]);
   });
 
   it("RPT-O1 and RPT-O2 give the PO's saved rate and its INR value at that rate, beside the supplier's rate now", async () => {
     await edit(guangzhou, { currency: "USD", exchangeRate: 88.25 });
-    const po = (await placeOrder(orderBody(guangzhou))).body.order.po as string;
+    const placed = (await placeOrder(orderBody(guangzhou))).body.order as { id: string; po: string };
+    const po = placed.po;
+    await receiveOrder(ctx, placed.id); // worth received x rate: all 10 received
     await edit(guangzhou, { exchangeRate: 90 });
     const report = (await get(`/orders/${po}/report`)).body;
     // 10 x 2.5 = 25 USD at 88.25 = 2,206.25 INR, whatever the supplier's rate is now.

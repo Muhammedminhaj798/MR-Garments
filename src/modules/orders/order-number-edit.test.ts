@@ -3,8 +3,8 @@ import { randomUUID } from "node:crypto";
 import { eq } from "drizzle-orm";
 import { afterAll, beforeEach, describe, expect, it } from "vitest";
 
-import { items, locations, notifications, orders, payments, receipts, shippingAgents, supplierLedgerEntries, suppliers, users } from "../../db/schema";
-import { api, createTestContext, resetData, SEEDED, signInAs } from "../../test/harness";
+import { items, locations, notifications, orders, payments, shippingAgents, supplierLedgerEntries, suppliers, users } from "../../db/schema";
+import { api, createTestContext, receiveOrder, resetData, SEEDED, signInAs } from "../../test/harness";
 import { MESSAGES } from "./orders.routes";
 
 // ORD-5 `po`: renumbering an order (docs/contracts.md ORD-5). The order keeps its id, so everything linked to it by id
@@ -60,7 +60,7 @@ describe("ORD-5 po: renumbering an order", () => {
     expect(res.body.order).toMatchObject({ id: order.id, po: "MR/2026/001", stage: 1 });
     expect(await ctx.db.select({ id: orders.id }).from(orders)).toEqual([{ id: order.id }]);
 
-    expect((await get(`/orders/${encodeURIComponent("MR/2026/001")}`)).body).toMatchObject({ id: order.id, po: "MR/2026/001", orderValueCny: 1000 });
+    expect((await get(`/orders/${encodeURIComponent("MR/2026/001")}`)).body).toMatchObject({ id: order.id, po: "MR/2026/001", orderValueCny: 0, poValueCny: 1000 });
     expect((await get(`/orders/${order.po}`)).status).toBe(404);
     expect((await get("/orders")).body.map((row: { id: string; po: string }) => [row.id, row.po])).toEqual([[order.id, "MR/2026/001"]]);
     // Searched and reported by the new number.
@@ -150,7 +150,8 @@ describe("ORD-5 po: renumbering an order", () => {
     const order = await createOrder();
     const freight = await payAgent(order.id, 200);
     expect(freight.status, JSON.stringify(freight.body)).toBe(201);
-    const receipt = (await ctx.db.insert(receipts).values({ orderId: order.id, receivedOn: "2026-10-26", locationId: ids.office, receivedBy: ids.userId, bundles: 2 }).returning())[0]!;
+    // Received in full, as REC-3 posts it: worth ¥1,000.
+    const receipt = { id: (await receiveOrder(ctx, order.id)).receiptId };
     const before = (await get(`/orders/${order.po}`)).body;
     const ledgerBefore = await ctx.db.select().from(supplierLedgerEntries).orderBy(supplierLedgerEntries.createdAt);
     const paymentsBefore = await ctx.db.select().from(payments);
@@ -199,12 +200,14 @@ describe("ORD-5 po: renumbering an order", () => {
     expect(payment.every((link) => link.href === "/orders/PO%20A%26B/payments")).toBe(true);
   });
 
-  it("posts the value change under the new number when the lines change in the same edit", async () => {
+  it("posts the value change under the new number: lines changed in the same edit post nothing before goods, the receipt posts", async () => {
     const order = await createOrder();
     const lines = (await get(`/orders/${order.po}`)).body.lines as { id: string }[];
     const res = await edit(order.po, { po: "PO-BIGGER", lines: [{ id: lines[0]!.id, itemId: ids.jeans, quantity: 200, rateCny: 10 }] });
     expect(res.status, JSON.stringify(res.body)).toBe(200);
-    expect(res.body.ledger).toMatchObject({ changeCny: -1000, balanceBefore: -1000, balanceAfter: -2000 });
+    expect(res.body.ledger).toMatchObject({ changeCny: 0, balanceBefore: 0, balanceAfter: 0 });
+    // The 200 arrive: worth ¥2,000, posted under the new number.
+    expect((await receiveOrder(ctx, order.id)).posted).toMatchObject({ changeCny: -2000, balanceBefore: 0, balanceAfter: -2000 });
     const stored = await ctx.db
       .select({ type: supplierLedgerEntries.entryType, po: supplierLedgerEntries.poNumber })
       .from(supplierLedgerEntries)
