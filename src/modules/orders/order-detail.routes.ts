@@ -3,6 +3,7 @@ import { Router } from "express";
 import { z } from "zod";
 
 import { requirePermission } from "../../auth/current-user";
+import { currencyCode } from "../../currencies";
 import {
   containerLines,
   containers,
@@ -52,13 +53,19 @@ import { byPo, depositRequired, isPoTaken, line, lineList, MESSAGES as M, orderR
 
 const EDIT = {
   warehouse: "This order has reached the warehouse, so it can't be changed.",
-  received: "Goods have been received for this order, so only the delivery date can change.",
+  received: "Goods have been received for this order, so its order date and items can't change.",
   lineChanged: "A line on this order changed. Reload the order and try again.",
   /** Its containers have its terms (CON-3), so they are fixed once it is loaded (unless never set: an older order). */
   termsLoaded: "This order is already loaded in a container, so its container terms can't change.",
   /** M8 (costs/landed-cost.ts guardFinalSettlements): FIFO order follows the order date. */
   finalSettled: (pos: string[]) =>
     `Changing the order date would change the payments that settle ${joined(pos)}, whose landed cost is already final. Keep the saved order date.`,
+  /**
+   * The order's value is posted to its supplier's account in its currency (docs/unified-ledger.md); the ledger has no
+   * transfer between accounts, so both are fixed once the order is placed (owner refinement 2026-11-21: blocked).
+   */
+  supplierFixed: "An order's supplier can't change: its value is posted to this supplier's account. Place a new order for the other supplier.",
+  currencyFixed: (currency: string) => `An order's currency can't change: its rates, value and payments are in ${currency}. Place a new order in the other currency.`,
 };
 const orderEdit = z.strictObject({
   /**
@@ -76,6 +83,9 @@ const orderEdit = z.strictObject({
   lines: lineList(line.extend({ id: z.uuid({ error: EDIT.lineChanged }).optional() })).optional(),
   /** The deposit the supplier asked for; null clears it. A money term, so it may change until the warehouse (stage 6), like the delivery date. */
   depositRequiredCny: depositRequired.nullable().optional(),
+  /** Accepted only to explain the refusal: the saved supplier or currency is no change, another one is 422. */
+  supplierId: z.uuid({ error: M.supplier }).optional(),
+  currency: currencyCode(M.currency).optional(),
 });
 /** "a, b and c". */
 export const joined = (parts: string[]) => (parts.length > 1 ? `${parts.slice(0, -1).join(", ")} and ${parts.at(-1)}` : parts[0]!);
@@ -252,7 +262,8 @@ export function orderDetailRoutes({ db }: RouteContext) {
   // difference is posted as one order_adjustment (nothing when the value is unchanged). Other edits post nothing. A new
   // order date, PO number or deposit asked is refused in maintenance too (the cutover's baseline holds them: ORD-5 in
   // docs/unified-ledger.md); delivery date and terms are not. A new order date is refused (422) when it would change the
-  // settlement of an order whose landed cost is final (M8).
+  // settlement of an order whose landed cost is final (M8). Payments never block an edit: a value change is posted as
+  // its adjustment and the FIFO projection re-settles. The supplier and currency are fixed (422 with the reason).
   router.patch("/orders/:po", requirePermission("ordersEdit", "Enter"), async (req, res) => {
     const po = String(req.params.po);
     const input = parse(orderEdit, req.body);
@@ -277,6 +288,8 @@ export function orderDetailRoutes({ db }: RouteContext) {
       }
 
       const problems: Record<string, string> = {};
+      if (input.supplierId !== undefined && input.supplierId !== row.supplierId) problems.supplierId = EDIT.supplierFixed;
+      if (input.currency !== undefined && input.currency !== row.currency) problems.currency = EDIT.currencyFixed(row.currency);
       // A new PO number (the same one, as saved, is no change). Taken by another order in any letter case: 422 here;
       // one taken by a concurrent edit or create after this check is caught by the unique index below.
       const newPo = input.po !== undefined && input.po !== row.poNumber ? input.po : undefined;

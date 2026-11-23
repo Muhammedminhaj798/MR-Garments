@@ -28,7 +28,9 @@ const http = api(ctx);
 afterAll(() => ctx.pool.end());
 
 const LOCKED_WAREHOUSE = "This order has reached the warehouse, so it can't be changed.";
-const LOCKED_RECEIVED = "Goods have been received for this order, so only the delivery date can change.";
+const LOCKED_RECEIVED = "Goods have been received for this order, so its order date and items can't change.";
+const SUPPLIER_FIXED = "An order's supplier can't change: its value is posted to this supplier's account. Place a new order for the other supplier.";
+const CURRENCY_FIXED = "An order's currency can't change: its rates, value and payments are in CNY. Place a new order in the other currency.";
 const LINE_CHANGED = "A line on this order changed. Reload the order and try again.";
 
 let management = "";
@@ -257,6 +259,118 @@ describe("ORD-5 PATCH /orders/:po", () => {
     ]);
   });
 
+  // Owner refinement 2026-11-21: payments never block a financial edit. Quantity, rate (so the order value), order date
+  // and PO number stay editable; a value change is one order_adjustment, earlier postings and payments never change,
+  // and the FIFO projection re-settles. The supplier and currency are blocked, with the reason.
+  describe("financial fields with supplier payments", () => {
+    const pay = async (amount: number) => {
+      const res = await http
+        .post("/payments", { supplierId: ids.supplier, amount, paidOn: "2026-10-21", rateInr: 11.8, mode: "Bank transfer", clientRequestId: randomUUID() })
+        .set("Cookie", management);
+      expect(res.status, JSON.stringify(res.body)).toBe(201);
+    };
+    const detail = async (po: string) => (await http.get(`/orders/${encodeURIComponent(po)}`).set("Cookie", management)).body;
+    const postingsOf = (orderId: string) =>
+      ctx.db.select().from(supplierLedgerEntries).where(eq(supplierLedgerEntries.orderId, orderId)).orderBy(asc(supplierLedgerEntries.createdAt), asc(supplierLedgerEntries.id));
+    const credits = () => ctx.db.select().from(supplierLedgerEntries).where(sql`${supplierLedgerEntries.orderId} is null`).orderBy(asc(supplierLedgerEntries.id));
+    const allPayments = () => ctx.db.select().from(payments).orderBy(asc(payments.id));
+    /** Quantity (+¥1,250), rate (+¥225), order date and PO number, one edit each: ¥14,975 becomes ¥16,450. */
+    const editFinancialFields = async (order: Awaited<ReturnType<typeof createOrder>>) => {
+      const [jeans, fabric] = order.lines as [(typeof order.lines)[0], (typeof order.lines)[0]];
+      const quantity = await edit(order.po, {
+        lines: [
+          { id: jeans.id, itemId: ids.jeans, quantity: 1100, rateCny: 12.5 },
+          { id: fabric.id, itemId: ids.fabric, quantity: 300, rateCny: 8.25 },
+        ],
+      });
+      expect(quantity.status, JSON.stringify(quantity.body)).toBe(200);
+      expect(quantity.body.ledger).toMatchObject({ changeCny: -1250 });
+      const rate = await edit(order.po, {
+        lines: [
+          { id: jeans.id, itemId: ids.jeans, quantity: 1100, rateCny: 12.5 },
+          { id: fabric.id, itemId: ids.fabric, quantity: 300, rateCny: 9 },
+        ],
+      });
+      expect(rate.status, JSON.stringify(rate.body)).toBe(200);
+      expect(rate.body.ledger).toMatchObject({ changeCny: -225 });
+      const date = await edit(order.po, { orderDate: "2026-10-18" });
+      expect(date.status, JSON.stringify(date.body)).toBe(200);
+      const renamed = await edit(order.po, { po: `${order.po}-R` });
+      expect(renamed.status, JSON.stringify(renamed.body)).toBe(200);
+      return `${order.po}-R`;
+    };
+
+    it("no payment: quantity, rate, order date and PO number change; each value change is one adjustment", async () => {
+      const order = await createOrder();
+      const po = await editFinancialFields(order);
+      expect(await detail(po)).toMatchObject({ orderDate: "2026-10-18", orderValueCny: 16450, settledCny: 0, outstandingCny: 16450, paymentStatus: "unpaid" });
+      expect((await postingsOf(order.id)).map((row) => [row.entryType, row.amount])).toEqual([
+        ["order_debit", -14975],
+        ["order_adjustment", -1250],
+        ["order_adjustment", -225],
+      ]);
+    });
+
+    it("partly paid (a supplier payment and an agent deposit): the same edits; payments and earlier postings never change", async () => {
+      const order = await createOrder({ deposits: [deposit(100)] });
+      await pay(5000);
+      const paymentsBefore = await allPayments();
+      const creditsBefore = await credits();
+      const [debitBefore] = await postingsOf(order.id);
+      const po = await editFinancialFields(order);
+      // FIFO re-settles: the ¥5,000 credit settles ¥5,000 of the new ¥16,450.
+      expect(await detail(po)).toMatchObject({ orderValueCny: 16450, settledCny: 5000, outstandingCny: 11450, paymentStatus: "partly", agentPaidCny: 100 });
+      expect(await allPayments()).toEqual(paymentsBefore);
+      expect(await credits()).toEqual(creditsBefore);
+      const after = await postingsOf(order.id);
+      // The debit is the same row, PO number included (a renumbering never rewrites a posting).
+      expect(after[0]).toEqual(debitBefore);
+      expect(after.slice(1).map((row) => [row.entryType, row.amount, row.poNumber])).toEqual([
+        ["order_adjustment", -1250, order.po],
+        ["order_adjustment", -225, order.po],
+      ]);
+      // What locks the order date and the items is received goods, never a payment.
+      await setStage(order.id, 2);
+      expectConflict(await edit(po, { lines: [{ id: order.lines[0]!.id, itemId: ids.jeans, quantity: 1, rateCny: 1 }] }), "order_locked", LOCKED_RECEIVED);
+      expect((await edit(po, { deliveryDate: "2026-12-05" })).status).toBe(200);
+    });
+
+    it("fully paid: lower the value below what was paid (the account holds the rest), then raise it past it (outstanding again)", async () => {
+      const order = await createOrder();
+      await pay(14975);
+      expect(await detail(order.po)).toMatchObject({ settledCny: 14975, paymentStatus: "paid" });
+      const paymentsBefore = await allPayments();
+      const [jeans, fabric] = order.lines as [(typeof order.lines)[0], (typeof order.lines)[0]];
+      const lines = (jeansQuantity: number, fabricRate: number) => [
+        { id: jeans.id, itemId: ids.jeans, quantity: jeansQuantity, rateCny: 12.5 },
+        { id: fabric.id, itemId: ids.fabric, quantity: 300, rateCny: fabricRate },
+      ];
+      const lower = await edit(order.po, { lines: lines(800, 8.25) });
+      expect(lower.body.ledger).toMatchObject({ changeCny: 2500, balanceBefore: 0, balanceAfter: 2500 });
+      expect(await detail(order.po)).toMatchObject({ orderValueCny: 12475, settledCny: 12475, outstandingCny: 0, paymentStatus: "paid" });
+      const higher = await edit(order.po, { lines: lines(1200, 10) });
+      expect(higher.body.ledger).toMatchObject({ changeCny: -5525, balanceBefore: 2500, balanceAfter: -3025 });
+      expect(await detail(order.po)).toMatchObject({ orderValueCny: 18000, settledCny: 14975, outstandingCny: 3025, paymentStatus: "partly" });
+      expect(await allPayments()).toEqual(paymentsBefore);
+      expect((await postingsOf(order.id)).map((row) => row.amount)).toEqual([-14975, 2500, -5525]);
+    });
+
+    it("the supplier and the currency are blocked with the reason (422, nothing written); the saved ones are no change", async () => {
+      const order = await createOrder();
+      await pay(1000);
+      const other = (await ctx.db.select({ id: suppliers.id }).from(suppliers).where(eq(suppliers.name, "Hangzhou Knits")))[0]!.id;
+      const before = { order: await orderRow(order.id), postings: await postingsOf(order.id), credits: await credits(), payments: await allPayments() };
+      expectFields(await edit(order.po, { supplierId: other }), { supplierId: SUPPLIER_FIXED });
+      expectFields(await edit(order.po, { currency: "USD" }), { currency: CURRENCY_FIXED });
+      expectFields(await edit(order.po, { supplierId: other, currency: "USD", deliveryDate: "2026-12-01" }), { supplierId: SUPPLIER_FIXED, currency: CURRENCY_FIXED });
+      expect({ order: await orderRow(order.id), postings: await postingsOf(order.id), credits: await credits(), payments: await allPayments() }).toEqual(before);
+      const same = await edit(order.po, { supplierId: ids.supplier, currency: "CNY", deliveryDate: "2026-12-01" });
+      expect(same.status, JSON.stringify(same.body)).toBe(200);
+      expect(await orderRow(order.id)).toMatchObject({ supplierId: ids.supplier, currency: "CNY", deliveryDate: "2026-12-01" });
+      expect(await postingsOf(order.id)).toEqual(before.postings);
+    });
+  });
+
   it("is 404 for an unknown or malformed PO", async () => {
     for (const po of ["PO-9999", "po-2050", "2050"]) {
       const res = await edit(po, { deliveryDate: "2026-12-01" });
@@ -268,7 +382,7 @@ describe("ORD-5 PATCH /orders/:po", () => {
   it("is 400 for an empty body or an unknown key, and 422 with the ORD-3 messages", async () => {
     const order = await createOrder();
     const line = { itemId: ids.jeans, quantity: 10, rateCny: 1 };
-    for (const body of [{}, { supplierId: ids.supplier }, { stage: 2 }, { lines: [{ ...line, position: 0 }] }]) {
+    for (const body of [{}, { stage: 2 }, { lines: [{ ...line, position: 0 }] }]) {
       const res = await edit(order.po, body);
       expect(res.status, JSON.stringify(body)).toBe(400);
       expect(res.body.error.code).toBe("bad_request");

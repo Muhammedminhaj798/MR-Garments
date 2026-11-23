@@ -139,12 +139,15 @@ ORD-1 to ORD-4 are in `docs/live-screens-contracts.md`. Both routes are in `src/
   the number they were raised under); supplier advance entries keep the stored number but show the order's current
   one; a server log line records the change. `terms?` (FOB/CNF, migration 0015) follows docs/order-container-terms.md.
   stages 2-5 with `orderDate` or `lines`: 409
-  `order_locked` "Goods have been received for this order, so only the delivery date can change.". 422 on
+  `order_locked` "Goods have been received for this order, so its order date and items can't change.". 422 on
   `deliveryDate` for BR-09 (saved values for keys not sent); on `lines` for an inactive or unknown item (a line keeping
   its saved item is not re-checked), an `id` that isn't one of this order's lines (or repeated) ("A line on this order
-  changed. Reload the order and try again."), or a total (sum of quantity x rateCny) below the paid payments ("The
-  order total can't be less than the ¥1,23,456.78 already paid.", 2 decimals, Indian grouping). One transaction with
-  the order row locked `for update`.
+  changed. Reload the order and try again."). Payments never block an edit: the total may go below what was paid
+  (docs/unified-ledger.md, D9; the earlier "total can't be less than paid" refusal is gone). `supplierId?` and
+  `currency?` are accepted only to explain the refusal: the saved ones are no change, another one is 422 `supplierId`
+  "An order's supplier can't change: its value is posted to this supplier's account. Place a new order for the other
+  supplier." or `currency` "An order's currency can't change: its rates, value and payments are in <currency>. Place a
+  new order in the other currency.". One transaction with the order row locked `for update`.
 - **ORD-6** 204 when deleted with its own lines. 409 `in_use` "This order has {2 payments, 1 receipt and 1
   container}, so it can't be deleted." when it has payments (any status), receipts (its own, or any holding one of
   its lines), containers or warehouse receipts holding one of its lines. The order row and its lines are locked

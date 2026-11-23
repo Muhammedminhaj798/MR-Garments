@@ -300,7 +300,16 @@ one, ordered CNY, USD, INR, then the rest.
   - `payments: PaymentRow[] | null` (order-linked rows: legacy supplier memo rows plus agent rows; null without
     payments View).
 - **ORD-5 `PATCH /orders/:po`.**
-  - The `belowPaid` refusal is **removed**.
+  - The `belowPaid` refusal is **removed**. Payments never block an edit (owner refinement 2026-11-21): quantity, rate
+    (so the order value), order date and PO number stay editable on an order with supplier payments, partly or fully
+    paid, at the stages where they are editable at all (order date and items until goods are received; PO number until
+    the warehouse). A value change is one `order_adjustment`; the debit, earlier adjustments and every payment and its
+    credit are never rewritten (a renumbered order's earlier postings keep the number they were posted under), and the
+    FIFO projection re-settles (a total below what was paid leaves the rest available with the supplier).
+  - The supplier and the currency are fixed (blocked for safety): the order's postings belong to the account of its
+    supplier and currency, and the ledger has no transfer between accounts (a debit key is used once per order, the
+    reconciliation expects one debit per order, and the line rates are amounts in the order's currency). `supplierId`
+    or `currency` other than the saved ones answer 422 with the reason; the saved ones are no change.
   - When `lines` are sent: guard, held check, then one `order_adjustment` for the value change (nothing when
     unchanged).
   - Response `{ order, ledger?: { supplierId, currency, changeCny, balanceBefore, balanceAfter } }` (`ledger` only when
