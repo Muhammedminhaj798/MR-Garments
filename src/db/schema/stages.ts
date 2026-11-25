@@ -1,5 +1,5 @@
 import { sql } from "drizzle-orm";
-import { check, date, integer, numeric, pgTable, primaryKey, text, uniqueIndex, uuid } from "drizzle-orm/pg-core";
+import { check, date, index, integer, numeric, pgTable, primaryKey, text, uniqueIndex, uuid } from "drizzle-orm/pg-core";
 
 import { inList, timestamps } from "./columns";
 import { locations } from "./core";
@@ -139,6 +139,8 @@ export const warehouseReceiptLines = pgTable(
   },
   (t) => [
     primaryKey({ columns: [t.receiptId, t.orderLineId, t.teamId] }),
+    // Migration 0020: India warehouse quantity per order line, read by order line (see receipt_lines_order_line_idx).
+    index("warehouse_receipt_lines_order_line_idx").on(t.orderLineId),
     check("warehouse_receipt_lines_quantity_check", sql`quantity >= 0`),
   ],
 );

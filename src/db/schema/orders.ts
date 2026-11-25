@@ -182,7 +182,13 @@ export const receiptLines = pgTable(
       .references(() => orderLines.id, { onDelete: "cascade" }),
     quantity: integer("quantity").notNull(),
   },
-  (t) => [primaryKey({ columns: [t.receiptId, t.orderLineId] }), check("receipt_lines_quantity_check", sql`quantity >= 0`)],
+  (t) => [
+    primaryKey({ columns: [t.receiptId, t.orderLineId] }),
+    // Migration 0020 (2026-11-25): received quantity per order line is read by order line (the order reports'
+    // per-line sums); the primary key leads with receipt_id, so without this each line scanned the whole table.
+    index("receipt_lines_order_line_idx").on(t.orderLineId),
+    check("receipt_lines_quantity_check", sql`quantity >= 0`),
+  ],
 );
 
 export const containers = pgTable(

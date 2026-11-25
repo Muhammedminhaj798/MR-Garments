@@ -26,6 +26,7 @@ import { stagesRoutes } from "./stages/stages.routes";
 import { containerDetailRoutes } from "./stock/container-detail.routes";
 import { stockRoutes } from "./stock/stock.routes";
 import { usersRoutes } from "./users/users.routes";
+import { supplierHistoryRoutes } from "./supplier-history/history.routes";
 
 /** Registers every router under /api/v1. Coordinator-owned; agents only edit their own router files. */
 export function apiRoutes(ctx: RouteContext) {
@@ -36,6 +37,7 @@ export function apiRoutes(ctx: RouteContext) {
   router.use(usersRoutes(ctx));
   router.use(profileRoutes(ctx));
   router.use(suppliersRoutes(ctx));
+  router.use(supplierHistoryRoutes(ctx));
   router.use(currenciesRoutes(ctx));
   router.use(shippingAgentsRoutes(ctx));
   router.use(clearingAgentsRoutes(ctx));

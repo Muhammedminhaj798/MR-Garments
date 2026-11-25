@@ -141,6 +141,13 @@
       "when": 1795538495400,
       "tag": "0019_order_usd_rate",
       "breakpoints": true
+    },
+    {
+      "idx": 20,
+      "version": "7",
+      "when": 1795592008682,
+      "tag": "0020_receipt_line_indexes",
+      "breakpoints": true
     }
   ]
 }
