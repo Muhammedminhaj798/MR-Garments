@@ -43,7 +43,7 @@ import {
   postOrderDebit,
 } from "../ledger/ledger";
 import { orderClosed, orderClosedOn } from "./closure";
-import { hiddenSettlement, orderMoney, orderSettlement, round2 } from "./money";
+import { hiddenSettlement, orderMoney, orderSettlement, round2, usdRateNow } from "./money";
 
 // Owner: BE-orders. ORD-1 GET /orders, ORD-2 GET /orders/options, ORD-3 POST /orders, CAL-1 GET /deliveries,
 // PAY-1 GET /payments (docs/live-screens-contracts.md; supplier money per docs/unified-ledger.md). An order's value is
@@ -382,6 +382,8 @@ export function ordersRoutes({ db }: RouteContext) {
             .limit(1);
           const finalChanged = later.length > 0 ? await guardFinalSettlements(tx, input.supplierId, supplier.currency) : null;
           const exchangeRate = supplier.currency === "INR" ? 1 : supplier.exchangeRate;
+          // 0019: the USD rate of the moment, for Dollar Cost (a USD order's is its own rate).
+          const usdRate = supplier.currency === "USD" ? exchangeRate : await usdRateNow(tx);
           const created = await tx
             .insert(orders)
             .values({
@@ -391,6 +393,7 @@ export function ordersRoutes({ db }: RouteContext) {
               deliveryDate: input.deliveryDate,
               currency: supplier.currency,
               exchangeRate,
+              usdRate,
               depositRequiredCny: input.depositRequiredCny ?? null,
               terms: input.terms ?? null,
               createdBy: userId,

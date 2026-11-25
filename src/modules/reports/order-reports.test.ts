@@ -538,6 +538,8 @@ describe("RPT-O2 GET /reports/orders", () => {
       closedOn: indiaDay(-4),
       orderValueCny: 1440,
       poValueCny: 1400,
+      usdRate: null, // written straight to the tables, as before 0019
+      dollarCost: null, // CNY with goods received and no USD rate saved on the order
       held: false,
       settledCny: 800,
       outstandingCny: 640,
@@ -555,13 +557,16 @@ describe("RPT-O2 GET /reports/orders", () => {
     expect(body.rows[4]).toMatchObject({ po: b.po, closed: false, stocked: 80, settledCny: 400, outstandingCny: 0, paymentStatus: "paid", landedCostInr: 44500, perPieceInr: 556.25, lineCount: 1, quantities: [{ unit: "pcs", quantity: 80 }] });
     expect(body.rows[2]).toMatchObject({ po: d.po, stage: 3, paymentStatus: "unpaid", landedCostInr: null, perPieceInr: null });
     expect(body.rows[1]).toMatchObject({ po: e.po, currency: "USD", stage: 2, received: 50, settledCny: 60, settledInr: 5000, paidInr: 5000, outstandingCny: 40, paymentStatus: "partly", landedCostInr: 5000, perPieceInr: null });
-    expect(body.rows[0]).toMatchObject({ po: c.po, stage: 1, orderDate: indiaDay(-3), orderValueCny: 0, poValueCny: 30, paymentStatus: "awaiting_goods" });
+    expect(body.rows[0]).toMatchObject({ po: c.po, stage: 1, orderDate: indiaDay(-3), orderValueCny: 0, poValueCny: 30, dollarCost: 0, paymentStatus: "awaiting_goods" });
+    expect(body.rows[1].dollarCost).toBe(100); // USD: the order value
     expect(body.summary).toEqual({
       orders: 5,
       byCurrency: [
         { currency: "CNY", orderValueCny: 1841, poValueCny: 1831, settledCny: 1200, outstandingCny: 641 },
         { currency: "USD", orderValueCny: 100, poValueCny: 100, settledCny: 60, outstandingCny: 40 },
       ],
+      // C (nothing received) 0, E $100; A, B and D are CNY with goods received: no USD total, 3 without a rate.
+      dollarCost: { usd: null, missing: 3 },
       paidInr: 20850, // Σ row paidInr: the agent's ₹1,200 on A is in it now
 
       landedCostInr: 99050,
@@ -606,7 +611,7 @@ describe("RPT-O2 GET /reports/orders", () => {
     expect(main.filter.warehouse).toBe("Main warehouse");
     const office = await list(`?warehouseId=${m.indiaOffice}`);
     expect(office.rows).toEqual([]);
-    expect(office.summary).toEqual({ orders: 0, byCurrency: [], paidInr: 0, landedCostInr: 0 });
+    expect(office.summary).toEqual({ orders: 0, byCurrency: [], dollarCost: { usd: 0, missing: 0 }, paidInr: 0, landedCostInr: 0 });
     expect(pos(await list("?paymentStatus=unpaid"))).toEqual([d.po]);
     expect(pos(await list("?paymentStatus=awaiting_goods"))).toEqual([c.po]);
     expect(pos(await list("?paymentStatus=partly"))).toEqual([e.po, a.po]);
@@ -625,6 +630,84 @@ describe("RPT-O2 GET /reports/orders", () => {
     expect(pos(usd)).toEqual([e.po]);
     expect(usd.filter.currency).toBe("USD");
     expect(usd.summary.byCurrency).toEqual([{ currency: "USD", orderValueCny: 100, poValueCny: 100, settledCny: 60, outstandingCny: 40 }]);
+    expect(usd.summary.dollarCost).toEqual({ usd: 100, missing: 0 });
     expect(pos(await list("?currency=CNY&stage=1"))).toEqual([c.po]);
+  });
+});
+
+// Owner request of 2026-11-24: RPT-O2's orders grouped by supplier, each with its lines, containers and landed-cost parts.
+describe("RPT-S1 GET /reports/supplier-orders", () => {
+  const report = async (query = "") => {
+    const res = await http.get(`/reports/supplier-orders${query}`).set("Cookie", suresh);
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    return res.body;
+  };
+
+  it("is 401 signed out, 403 without Reports access and 400 for a malformed query", async () => {
+    expect((await http.get("/reports/supplier-orders")).status).toBe(401);
+    expect((await http.get("/reports/supplier-orders").set("Cookie", priya)).status).toBe(403);
+    expect((await http.get("/reports/supplier-orders?from=2026-13-01").set("Cookie", suresh)).status).toBe(400);
+  });
+
+  it("groups RPT-O2's orders by supplier (by name), with totals per currency, Dollar Cost, lines, containers and cost parts", async () => {
+    const body = await report();
+    const orders = (await list()).rows;
+    expect(body.suppliers.map((group: { supplier: { name: string } }) => group.supplier.name)).toEqual(["Foshan Fabrics", "Guangzhou Textile Co."]);
+    const [foshan, guangzhou] = body.suppliers;
+    // The same rows and figures as RPT-O2 (newest first inside a supplier), with the details added.
+    expect(guangzhou.rows.map((row: { po: string }) => row.po)).toEqual([d.po, a.po, b.po]);
+    expect(foshan.rows.map((row: { po: string }) => row.po)).toEqual([c.po, e.po]);
+    expect(guangzhou.rows[1]).toMatchObject(orders.find((row: { po: string }) => row.po === a.po));
+    expect(guangzhou).toMatchObject({
+      orders: 3,
+      byCurrency: [{ currency: "CNY", orderValueCny: 1841, poValueCny: 1801, settledCny: 1200, outstandingCny: 641 }],
+      dollarCost: { usd: null, missing: 3 },
+      landedCostInr: 94050,
+    });
+    expect(foshan).toMatchObject({
+      orders: 2,
+      byCurrency: [
+        { currency: "CNY", orderValueCny: 0, poValueCny: 30, settledCny: 0, outstandingCny: 0 },
+        { currency: "USD", orderValueCny: 100, poValueCny: 100, settledCny: 60, outstandingCny: 40 },
+      ],
+      dollarCost: { usd: 100, missing: 0 }, // C worth 0 (nothing received), E $100
+      landedCostInr: 5000,
+    });
+    // Each line: ordered, received (excess and short), rate, PO value, value (received × rate) and its Dollar Cost.
+    expect(guangzhou.rows[1].lines).toEqual([
+      { item: "Denim jeans", unit: "pcs", ordered: 100, received: 120, rate: 10, poValueCny: 1000, orderValueCny: 1200, dollarCost: null },
+      { item: "Cotton fabric", unit: "m", ordered: 50, received: 30, rate: 8, poValueCny: 400, orderValueCny: 240, dollarCost: null },
+    ]);
+    expect(foshan.rows[1].lines).toEqual([{ item: "Polo shirts", unit: "pcs", ordered: 50, received: 50, rate: 2, poValueCny: 100, orderValueCny: 100, dollarCost: 100 }]);
+    expect(foshan.rows[0].lines[0]).toMatchObject({ received: 0, orderValueCny: 0, dollarCost: 0 });
+    // A: one CNF container, its parts adding up to the landed cost; B: split over two containers.
+    expect(guangzhou.rows[1].containers).toHaveLength(1);
+    expect(guangzhou.rows[1].containers[0]).toMatchObject({ terms: "CNF", number: expect.any(String), status: expect.any(String) });
+    expect(guangzhou.rows[1].landedCost).toEqual({
+      goodsInr: 9850,
+      seaFreightInr: 0,
+      clearingInr: 37050,
+      transportInr: 2650,
+      totalInr: 49550,
+      perPieceInr: 330.33,
+      final: false,
+      waitingFor: "supplier payment",
+    });
+    expect(guangzhou.rows[2].containers).toHaveLength(2);
+    expect(foshan.rows[0]).toMatchObject({ containers: [], landedCost: null });
+    expect(body.summary).toMatchObject({ orders: 5, suppliers: 2, dollarCost: { usd: null, missing: 3 } });
+  });
+
+  it("takes RPT-O2's filters: supplier, dates, currency; a supplier with no matching order is not listed", async () => {
+    const guangzhou = await supplierId("Guangzhou Textile Co.");
+    const one = await report(`?supplierId=${guangzhou}`);
+    expect(one.suppliers.map((group: { supplier: { id: string } }) => group.supplier.id)).toEqual([guangzhou]);
+    expect(one.filter.supplier).toBe("Guangzhou Textile Co.");
+    const recent = await report(`?from=${indiaDay(-15)}&to=${indiaDay()}`);
+    expect(recent.suppliers.map((group: { rows: { po: string }[] }) => group.rows.map((row) => row.po))).toEqual([[c.po, e.po]]);
+    const usd = await report("?currency=USD");
+    expect(usd.suppliers).toHaveLength(1);
+    expect(usd.suppliers[0]).toMatchObject({ orders: 1, dollarCost: { usd: 100, missing: 0 } });
+    expect((await report("?po=NO-SUCH")).suppliers).toEqual([]);
   });
 });

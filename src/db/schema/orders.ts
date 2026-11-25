@@ -36,6 +36,13 @@ export const orders = pgTable(
      * from before 0012 or placed while the supplier had no rate. Never updated: the supplier's later rates don't apply.
      */
     exchangeRate: rate("exchange_rate"),
+    /**
+     * INR per 1 USD when the order was entered (0019, owner decisions of 2026-11-24): a USD order's own `exchange_rate`;
+     * any other order's the USD rate in force then (the one rate the active USD suppliers agree on, Settings ›
+     * Suppliers; none when missing or conflicting). Dollar Cost = value × exchange_rate ÷ usd_rate. Null when none was
+     * known (historical orders: only where the records prove it). Never updated: later rates don't apply.
+     */
+    usdRate: rate("usd_rate"),
     stage: smallint("stage").notNull().default(1),
     /**
      * The deposit the supplier asked for, in the order's currency (0009); null when none was agreed. Paid supplier
@@ -56,6 +63,7 @@ export const orders = pgTable(
     uniqueIndex("orders_po_number_unique").on(sql`lower(${t.poNumber})`),
     check("orders_currency_check", CURRENCY_SHAPE),
     check("orders_exchange_rate_check", sql`exchange_rate is null or exchange_rate > 0`),
+    check("orders_usd_rate_check", sql`usd_rate is null or usd_rate > 0`),
     check("orders_stage_check", sql`stage between 1 and 6`),
     check("orders_dates_check", sql`delivery_date >= order_date`),
     check("orders_deposit_required_check", sql`deposit_required_cny is null or deposit_required_cny > 0`),

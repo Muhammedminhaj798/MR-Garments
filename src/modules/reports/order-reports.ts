@@ -7,7 +7,7 @@ import { items, locations, orderLines, orders, suppliers, warehouseReceiptLines,
 import { loadLandedCosts } from "../costs/landed-cost";
 import { cents, fromCents, loadLedger } from "../ledger/ledger";
 import { main, newestFirst, orderColumns, PO_MAX_LENGTH, round2, unitSymbol } from "../orders/orders.routes";
-import { orderSettlement } from "../orders/money";
+import { dollarCost, dollarCostTotal, orderSettlement } from "../orders/money";
 import { orderFilter } from "./reports";
 
 // Owner: Agent R. RPT-O2 GET /reports/orders (docs/phase2-contracts.md section 4.2; shape in 8.R; the comprehensive
@@ -48,8 +48,28 @@ const withoutAgentCny = <T extends { agentPaidCny: unknown }>({ agentPaidCny: _a
 /** `%`, `_` and `\` typed in the PO filter match themselves (LIKE's default escape is `\`). */
 const escapeLike = (value: string) => value.replace(/[\\%_]/g, "\\$&");
 
-/** The filtered orders, their summary, the filter echo (names) and the page's select options. Seven queries, plus loadLandedCosts. */
-export async function orderReports(db: Database, q: Query) {
+/** RPT-O2's response: the filtered orders, their summary, the filter echo (names) and the page's select options. */
+export const orderReports = async (db: Database, q: Query) => (await buildOrderReports(db, q)).report;
+
+/**
+ * Totals per order currency (never added across currencies); a held account's orders (D4) are listed but count in no
+ * total. RPT-O2's summary and RPT-S1's suppliers.
+ */
+export function currencyTotals<T extends { currency: string; held: boolean; orderValueCny: number; poValueCny: number; settledCny: number | null; outstandingCny: number | null }>(list: T[]) {
+  return orderedCurrencies(list.map((row) => row.currency)).map((currency) => {
+    const inCurrency = list.filter((row) => row.currency === currency && !row.held);
+    return {
+      currency,
+      orderValueCny: round2(sum(inCurrency, (row) => row.orderValueCny)),
+      poValueCny: round2(sum(inCurrency, (row) => row.poValueCny)),
+      settledCny: fromCents(sum(inCurrency, (row) => cents(row.settledCny ?? 0))),
+      outstandingCny: fromCents(sum(inCurrency, (row) => cents(row.outstandingCny ?? 0))),
+    };
+  });
+}
+
+/** The report and each kept order's landed cost (RPT-S1 adds its parts). Seven queries, plus loadLandedCosts. */
+export async function buildOrderReports(db: Database, q: Query) {
   const po = q.po || undefined;
   const supplierText = q.supplier || undefined;
   // Orders with some of their own goods on a stocked receipt at that warehouse.
@@ -61,7 +81,7 @@ export async function orderReports(db: Database, q: Query) {
 
   const [rows, supplierOptions, warehouseOptions, supplier, warehouse, ledger] = await Promise.all([
     db
-      .select({ ...orderColumns, supplierCode: suppliers.code })
+      .select({ ...orderColumns, supplierCode: suppliers.code, usdRate: orders.usdRate })
       .from(orders)
       .innerJoin(suppliers, eq(suppliers.id, orders.supplierId))
       .innerJoin(main, and(eq(main.orderId, orders.id), eq(main.position, 0)))
@@ -134,27 +154,22 @@ export async function orderReports(db: Database, q: Query) {
       /** Received quantity × rate; poValueCny is the ordered quantity × rate, for reference. */
       orderValueCny: row.orderValueCny,
       poValueCny: row.poValueCny,
+      /** INR per 1 USD saved on the order (0019; null when none was known), and the order value in USD (money.ts `dollarCost`). */
+      usdRate: row.usdRate,
+      dollarCost: dollarCost(row),
       ...withoutAgentCny(orderSettlement(ledger.order(row.id), row)),
       /** null until the order has any cost (as the Landed Cost list hides costless orders). */
       landedCostInr: cost.totalInr > 0 ? cost.totalInr : null,
       perPieceInr: cost.totalInr > 0 ? cost.perPieceInr : null,
     };
   });
-  return {
+  const report = {
     rows: list,
     summary: {
       orders: list.length,
-      byCurrency: orderedCurrencies(list.map((row) => row.currency)).map((currency) => {
-        // A held account's orders (D4) are listed but count in no total.
-        const inCurrency = list.filter((row) => row.currency === currency && !row.held);
-        return {
-          currency,
-          orderValueCny: round2(sum(inCurrency, (row) => row.orderValueCny)),
-          poValueCny: round2(sum(inCurrency, (row) => row.poValueCny)),
-          settledCny: fromCents(sum(inCurrency, (row) => cents(row.settledCny ?? 0))),
-          outstandingCny: fromCents(sum(inCurrency, (row) => cents(row.outstandingCny ?? 0))),
-        };
-      }),
+      byCurrency: currencyTotals(list),
+      /** USD over the orders not held; `usd` null when any has no USD rate (`missing` of them). */
+      dollarCost: dollarCostTotal(list.filter((row) => !row.held).map((row) => row.dollarCost)),
       // A held account's orders (D4) count in no total, their landed cost included.
       paidInr: fromCents(sum(list.filter((row) => !row.held), (row) => cents(row.paidInr ?? 0))),
       landedCostInr: round2(sum(list.filter((row) => !row.held), (row) => row.landedCostInr ?? 0)),
@@ -173,4 +188,5 @@ export async function orderReports(db: Database, q: Query) {
     },
     options: { suppliers: supplierOptions, warehouses: warehouseOptions },
   };
+  return { report, costs };
 }

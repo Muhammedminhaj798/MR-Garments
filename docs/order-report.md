@@ -54,6 +54,42 @@ RPT-O2 keep every field they had (docs/phase2-contracts.md section 4 and 8.R), s
 - Rows: `supplier.code`, `lineCount`, `quantities: { unit, quantity }[]` (ordered quantity per unit over every line).
 - Filter echo: `supplierName`, `stage`, `currency`.
 
+## Dollar Cost (owner decisions of 2026-11-24)
+
+The order's value (received quantity × rate, `orderValueCny`) in USD, from one function (`orders/money.ts`
+`dollarCost`) used by every report and export:
+
+- a USD order: its value; any order with nothing received: 0;
+- any other currency: round(value × `exchange_rate` ÷ `usd_rate`, 2), the two rates saved on the order when it was
+  placed (INR per 1 of its currency; INR per 1 USD); `null` ("No USD rate saved") without both. Today's rate never
+  re-prices a past order.
+
+`orders.usd_rate` (migration 0019): ORD-3 saves a USD order's own rate, any other order the USD rate in force
+(`usdRateNow`: the one rate the **active** USD suppliers with a rate agree on, Settings › Suppliers, the existing
+exchange-rate mechanism; null, never a pick, when none has a rate or their rates differ). Never updated afterwards.
+Historical orders, in the migration, only where the records prove the rate at the moment the order was **entered**
+(`created_at`, not its order date): a USD order its own rate; any other the same rule applied to the suppliers that
+existed then, only when no supplier that existed then has had its currency or rate changed since (`rate_updated_at`
+after the order, or a rate with no recorded moment) and no USD supplier has been edited since (`updated_at`, its status
+then); otherwise null. A held account's orders (D4) are not touched. A supplier deleted since is not visible
+(deletes are refused once it has transactions).
+
+RPT-O2 rows add `usdRate` and `dollarCost: number | null`; the summary adds `dollarCost: { usd: number | null, missing }`
+over the orders not held (`usd` null when any of them has no USD rate, `missing` of them). Supplier code is no longer
+shown on the Order reports page, the single-order report (RPT-O1) or their files (`supplier.code` stays in the
+responses).
+
+## RPT-S1 `GET /reports/supplier-orders` (Supplier order details, owner request of 2026-11-24)
+
+Reports View. RPT-O2's query, filters and rows (the same figures), grouped by supplier:
+`{ suppliers: [{ supplier: { id, name }, orders, byCurrency: [{ currency, orderValueCny, poValueCny, settledCny,
+outstandingCny }], dollarCost: { usd, missing }, landedCostInr, rows }], summary: RPT-O2 summary + suppliers, filter,
+options }`. Suppliers by name; rows newest first. Each row is RPT-O2's row plus `lines: { item, unit, ordered,
+received, rate, poValueCny, orderValueCny, dollarCost }[]`, `containers: { number, status, terms, loadedOn, sailedOn,
+eta, quantity }[]` (each container carrying some of the order, `quantity` of it) and `landedCost: { goodsInr,
+seaFreightInr, clearingInr, transportInr, totalInr, perPieceInr, final, waitingFor } | null` (null until any cost).
+Totals leave a held account's orders out (D4). A supplier with no matching order is not listed (an order report).
+
 ## Frontend
 
 - `/reports/orders`: the filters above (PO, supplier name, supplier, order dates, status, stage, currency, warehouse,

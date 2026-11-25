@@ -6,7 +6,7 @@ import { afterAll, beforeEach, describe, expect, it } from "vitest";
 import { items, orderLines, orders, shippingAgents, suppliers } from "../../db/schema";
 import { api, createTestContext, receiveOrder, resetData, SEEDED, signInAs } from "../../test/harness";
 import { makeOrder } from "../stock/fixtures";
-import { hiddenSettlement, orderSettlement } from "./money";
+import { dollarCost, dollarCostTotal, hiddenSettlement, orderSettlement } from "./money";
 import { MESSAGES as M } from "./orders.routes";
 
 // docs/phase2-fixes.md sections 1 and 2 and docs/unified-ledger.md: one money calculation for every screen (the ledger's
@@ -194,5 +194,38 @@ describe("the deposit the supplier asked for (ORD-3, ORD-5, PAY-2, DEP-1)", () =
     const locked = await patch(`/orders/${stocked.po}`, { depositRequiredCny: 20 });
     expect([locked.status, locked.body.error.code]).toEqual([409, "order_locked"]);
     expect((await ctx.db.select({ v: orders.depositRequiredCny }).from(orders).where(eq(orders.id, stocked.id)))[0]!.v).toBeNull();
+  });
+});
+
+// Owner decisions of 2026-11-24: Dollar Cost is the order value (received quantity × rate) in USD, one definition: a
+// USD order's value; any other at its two saved rates (INR per 1 of its currency ÷ INR per 1 USD); else no USD rate.
+describe("dollarCost and dollarCostTotal", () => {
+  const order = (currency: string, orderValueCny: number, exchangeRate: number | null = null, usdRate: number | null = null) => ({ currency, orderValueCny, exchangeRate, usdRate });
+
+  it("is the value for a USD order (its rates aside) and 0 for any order with nothing received", () => {
+    expect(dollarCost(order("USD", 1234.56))).toBe(1234.56);
+    expect(dollarCost(order("USD", 1234.56, 88, 90))).toBe(1234.56);
+    expect(dollarCost(order("USD", 0))).toBe(0);
+    expect(dollarCost(order("CNY", 0))).toBe(0);
+    expect(dollarCost(order("INR", 0))).toBe(0);
+  });
+
+  it("converts another currency at the order's own saved rates: value × INR rate ÷ USD rate, to the cent", () => {
+    expect(dollarCost(order("CNY", 1440, 12.5, 88))).toBe(204.55); // ₹18,000 ÷ 88
+    expect(dollarCost(order("CNY", 960, 15.5, 100))).toBe(148.8);
+    expect(dollarCost(order("INR", 8800, 1, 88))).toBe(100);
+    expect(dollarCost(order("EUR", 0.01, 95.5, 88.25))).toBe(0.01);
+  });
+
+  it("is null (no USD rate saved) without either rate: never today's rate", () => {
+    expect(dollarCost(order("CNY", 1440, 12.5, null))).toBeNull();
+    expect(dollarCost(order("CNY", 1440, null, 88))).toBeNull();
+    expect(dollarCost(order("INR", 5, 1, null))).toBeNull();
+  });
+
+  it("adds to the cent, and gives no total when any order has no USD rate", () => {
+    expect(dollarCostTotal([])).toEqual({ usd: 0, missing: 0 });
+    expect(dollarCostTotal([0.1, 0.2, 0])).toEqual({ usd: 0.3, missing: 0 });
+    expect(dollarCostTotal([100, null, 204.55, null])).toEqual({ usd: null, missing: 2 });
   });
 });

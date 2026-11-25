@@ -1,6 +1,7 @@
-import { type SQL, sql } from "drizzle-orm";
+import { and, eq, isNotNull, type SQL, sql } from "drizzle-orm";
 
-import { orderLines, orders, payments } from "../../db/schema";
+import type { Database } from "../../db/client";
+import { orderLines, orders, payments, suppliers } from "../../db/schema";
 import { cents, depositMilestone, fromCents, type OrderSettlement, settlementFields } from "../ledger/ledger";
 import { receivedOfLine } from "../ledger/received";
 
@@ -45,6 +46,44 @@ export const orderMoney = {
   /** The earliest due payment, or null. */
   nextDue: sql<string | null>`(select min(${payments.dueDate})::text from ${payments} where ${ofOrder} and ${payments.status} = 'due')`,
 };
+
+/**
+ * Dollar Cost (owner decisions of 2026-11-24): the order's value (received quantity × rate, `orderValueCny`) in USD. The
+ * one definition every report and export uses. A USD order: its value. Nothing received (value 0): 0. Any other
+ * currency: at the two rates saved on the order when it was placed, round(value × exchange_rate ÷ usd_rate, 2) (INR per
+ * 1 of its currency, INR per 1 USD); null (no USD rate saved) without both. Today's rate never re-prices a past order.
+ * Works on a line's value too (same currency and rates as its order).
+ */
+export const dollarCost = (row: { currency: string; orderValueCny: number; exchangeRate: number | null; usdRate: number | null }) =>
+  row.currency === "USD" || row.orderValueCny === 0
+    ? row.orderValueCny
+    : row.exchangeRate !== null && row.usdRate !== null
+      ? round2((row.orderValueCny * row.exchangeRate) / row.usdRate)
+      : null;
+
+/**
+ * Dollar Cost added up (callers leave a held account's orders out, as from every total): `usd` only when every one is
+ * known (a part total would read as the whole), and how many have no USD rate.
+ */
+export function dollarCostTotal(values: (number | null)[]) {
+  const missing = values.filter((value) => value === null).length;
+  return { usd: missing ? null : fromCents(values.reduce((total: number, value) => total + cents(value ?? 0), 0)), missing };
+}
+
+/**
+ * The USD rate in force now (INR per 1 USD), what a new non-USD order saves as `usd_rate` (0019, owner decisions of
+ * 2026-11-24): the one rate the active USD suppliers with a rate agree on (Settings › Suppliers, the existing
+ * exchange-rate mechanism). Null, never a pick, when none has a rate or their rates differ. Migration 0019 gave
+ * historical orders the same rule's rate only where the records prove it for the moment they were entered.
+ */
+export async function usdRateNow(db: Pick<Database, "select">) {
+  const rates = await db
+    .select({ rate: suppliers.exchangeRate })
+    .from(suppliers)
+    .where(and(eq(suppliers.currency, "USD"), eq(suppliers.status, "Active"), isNotNull(suppliers.exchangeRate)))
+    .groupBy(suppliers.exchangeRate);
+  return rates.length === 1 ? rates[0]!.rate : null;
+}
 
 /**
  * The order's money for a response from its settlement (FIFO projection) and its own figures: SettlementFields,

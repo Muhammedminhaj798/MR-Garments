@@ -134,6 +134,13 @@
       "when": 1795423562228,
       "tag": "0018_final_cost_protections",
       "breakpoints": true
+    },
+    {
+      "idx": 19,
+      "version": "7",
+      "when": 1795538495400,
+      "tag": "0019_order_usd_rate",
+      "breakpoints": true
     }
   ]
 }

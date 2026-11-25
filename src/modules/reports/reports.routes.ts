@@ -9,6 +9,7 @@ import type { RouteContext } from "../context";
 import { landedCostList } from "./landed-cost-list";
 import { orderReport } from "./order-report";
 import { orderReports, orderReportsQuery } from "./order-reports";
+import { supplierOrders } from "./supplier-orders";
 import { REPORTS, todayInIndia } from "./reports";
 import { detailQuery, supplierPaymentDetail } from "./supplier-detail";
 
@@ -51,6 +52,11 @@ export function reportsRoutes({ db }: RouteContext) {
   // RPT-O2: every order with its payments, closure and landed cost, filtered (docs/phase2-contracts.md section 4.2).
   router.get("/reports/orders", requirePermission("reports", "View"), async (req, res) => {
     res.json(await orderReports(db, readQuery(orderReportsQuery, req.query)));
+  });
+
+  // RPT-S1: RPT-O2's orders grouped by supplier, with lines, containers and landed-cost parts (same filters).
+  router.get("/reports/supplier-orders", requirePermission("reports", "View"), async (req, res) => {
+    res.json(await supplierOrders(db, readQuery(orderReportsQuery, req.query)));
   });
 
   // RPT-O1: one order's report; sections the user can't view are null (section 4.1). Anyone who can open the order.
