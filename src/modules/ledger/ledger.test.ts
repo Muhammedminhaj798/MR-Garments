@@ -367,6 +367,24 @@ describe("the cutover's approved baseline (docs/operator-commands.md)", () => {
     expect(changes.find((row) => row.table === "supplier_advance_entries")).toMatchObject({ id: receipt.id, before: null, after: { amount: 500, kind: "receipt" } });
   });
 
+  // 2026-11-25: migration 0019 added orders.usd_rate after the approved baseline was written; it is Dollar Cost's
+  // reporting rate, never money, so it is left out as 0017's payment columns are. Financial fields still count.
+  it("leaves out orders.usd_rate (0019): a pre-0019 baseline still matches, a financial field beside it is still a change", async () => {
+    const seeded = await seedLegacy();
+    const before = await legacyRecords(ctx.db);
+    expect(Object.values(before.orders!).some((record) => record.includes("usd_rate"))).toBe(false);
+    // The migration's backfill (or a new order's snapshot) setting the rate: no financial change.
+    await ctx.db.update(orders).set({ usdRate: 100 });
+    expect(baselineChanges(before, await legacyRecords(ctx.db))).toEqual([]);
+    // A financial field changed with it (the order's saved INR rate) is still listed, with that field alone.
+    await ctx.db.update(orders).set({ exchangeRate: 12.25, usdRate: 101 }).where(eq(orders.id, seeded.a.id));
+    const changes = baselineChanges(before, await legacyRecords(ctx.db));
+    expect(changes.map(({ table, id, change }) => [table, id, change])).toEqual([["orders", seeded.a.id, "changed"]]);
+    const was = changes[0]!.before as Record<string, unknown>;
+    const now = changes[0]!.after as Record<string, unknown>;
+    expect(Object.keys(now).filter((key) => JSON.stringify(now[key]) !== JSON.stringify(was[key]))).toEqual(["exchange_rate"]);
+  });
+
   it("backfill --apply is refused when anything differs from the approved baseline, and posts nothing", async () => {
     const seeded = await seedLegacy();
     const approved = await legacyRecords(ctx.db);

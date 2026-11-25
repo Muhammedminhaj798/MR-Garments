@@ -331,11 +331,12 @@ export async function reconcileLedger(
  * Invariant 7 and the cutover's tie to the rehearsal (docs/operator-commands.md): every legacy record's financial
  * fields, by table and id, as text. Left out, so harmless work during the cutover never blocks it: what never changes
  * money or its order (an order's stage, delivery date and terms; a line's item and position; modes, references, notes,
- * who and when), and the payment columns 0017 added (a baseline taken before the migration compares with one after).
+ * who and when), the payment columns 0017 added (a baseline taken before the migration compares with one after), and
+ * the order's USD rate 0019 added (`usd_rate`: Dollar Cost's reporting rate, never money; same reason).
  * `created_at` is never changed by the application, and its text would depend on the session's time zone.
  */
 const NON_FINANCIAL: Record<string, string[]> = {
-  orders: ["stage", "delivery_date", "terms"],
+  orders: ["stage", "delivery_date", "terms", "usd_rate"],
   order_lines: ["item_id", "position"],
   payments: ["supplier_id", "currency", "voided_at", "voided_by", "void_reason", "client_request_id"],
   supplier_advance_entries: [],
