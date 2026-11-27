@@ -325,9 +325,11 @@ export function postPaymentCredit(tx: Tx, payment: LedgerPayment, userId: string
 
 /**
  * PAY-3: reverses the payment's credit (key `payment:<id>:void`), at its rate, dated today. Null when the payment was
- * never posted (a shipping-agent payment, or one still outside the ledger).
+ * never posted (a shipping-agent payment, or one still outside the ledger). `entryDate`: PAY-4's correction dates the
+ * void at the original payment's date, so the statement never shows both credits between it and the edit (the
+ * projection nets a void into its payment whatever its date).
  */
-export async function postPaymentVoid(tx: Tx, paymentId: string, userId: string, reason: string) {
+export async function postPaymentVoid(tx: Tx, paymentId: string, userId: string, reason: string, entryDate = todayInIndia()) {
   const [credit] = await tx
     .select()
     .from(e)
@@ -339,7 +341,7 @@ export async function postPaymentVoid(tx: Tx, paymentId: string, userId: string,
     entryType: "payment_void",
     amount: -credit.amount,
     exchangeRate: credit.exchangeRate,
-    entryDate: todayInIndia(),
+    entryDate,
     paymentId,
     reversesId: credit.id,
     idempotencyKey: `payment:${paymentId}:void`,

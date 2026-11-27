@@ -155,16 +155,15 @@ async function expectConsistent(want: Expected) {
   const mainReceived = detail.receipts.flatMap((r: { lines: { orderLineId: string; quantity: number }[] }) => r.lines).filter((l: { orderLineId: string }) => l.orderLineId === order.lines[0]);
   expect(mainReceived.reduce((sum: number, l: { quantity: number }) => sum + l.quantity, 0)).toBe(want.received[0]);
 
-  // REC-2: stage 1-2 with something left; per-line receivedEarlier; what is still owed for the order.
+  // REC-2: stage 1-2 with every line, fully received too; per-line receivedEarlier; what is still owed for the order.
   const opt = r2.body.orders.find((row: { orderId: string }) => row.orderId === order.id);
-  const left = [60 - want.received[0], 50 - want.received[1]];
-  if (want.stage <= 2 && left.some((n) => n > 0)) {
+  if (want.stage <= 2) {
     expect(opt).toBeDefined();
     expect(opt.orderValueCny).toBe(value);
     expect(opt.poValueCny).toBe(VALUE);
     // REC-2 shows the order's outstanding (the ledger's projection): an agent payment is freight.
     expect(opt.outstandingCny).toBeCloseTo(round2(value - settledCny), 2);
-    expect(opt.lines.map((l: { orderLineId: string }) => l.orderLineId)).toEqual(order.lines.filter((_, i) => left[i]! > 0));
+    expect(opt.lines.map((l: { orderLineId: string }) => l.orderLineId)).toEqual(order.lines);
     for (const l of opt.lines as { orderLineId: string; receivedEarlier: number; ordered: number }[]) {
       const i = order.lines.indexOf(l.orderLineId);
       expect(l.receivedEarlier).toBe(want.received[i]);
@@ -298,8 +297,8 @@ describe("one order across all five tabs", () => {
     });
     expect(res.status).toBe(201);
     state.received = [90, 50];
-    await expectConsistent(state); // REC-2 no longer lists it; CON-2 does
-    // The API still takes more for a fully received order (the supplier sent extra); only the form stops offering it.
+    await expectConsistent(state); // REC-2 still lists it, fully received; CON-2 does too
+    // More for a fully received order (the supplier sent extra) is taken, and REC-2 keeps offering it.
     const more = await post("/receipts", { orderId: order.id, receivedOn: indiaDay(-1), locationId: ids.office, bundles: 0, deliveryNote: "", shortRemark: "", lines: [{ orderLineId: order.lines[1], quantity: 1 }] });
     expect(more.status).toBe(201);
     state.received = [90, 51];

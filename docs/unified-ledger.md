@@ -126,7 +126,7 @@ Undecided, for the owner (each needs a written decision before any release):
 - `ledger_state` holds one row, `maintenance` or `live`. Migration 0017 creates it as `maintenance`.
 - While `maintenance`, every financial write answers **503 `ledger_maintenance`** "Payments and order money are paused
   for maintenance. Try again later.":
-  - PAY-2, PAY-3;
+  - PAY-2, PAY-3, PAY-4;
   - LED-3;
   - ORD-3;
   - ORD-5 when `lines` are sent, or a new order date, PO number or deposit required (the cutover baseline's fields),
@@ -362,6 +362,33 @@ one, ordered CNY, USD, INR, then the rest.
       already final. Give the reason for approving it."), nothing written, unless `finalSettlementApproval` is given;
       the `payment_void` notes are then "<reason>; Management approval (final landed cost): <approval reason>".
   - Its only cross-order effect is the FIFO re-settlement of the account (guarded as above).
+- **PAY-4 `PATCH /payments/:id`** (owner decisions of 2026-11-27, inline Edit on the Payments table). Payments Full
+  (Management), as PAY-3. Guard. Strict body, every field as it should end up, with PAY-2's rules:
+  `{ amount, paidOn, rateInr?, mode, reference?, notes?, reason?, clientRequestId, finalSettlementApproval?: { reason } }`.
+  - **Editable:** not voided, `status 'paid'`, account not held, and either a current supplier payment
+    (`payee_role 'supplier'`, `kind 'Payment'`, no order) or a shipping-agent (sea freight) payment. Legacy
+    order-linked supplier rows ("Deposit (legacy)" / "Balance (legacy)") stay read-only: 409 `legacy_payment`
+    (Void still works). The archive (`supplier_advance_entries`, `supplier_deposits`) is never touched.
+  - **Mode, reference or notes only:** the row is updated in place (`updated_at`); nothing is posted. Response
+    `replaced: null, ledger: null`. A submit that changes nothing answers 200 and writes nothing.
+  - **Amount, paid on or rate changed (a correction):** `reason` is required (422 `reason`). One transaction, the
+    existing void and record logic only, no new posting type or calculation: account lock, M8 guard, the original is
+    voided as PAY-3 voids it (`void_reason` "Edited: <reason>") with its `payment_void` **dated at the original's
+    `paidOn`** (so the LED-1 statement never counts both credits between the payment date and the edit; the
+    projection nets a void into its payment by `reverses_id` whatever its date), then a copy with the new values
+    (same supplier, currency, order, kind, payee) is inserted under the body's `clientRequestId` and, for supplier
+    money, credited by `postPaymentCredit`. Both postings carry the notes "Edited: <reason>" (+ the approval note).
+    Response 200 `{ payment: <the copy>, replaced: <original id>, ledger: { supplierId, currency, balanceBefore
+    (before the void), balanceAfter (after the credit) } | null }` (null for sea freight: never posted).
+  - **Errors:** 404, 409 `already_voided`, 409 `not_editable` (a due row), 409 `legacy_payment`, 409 `account_held`,
+    409 `final_settlement_approval` ("Changing this payment changes the payments that settle <POs>, whose landed cost
+    is already final. Give the reason for approving it.", nothing written), 409 `idempotency_conflict`, 422 fields,
+    503 `ledger_maintenance`. A retry of a correction with the same key and details replays it (200).
+  - **Known, accepted (owner-approved design 2026-11-27):** the copy sorts by its own `created_at` among credits of
+    the same date (as a manual void + new payment would); M8 compares slices by entry, so any money edit of a payment
+    that settles a protected order needs the approval; sea-freight edits have no M8 check (as PAY-2/PAY-3 agent rows);
+    the voided original and the copy are both listed (Supplier History counts two payments recorded); no
+    notification is sent.
 - **PAY-1 `GET /payments`.** Payments View. `{ orders, payments, accounts, totals }`:
   - `orders`: `{ orderId, po, supplierId, supplier, currency, supplierRate, orderValueCny, ...SettlementFields, ...MilestoneFields, agentPaidCny, agentPaidInr, paidInr, nextDue }` (newest first);
   - `payments`: PaymentRow[], including orderless and voided rows, latest date first;

@@ -17,7 +17,7 @@ import { money, notify } from "../notifications/notify";
 import { rateProblem } from "../orders/orders.routes";
 import { isUuid, todayInIndia } from "../stages/common";
 
-// Owner: BE-payments. PAY-2 POST /payments and PAY-3 DELETE /payments/:id (docs/unified-ledger.md). A supplier payment
+// Owner: BE-payments. PAY-2 POST /payments, PAY-3 DELETE /payments/:id and PAY-4 PATCH /payments/:id (docs/unified-ledger.md). A supplier payment
 // is recorded against the supplier (no order) and credited to its ledger account in the payment's currency, in one
 // transaction; a shipping-agent payment stays on its order as sea freight and is never posted. A payment is never
 // deleted: PAY-3 voids it (reason required) and reverses its posting. `rateInr` is INR per 1 of the currency (none,
@@ -45,6 +45,9 @@ export const MESSAGES = {
   reason: "Enter the reason for voiding the payment.",
   reasonTooLong: "Use 1,000 characters or fewer for the reason.",
   alreadyVoided: "This payment was already voided.",
+  editReason: "Enter the reason for changing the amount, date or rate.",
+  editDue: "Only a paid payment can be edited.",
+  editLegacy: "This payment was recorded against an order before the supplier ledger, so it can't be edited. Void it and record a new payment instead.",
 };
 const M = MESSAGES;
 
@@ -72,6 +75,7 @@ const FINAL = {
   payment: (pos: string[]) =>
     `This payment's date puts it before the payments that settle ${joinedPos(pos)}, whose landed cost is already final, so it changes them. A Management user must approve it with a reason.`,
   void: (pos: string[]) => `Voiding this payment changes the payments that settle ${joinedPos(pos)}, whose landed cost is already final. Give the reason for approving it.`,
+  edit: (pos: string[]) => `Changing this payment changes the payments that settle ${joinedPos(pos)}, whose landed cost is already final. Give the reason for approving it.`,
   notAllowed: "Only Management can approve a change to a final landed cost.",
   approvalReason: "Enter the reason for approving this change (up to 500 characters).",
 };
@@ -97,6 +101,13 @@ const agentPayment = z.strictObject({
   ...common,
 });
 const voidPayment = z.strictObject({ reason: z.string({ error: M.reason }).trim().min(1, M.reason).max(1000, M.reasonTooLong), finalSettlementApproval });
+/** PAY-4: every field as it should be (PAY-2's rules); `reason` is required when the amount, date or rate changes. */
+const editPayment = z.strictObject({
+  amount,
+  ...common,
+  reason: z.string({ error: M.reasonTooLong }).trim().max(1000, M.reasonTooLong).default(""),
+  finalSettlementApproval,
+});
 
 type Tx = Parameters<Parameters<Database["transaction"]>[0]>[0];
 
@@ -118,10 +129,10 @@ function sameDetails(stored: Stored, fields: Omit<Stored, "id" | "status" | "due
   if (!same) throw conflict("idempotency_conflict", M.idempotencyConflict);
 }
 
-/** The balances a supplier payment's credit left its account with when it was posted (a replayed PAY-2 answers them again). */
-async function postedBalances(db: Pick<Database, "select">, paymentId: string) {
+/** The balances a payment's credit (or void) left its account with when it was posted (a replayed PAY-2/PAY-4 answers them again). */
+async function postedBalances(db: Pick<Database, "select">, paymentId: string, entryType: "payment" | "payment_void" = "payment") {
   const e = supplierLedgerEntries;
-  const [credit] = await db.select().from(e).where(and(eq(e.paymentId, paymentId), eq(e.entryType, "payment")));
+  const [credit] = await db.select().from(e).where(and(eq(e.paymentId, paymentId), eq(e.entryType, entryType)));
   if (!credit) return null;
   // Postings to one account are serialised by its lock, so everything recorded before this one was already committed.
   const [row] = await db
@@ -330,6 +341,88 @@ export function paymentsRoutes({ db }: RouteContext) {
       payment: await view(id),
       ledger: posted ? { supplierId: posted.entry.supplierId, currency: posted.entry.currency, balanceBefore: posted.balanceBefore, balanceAfter: posted.balanceAfter } : null,
     });
+  });
+
+  // PAY-4. Management only (payments Full), as a void. Edits a current supplier payment (orderless, kind Payment) or a
+  // shipping agent's. Mode, reference and notes change in place and post nothing. A new amount, date or rate is one
+  // correction: the payment is voided as PAY-3 voids it ("Edited: <reason>") and a corrected copy is recorded and posted
+  // as PAY-2 posts it, under the same M8 guard. The body's `clientRequestId` keys the copy: a retry replays it. A
+  // submit that changes nothing answers 200 and writes nothing. Legacy order-linked supplier rows stay read-only.
+  router.patch("/payments/:id", requirePermission("payments", "Full"), async (req, res) => {
+    const id = String(req.params.id);
+    if (!isUuid(id)) throw notFound("Payment");
+    const input = parse(editPayment, req.body);
+    const { reason, finalSettlementApproval: approval } = input;
+    const userId = req.user!.id;
+    const result = await db.transaction(async (tx) => {
+      await assertLedgerLive(tx);
+      await lockRequest(tx, input.clientRequestId);
+      const [row] = await tx.select().from(payments).where(eq(payments.id, id)).for("update");
+      if (!row) throw notFound("Payment");
+      const [order] = row.orderId ? await tx.select({ po: orders.poNumber, supplierId: orders.supplierId, currency: orders.currency }).from(orders).where(eq(orders.id, row.orderId)) : [];
+      const supplierId = row.supplierId ?? order!.supplierId;
+      const currency = row.currency ?? order!.currency;
+      const fields = { amountCny: input.amount, paidOn: input.paidOn, rateInr: input.rateInr ?? 1, mode: input.mode, reference: input.reference, notes: input.notes };
+      const supplierMoney = row.payeeRole === "supplier";
+      // A retry of a correction already made replays it before any check that may have changed since (the original is
+      // voided by then): same details 200, other details 409 (as PAY-2).
+      const replay = await byRequest(tx, input.clientRequestId);
+      if (replay) {
+        if (replay.id === id || !row.voidedAt) throw conflict("idempotency_conflict", M.idempotencyConflict);
+        sameDetails(replay, { orderId: row.orderId, supplierId: row.supplierId, currency: row.currency, kind: row.kind, payeeRole: row.payeeRole, ...fields });
+        const [voided, credit] = supplierMoney ? await Promise.all([postedBalances(tx, id, "payment_void"), postedBalances(tx, replay.id)]) : [null, null];
+        const ledger = credit ? { ...credit, balanceBefore: voided?.balanceBefore ?? credit.balanceBefore } : null;
+        return { id: replay.id, replaced: id as string | null, ledger, log: null };
+      }
+      if (row.voidedAt) throw new HttpError(409, "already_voided", M.alreadyVoided);
+      if (row.status !== "paid") throw conflict("not_editable", M.editDue);
+      if (supplierMoney && (row.orderId || row.kind !== "Payment")) throw conflict("legacy_payment", M.editLegacy);
+      if (await isHeld(tx, supplierId, currency)) throw conflict("account_held", LEDGER.held);
+      const rate = rateProblem(currency, input.rateInr, M.rateInr);
+      if (rate) throw validationFailed({ rateInr: rate });
+      const was = `${row.kind} ${money(row.amountCny, currency)} paid ${row.paidOn} at ${row.rateInr} to ${row.payee}${order ? ` of ${order.po}` : ""}`;
+      const moneyChanged = cents(fields.amountCny) !== cents(row.amountCny) || fields.paidOn !== row.paidOn || Math.round(fields.rateInr * 10_000) !== Math.round((row.rateInr ?? 0) * 10_000);
+      if (!moneyChanged) {
+        const text = (["mode", "reference", "notes"] as const).filter((key) => fields[key] !== row[key]);
+        if (text.length === 0) return { id, replaced: null, ledger: null, log: null };
+        await tx.update(payments).set({ mode: fields.mode, reference: fields.reference, notes: fields.notes, updatedAt: new Date() }).where(eq(payments.id, id));
+        return { id, replaced: null, ledger: null, log: `Payment ${id} (${was}) edited by user ${userId}: ${text.map((key) => `${key} ${JSON.stringify(row[key])} -> ${JSON.stringify(fields[key])}`).join(", ")}` };
+      }
+      if (!reason) throw validationFailed({ reason: M.editReason });
+      const voidReason = `Edited: ${reason}`;
+      const notes = approval ? `${voidReason}; ${approvalNote(approval)}` : voidReason;
+      if (supplierMoney) await lockAccount(tx, supplierId, currency);
+      const finalChanged = supplierMoney ? await guardFinalSettlements(tx, supplierId, currency) : null;
+      await tx.update(payments).set({ voidedAt: new Date(), voidedBy: userId, voidReason, updatedAt: new Date() }).where(eq(payments.id, id));
+      // Dated at the original's date, so the statement's running balance never counts both credits in between.
+      const voided = await postPaymentVoid(tx, id, userId, notes, row.paidOn!);
+      const [created] = await tx
+        .insert(payments)
+        .values({
+          orderId: row.orderId,
+          supplierId: row.supplierId,
+          currency: row.currency,
+          kind: row.kind,
+          payee: row.payee,
+          payeeRole: row.payeeRole,
+          status: "paid",
+          ...fields,
+          clientRequestId: input.clientRequestId,
+          createdBy: userId,
+        })
+        .returning({ id: payments.id });
+      const newId = created!.id;
+      const credit = supplierMoney
+        ? await postPaymentCredit(tx, { id: newId, supplierId, currency, amount: fields.amountCny, exchangeRate: fields.rateInr, paidOn: fields.paidOn }, userId, notes)
+        : null;
+      if (finalChanged) requireFinalApproval(await finalChanged(), approval, true, FINAL.edit);
+      const ledger = credit ? { supplierId, currency, balanceBefore: voided?.balanceBefore ?? credit.balanceBefore, balanceAfter: credit.balanceAfter } : null;
+      const now = `${money(fields.amountCny, currency)} paid ${fields.paidOn} at ${fields.rateInr}`;
+      return { id: newId, replaced: id as string | null, ledger, log: `Payment ${id} (${was}) replaced by ${newId} (${now}) by user ${userId}: ${reason}` };
+    });
+    // The voided row, its replacement and their postings are the record; this line says who changed what, as PAY-3 logs.
+    if (result.log) console.info(result.log);
+    res.json({ payment: await view(result.id), replaced: result.replaced, ledger: result.ledger });
   });
 
   return router;

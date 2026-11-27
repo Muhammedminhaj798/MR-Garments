@@ -90,8 +90,12 @@ backend returns exactly those shapes. Summary:
   `containers` (numbers): the containers holding goods only this receipt covers, which REC-4 names when it refuses;
   empty when it can be deleted.
 - **REC-2** `ReceiptOptions`: active China `offices {id, name}[]` and `orders {orderId, po, supplier, currency, orderValueCny,
-  depositsPaidCny, lines {orderLineId, item, unit, ordered, receivedEarlier, unitPriceCny}[]}[]` for orders at stage
-  1-2 with something left to receive. `orderValueCny`, `depositsPaidCny` and `unitPriceCny` are null unless the user
+  depositsPaidCny, lines {orderLineId, item, unit, ordered, receivedEarlier, unitPriceCny}[]}[]` for every order at
+  stage 1-2, with **all** its lines, fully received ones included (owner rule of 2026-11-27: the ordered quantity is
+  an estimate, so a later delivery may take a line past it). `receivedEarlier` is the line's total over all receipts
+  and may exceed `ordered`. Receiving screens never show a negative short: remaining = max(0, ordered − received),
+  over-received = max(0, received − ordered). REC-3 needs `shortRemark` only while a line stays below its ordered
+  quantity after the receipt; valuation stays received quantity × rate (`docs/unified-ledger.md`). `orderValueCny`, `depositsPaidCny` and `unitPriceCny` are null unless the user
   has payments >= View (QA 2026-10-30: China staff must not see payments; lead-approved, pending management note).
   `currency` is always given: it is not an amount.
 - **REC-3** body `CreateReceiptBody`: `orderId, receivedOn` (not after today), `locationId, bundles, deliveryNote,
@@ -261,6 +265,7 @@ to the supplier or a shipping agent, in the order's currency with its own `rateI
 | Id | Method and path | Permission | Owner |
 | --- | --- | --- | --- |
 | PAY-3 | `DELETE /payments/:id` | payments = Full (Management) | BE-payments (`payments/payments.routes.ts`) |
+| PAY-4 | `PATCH /payments/:id` (edit; a money change is a void + corrected copy, docs/unified-ledger.md) | payments = Full (Management) | BE-payments (`payments/payments.routes.ts`) |
 
 - **PAY-3** 204 when the payment row is deleted, any kind or status. One transaction: the payment's order locked `for
   update` (as ORD-5 and ORD-6 lock it), then the payment. Malformed, unknown or already deleted id: 404 `not_found`

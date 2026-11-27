@@ -1,7 +1,7 @@
 import { eq } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
-import { locations, orders, payments, receipts, users, userStageGrants } from "../../db/schema";
+import { locations, orderLines, orders, payments, receipts, users, userStageGrants } from "../../db/schema";
 import { api, createTestContext, resetData, SEEDED, signInAs } from "../../test/harness";
 import { idOf, indiaDay, makeOrder, postLegacy } from "./fixtures";
 import { MESSAGES } from "./stock.routes";
@@ -116,7 +116,7 @@ describe("REC-3 POST /receipts and REC-1 GET /receipts", () => {
       expect(row).toMatchObject({ ordered: 360, unit: "m", thisReceipt: quantity, totalSoFar: quantity });
     }
 
-    // Several receipts adding up past the order: 300, then 649 (949 in all). REC-2 then no longer offers the order.
+    // Several receipts adding up past the order: 300, then 649 (949 in all). REC-2 still offers the order, as received.
     const order = await makeOrder(ctx, { lines: [{ item: "Cotton fabric", quantity: 360, rateCny: 3 }] });
     const line = order.lineIds[0]!;
     expect((await post(chen, body(order.id, [{ orderLineId: line, quantity: 300 }]))).status).toBe(201);
@@ -125,9 +125,9 @@ describe("REC-3 POST /receipts and REC-1 GET /receipts", () => {
     const rows = (await http.get("/receipts").set("Cookie", chen)).body.filter((r: { orderId: string }) => r.orderId === order.id);
     expect(rows.map((r: { thisReceipt: number; totalSoFar: number }) => [r.thisReceipt, r.totalSoFar])).toEqual([[649, 949], [300, 300]]);
     const offered = (cookie: string) => http.get("/receipts/options").set("Cookie", cookie).then((res) => res.body.orders.find((o: { orderId: string }) => o.orderId === order.id));
-    expect(await offered(chen)).toBeUndefined();
+    expect((await offered(chen)).lines).toMatchObject([{ ordered: 360, receivedEarlier: 949 }]);
 
-    // REC-4 deletes the excess receipt like any other; the order is offered again with 300 received.
+    // REC-4 deletes the excess receipt like any other; the order is offered with 300 received.
     const boss = await signInAs(ctx, SEEDED.management);
     expect((await http.delete(`/receipts/${second.body.receipt.id}`).set("Cookie", boss)).status).toBe(204);
     expect((await offered(chen)).lines).toMatchObject([{ ordered: 360, receivedEarlier: 300 }]);
@@ -241,7 +241,7 @@ describe("REC-3 POST /receipts and REC-1 GET /receipts", () => {
 });
 
 describe("REC-2 GET /receipts/options", () => {
-  it("lists active China offices and the lines still to receive of stage 1-2 orders", async () => {
+  it("lists active China offices and every line of stage 1-2 orders, fully received ones too", async () => {
     const open = await makeOrder(ctx, { lines: twoLines });
     const [main, fabric] = open.lineIds as [string, string];
     const done = await makeOrder(ctx, { lines: [{ item: "Polo shirts", quantity: 10, rateCny: 1 }] });
@@ -261,8 +261,9 @@ describe("REC-2 GET /receipts/options", () => {
     expect(res.status).toBe(200);
     expect(res.body.offices).toEqual([{ id: guangzhou, name: "Guangzhou office" }]);
     const ids = res.body.orders.map((order: { orderId: string }) => order.orderId);
-    expect(ids).not.toContain(done.id);
     expect(ids).not.toContain(loading.id);
+    // Fully received is still offered: a later delivery may take it past the ordered quantity.
+    expect(res.body.orders.find((order: { orderId: string }) => order.orderId === done.id).lines).toMatchObject([{ ordered: 10, receivedEarlier: 10 }]);
     const row = {
       orderId: open.id,
       po: open.po,
@@ -271,7 +272,10 @@ describe("REC-2 GET /receipts/options", () => {
       orderValueCny: 1610, // received so far x rate
       poValueCny: 2750, // ordered x rate
       outstandingCny: 1310, // the ledger's projection: ¥1,610 less the ¥300 paid (the due row is not money paid)
-      lines: [{ orderLineId: fabric, item: "Cotton fabric", unit: "m", ordered: 500, receivedEarlier: 120, unitPriceCny: 3 }],
+      lines: [
+        { orderLineId: main, item: "Denim jeans", unit: "pcs", ordered: 100, receivedEarlier: 100, unitPriceCny: 12.5 },
+        { orderLineId: fabric, item: "Cotton fabric", unit: "m", ordered: 500, receivedEarlier: 120, unitPriceCny: 3 },
+      ],
     };
     expect(res.body.orders.find((order: { orderId: string }) => order.orderId === open.id)).toEqual(row);
 
@@ -283,7 +287,42 @@ describe("REC-2 GET /receipts/options", () => {
       orderValueCny: null,
       poValueCny: null,
       outstandingCny: null,
-      lines: [{ ...row.lines[0], unitPriceCny: null }],
+      lines: row.lines.map((line) => ({ ...line, unitPriceCny: null })),
     });
+  });
+
+  it("offers a fully received line again: under, over and several receipts count at received x rate; the ordered quantity never changes", async () => {
+    const boss = await signInAs(ctx, SEEDED.management);
+    const order = await makeOrder(ctx, { lines: twoLines }); // 100 pcs at ¥12.5, 500 m at ¥3
+    const [main, fabric] = order.lineIds as [string, string];
+    const offered = async () => (await http.get("/receipts/options").set("Cookie", boss)).body.orders.find((o: { orderId: string }) => o.orderId === order.id);
+
+    // Under: 60 of 100 and 420 of 500 need the short remark; with it the receipt is saved as typed.
+    expect((await post(boss, body(order.id, [{ orderLineId: main, quantity: 60 }, { orderLineId: fabric, quantity: 420 }], { shortRemark: "" }))).body.error.fields).toEqual({ shortRemark: MESSAGES.shortRemark });
+    const under = await post(boss, body(order.id, [{ orderLineId: main, quantity: 60 }, { orderLineId: fabric, quantity: 420 }]));
+    expect(under.status).toBe(201);
+    expect(under.body.ledger.changeCny).toBe(-2010); // 60 x 12.5 + 420 x 3
+    // A second partial receipt adds up: 60 + 40 = 100 of 100, still offered.
+    expect((await post(boss, body(order.id, [{ orderLineId: main, quantity: 40 }]))).body.ledger.changeCny).toBe(-500);
+    expect((await offered()).lines).toMatchObject([
+      { orderLineId: main, ordered: 100, receivedEarlier: 100 },
+      { orderLineId: fabric, ordered: 500, receivedEarlier: 420 },
+    ]);
+
+    // Over: 80 more on the complete line (180 of 100) posts 80 x 12.5; 140 more fabric (560 of 500) leaves nothing short.
+    expect((await post(boss, body(order.id, [{ orderLineId: main, quantity: 80 }]))).body.ledger.changeCny).toBe(-1000);
+    const over = await post(boss, body(order.id, [{ orderLineId: fabric, quantity: 140 }], { shortRemark: "" }));
+    expect(over.status).toBe(201);
+    expect(over.body.ledger.changeCny).toBe(-420);
+    expect(await offered()).toMatchObject({
+      orderValueCny: 3930, // 180 x 12.5 + 560 x 3
+      poValueCny: 2750, // ordered x rate, unchanged
+      lines: [
+        { orderLineId: main, ordered: 100, receivedEarlier: 180 },
+        { orderLineId: fabric, ordered: 500, receivedEarlier: 560 },
+      ],
+    });
+    const saved = await ctx.db.select({ quantity: orderLines.quantity }).from(orderLines).where(eq(orderLines.orderId, order.id)).orderBy(orderLines.position);
+    expect(saved).toEqual([{ quantity: 100 }, { quantity: 500 }]);
   });
 });

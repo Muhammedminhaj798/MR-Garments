@@ -280,8 +280,9 @@ export function stockRoutes({ db }: RouteContext) {
     );
   });
 
-  // REC-2. Orders at stage 1-2, with only the lines that still have something to receive. The money fields are null,
-  // and never queried, unless the user may view payments (China staff can't: matrix "Deposits and payments").
+  // REC-2. Orders at stage 1-2 with every line, fully received or not: the ordered quantity is an estimate, so a later
+  // delivery may take a line past it (owner rule of 2026-11-27). The money fields are null, and never queried, unless
+  // the user may view payments (China staff can't: matrix "Deposits and payments").
   router.get("/receipts/options", requirePermission("receiving", "Enter"), async (req, res) => {
     const money = atLeast(effectiveAccess(req.user!.role, req.user!.stages, "payments"), "View");
     const hidden = () => sql<null>`null`;
@@ -290,7 +291,6 @@ export function stockRoutes({ db }: RouteContext) {
       .from(locations)
       .where(and(eq(locations.type, "China office"), eq(locations.status, "Active")))
       .orderBy(asc(locations.createdAt), asc(locations.name));
-    const received = receivedOf();
     const rows = await db
       .select({
         orderId: orders.id,
@@ -306,14 +306,14 @@ export function stockRoutes({ db }: RouteContext) {
         item: items.name,
         unit: unitSymbol,
         ordered: orderLines.quantity,
-        receivedEarlier: received,
+        receivedEarlier: receivedOf(),
         unitPriceCny: money ? orderLines.rateCny : hidden(),
       })
       .from(orders)
       .innerJoin(suppliers, eq(suppliers.id, orders.supplierId))
       .innerJoin(orderLines, eq(orderLines.orderId, orders.id))
       .innerJoin(items, eq(items.id, orderLines.itemId))
-      .where(and(inArray(orders.stage, [1, 2]), sql`${received} < ${orderLines.quantity}`))
+      .where(inArray(orders.stage, [1, 2]))
       .orderBy(desc(orders.orderDate), desc(orders.createdAt), asc(orderLines.position));
     // What the supplier is still owed for the order: the ledger's FIFO projection (null while held or not posted).
     const ledger = money ? await loadLedger(db, { supplierIds: [...new Set(rows.map((row) => row.supplierId))] }) : null;
