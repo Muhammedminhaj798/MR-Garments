@@ -274,7 +274,7 @@ export function orderDetailRoutes({ db }: RouteContext) {
       /** The supplier's account in the order's currency (signed balance; null figures while held). */
       supplierAccount: account ? accountFields(account) : null,
       lines: lines.map(({ itemId, itemName, ...line }) => ({ ...line, item: { id: itemId, name: itemName } })),
-      payments: paymentList,
+      payments: paymentList?.map((payment) => ({ ...payment, settlement: ledger?.paymentSettlement(payment.id) ?? null })) ?? null,
       receipts: receiptList,
       containers: containerList,
     });

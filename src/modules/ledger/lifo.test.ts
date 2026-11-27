@@ -104,6 +104,14 @@ describe("negative adjustments take only free credits available at their date; o
       [20, 11, 220],
     ]);
     expect(withE.account).toMatchObject({ balanceCny: -50, outstandingCny: 50, paidInr: 1_000 + 1_100 + 1_200 + 1_300 + 1_400 });
+    // Each credit's use (PAY-4's settlement state): orders' slices, the adjustment's takes and shortfall draws all count.
+    expect([...withE.credits.values()].map((use) => [use.amountCny, use.usedCny, use.takenCny, use.toShortfallsCny, use.orders])).toEqual([
+      [100, 100, 0, 0, [{ orderId: "o1", amountCny: 100 }]],
+      [100, 100, 80, 0, [{ orderId: "o1", amountCny: 20 }]],
+      [100, 100, 100, 0, []],
+      [100, 100, 0, 100, []],
+      [100, 100, 0, 70, [{ orderId: "o2", amountCny: 30 }]],
+    ]);
   });
 
   it("the owner's example: the 5 Oct credit settles the 2 Oct shortfall, then the 3 Oct order; the 6 Oct adjustment can't take it again", () => {

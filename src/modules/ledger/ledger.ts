@@ -387,6 +387,29 @@ export type OrderSettlement = {
   slices: SettlementSlice[];
 };
 
+/** One credit lot's use in the projection: its amount (less its void) and what orders, shortfalls and negative adjustments drew. */
+export type CreditUse = {
+  paymentId: string | null;
+  amountCny: number;
+  usedCny: number;
+  /** Taken by negative adjustments. */
+  takenCny: number;
+  /** Drawn by shortfalls (what adjustments left payable). */
+  toShortfallsCny: number;
+  /** Orders whose FIFO slices drew from it, oldest first. */
+  orders: { orderId: string; amountCny: number }[];
+};
+
+/** A payment's credit as PAY-1/ORD-4/PAY-4 show it (docs/unified-ledger.md PAY-4 "Legacy rows"). */
+export type PaymentSettlement = {
+  state: "unsettled" | "partly" | "settled";
+  amountCny: number;
+  usedCny: number;
+  freeCny: number;
+  /** Orders that drew from it (oldest first), then `{ po: null }` for adjustment takes and shortfall draws. */
+  usedBy: { po: string | null; amountCny: number }[];
+};
+
 export type LedgerAccount = {
   supplierId: string;
   currency: string;
@@ -450,11 +473,13 @@ const chronological = (x: { entryDate: string; createdKey: string; id: string },
  * - Orders and shortfalls are then settled together, oldest first (an order by its order date, a shortfall by its
  *   adjustment's date; then the moment recorded, then id), from the lots left: a later credit reduces the negative
  *   balance through this ordinary settlement.
- * Exported for the unit tests; `shortfallCny` is what the shortfalls still leave payable.
+ * Exported for the unit tests; `shortfallCny` is what the shortfalls still leave payable; `credits` is each lot's use
+ * (what orders, shortfalls and negative adjustments drew from it), by entry id.
  */
 export function projectAccount(entries: EntryRow[], orderRows: OrderRow[]) {
-  type Lot = { entry: EntryRow; left: number };
+  type Lot = { entry: EntryRow; amount: number; left: number; taken: number; toShortfalls: number; toOrders: Map<string, number> };
   const lots: Lot[] = [];
+  const newLot = (entry: EntryRow, amount: number): Lot => ({ entry, amount, left: amount, taken: 0, toShortfalls: 0, toOrders: new Map() });
   /** Negative adjustments, and (never written by the app) a void that can't be netted into its payment. */
   const takers: { entry: EntryRow; amount: number }[] = [];
   const credits = entries.filter((row) => row.entryType === "payment" || row.entryType === "payment_void" || row.entryType === "adjustment").sort(chronological);
@@ -465,14 +490,14 @@ export function projectAccount(entries: EntryRow[], orderRows: OrderRow[]) {
     const amount = cents(entry.amount);
     if (entry.entryType === "payment") {
       const net = amount + (voidOf.get(entry.id) ?? 0);
-      if (net > 0) lots.push({ entry, left: net });
+      if (net > 0) lots.push(newLot(entry, net));
       // A void larger than its payment: never written by the app; kept so the lots always match the balance.
       else if (net < 0) takers.push({ entry, amount: -net });
     } else if (entry.entryType === "payment_void") {
       // Already netted into its payment; one whose payment is not in the account (never written) takes like an adjustment.
       if (!entry.reversesId || !payments.has(entry.reversesId)) takers.push({ entry, amount: -amount });
     } else if (amount > 0) {
-      lots.push({ entry, left: amount });
+      lots.push(newLot(entry, amount));
     } else {
       takers.push({ entry, amount: -amount });
     }
@@ -519,19 +544,22 @@ export function projectAccount(entries: EntryRow[], orderRows: OrderRow[]) {
     for (let i = known.length - 1; i >= 0 && need > 0; i--) {
       const take = Math.min(need, free[i]!);
       known[i]!.left -= take;
+      known[i]!.taken += take;
       need -= take;
     }
     if (need > 0) shortfalls.push({ entry, amount: need, left: need });
   }
 
   let lotIndex = 0;
-  /** Takes up to `need` from the oldest lots left, as slices (each at its credit's own rate). */
-  const draw = (need: number) => {
+  /** Takes up to `need` from the oldest lots left for the order (null: a shortfall), as slices (each at its credit's own rate). */
+  const draw = (need: number, orderId: string | null) => {
     const slices: SettlementSlice[] = [];
     while (need > 0 && lotIndex < lots.length) {
       const lot = lots[lotIndex]!;
       const take = Math.min(need, lot.left);
       if (take > 0) {
+        if (orderId === null) lot.toShortfalls += take;
+        else lot.toOrders.set(orderId, (lot.toOrders.get(orderId) ?? 0) + take);
         slices.push({
           entryId: lot.entry.id,
           entryType: lot.entry.entryType === "adjustment" ? "adjustment" : "payment",
@@ -558,7 +586,7 @@ export function projectAccount(entries: EntryRow[], orderRows: OrderRow[]) {
   const settlements = new Map<string, Omit<OrderSettlement, "supplierId" | "currency" | "held">>();
   for (const due of dues) {
     if (due.shortfall) {
-      due.shortfall.left -= settledOf(draw(due.shortfall.left));
+      due.shortfall.left -= settledOf(draw(due.shortfall.left, null));
       continue;
     }
     const order = due.order!;
@@ -567,7 +595,7 @@ export function projectAccount(entries: EntryRow[], orderRows: OrderRow[]) {
       settlements.set(order.id, { orderId: order.id, posted: false, valueCny: null, settledCny: null, outstandingCny: null, paymentStatus: null, settledInr: null, slices: [] });
       continue;
     }
-    const slices = draw(value);
+    const slices = draw(value, order.id);
     const settled = settledOf(slices);
     const inr = slices.some((slice) => slice.amountInr === null) ? null : fromCents(slices.reduce((sum, slice) => sum + cents(slice.amountInr!), 0));
     settlements.set(order.id, {
@@ -592,8 +620,22 @@ export function projectAccount(entries: EntryRow[], orderRows: OrderRow[]) {
       .sort()
       .at(-1) ?? null;
   const open = [...settlements.values()].filter((row) => (row.outstandingCny ?? 0) > 0);
+  const uses = new Map<string, CreditUse>(
+    lots.map((lot) => [
+      lot.entry.id,
+      {
+        paymentId: lot.entry.paymentId,
+        amountCny: fromCents(lot.amount),
+        usedCny: fromCents(lot.amount - lot.left),
+        takenCny: fromCents(lot.taken),
+        toShortfallsCny: fromCents(lot.toShortfalls),
+        orders: [...lot.toOrders].map(([orderId, amount]) => ({ orderId, amountCny: fromCents(amount) })),
+      },
+    ]),
+  );
   return {
     settlements,
+    credits: uses,
     shortfallCny: fromCents(shortfalls.reduce((total, shortfall) => total + shortfall.left, 0)),
     account: {
       creditsCny: fromCents(sum(credits)),
@@ -618,6 +660,14 @@ export type Ledger = {
   accountsOf: (supplierId: string) => LedgerAccount[];
   account: (supplierId: string, currency: string) => LedgerAccount | undefined;
   order: (orderId: string) => OrderSettlement | undefined;
+  /** Every credit lot of the non-held accounts, by entry id. */
+  credits: Map<string, CreditUse & { supplierId: string; currency: string }>;
+  /** What the account's shortfalls still leave payable; undefined for a held or unknown account. */
+  shortfall: (supplierId: string, currency: string) => number | undefined;
+  /** A live order's PO number. */
+  poOf: (orderId: string) => string | null;
+  /** The payment's standing credit (null for agent, due, voided, held or unposted payments). */
+  paymentSettlement: (paymentId: string) => PaymentSettlement | null;
 };
 
 const heldAccount = (supplierId: string, currency: string, entries: number): LedgerAccount => ({
@@ -668,6 +718,7 @@ export async function loadLedger(db: Reader, scope: { supplierIds?: string[] } =
   const orderSelect = await db
     .select({
       id: orders.id,
+      po: orders.poNumber,
       supplierId: orders.supplierId,
       currency: orders.currency,
       orderDate: orders.orderDate,
@@ -690,6 +741,8 @@ export async function loadLedger(db: Reader, scope: { supplierIds?: string[] } =
   const keys = new Set([...entryRows.map((row) => accountKey(row.supplierId, row.currency)), ...held]);
   const accounts = new Map<string, LedgerAccount>();
   const settlements = new Map<string, OrderSettlement>();
+  const credits: Ledger["credits"] = new Map();
+  const shortfalls = new Map<string, number>();
   for (const key of keys) {
     const [supplierId, currency] = key.split(" ") as [string, string];
     const own = entryRows.filter((row) => row.supplierId === supplierId && row.currency === currency);
@@ -703,6 +756,8 @@ export async function loadLedger(db: Reader, scope: { supplierIds?: string[] } =
     const projected = projectAccount(own, ownOrders);
     accounts.set(key, { supplierId, currency, held: false, ...projected.account });
     for (const [id, row] of projected.settlements) settlements.set(id, { ...row, supplierId, currency, held: false });
+    for (const [id, use] of projected.credits) credits.set(id, { ...use, supplierId, currency });
+    shortfalls.set(key, projected.shortfallCny);
   }
   // Orders of accounts with no posting at all (outside the ledger until the backfill posts them).
   for (const order of orderRowList) {
@@ -721,20 +776,76 @@ export async function loadLedger(db: Reader, scope: { supplierIds?: string[] } =
         slices: [],
       });
   }
-  return ledgerOf(accounts, settlements);
+  return ledgerOf(accounts, settlements, credits, shortfalls, new Map(orderSelect.map((row) => [row.id, row.po])));
 }
 
-function ledgerOf(accounts: Map<string, LedgerAccount>, settlements: Map<string, OrderSettlement>): Ledger {
+function ledgerOf(
+  accounts: Map<string, LedgerAccount>,
+  settlements: Map<string, OrderSettlement>,
+  credits: Ledger["credits"] = new Map(),
+  shortfalls = new Map<string, number>(),
+  pos = new Map<string, string>(),
+): Ledger {
+  const byPayment = new Map([...credits.values()].flatMap((use) => (use.paymentId ? [[use.paymentId, use] as const] : [])));
+  const poOf = (orderId: string) => pos.get(orderId) ?? null;
   return {
     accounts,
     orders: settlements,
     accountsOf: (supplierId) => [...accounts.values()].filter((row) => row.supplierId === supplierId),
     account: (supplierId, currency) => accounts.get(accountKey(supplierId, currency)),
     order: (orderId) => settlements.get(orderId),
+    credits,
+    shortfall: (supplierId, currency) => shortfalls.get(accountKey(supplierId, currency)),
+    poOf,
+    paymentSettlement: (paymentId) => {
+      const use = byPayment.get(paymentId);
+      if (!use) return null;
+      const free = cents(use.amountCny) - cents(use.usedCny);
+      const other = cents(use.takenCny) + cents(use.toShortfallsCny);
+      return {
+        state: use.usedCny === 0 ? "unsettled" : free === 0 ? "settled" : "partly",
+        amountCny: use.amountCny,
+        usedCny: use.usedCny,
+        freeCny: fromCents(free),
+        usedBy: [...use.orders.map((row) => ({ po: poOf(row.orderId), amountCny: row.amountCny })), ...(other > 0 ? [{ po: null, amountCny: fromCents(other) }] : [])],
+      };
+    },
   };
 }
 
 const emptyLedger = () => ledgerOf(new Map(), new Map());
+
+/**
+ * PAY-4's legacy guard (owner decisions of 2026-11-27): what a correction changed in the account's settlement, between
+ * the projection before it and after it (same transaction, account locked). `rename` maps the original credit's entry
+ * to its copy's, so the two count as one logical credit. Compared: every order's settled, outstanding, status, goods INR
+ * and slices (credit, amount, rate, date); every credit's use (adjustment takes, shortfall draws, orders: so only the
+ * edited credit's free part may change); the account's outstanding, open orders and shortfall. `orderIds`: the orders
+ * whose settlement changed (oldest first); `changed`: anything did.
+ */
+export function settlementDifferences(before: Ledger, after: Ledger, supplierId: string, currency: string, rename: Map<string, string>) {
+  const same = (id: string) => id;
+  const renamed = (id: string) => rename.get(id) ?? id;
+  const mine = (row: { supplierId: string; currency: string }) => row.supplierId === supplierId && row.currency === currency;
+  const orderView = (row: OrderSettlement | undefined, as: (id: string) => string) =>
+    JSON.stringify(row ? [row.settledCny, row.outstandingCny, row.paymentStatus, row.settledInr, row.slices.map((slice) => [as(slice.entryId), slice.amount, slice.exchangeRate, slice.entryDate])] : null);
+  const orderIds = [...new Set([...before.orders.values(), ...after.orders.values()].filter(mine).map((row) => row.orderId))].filter(
+    (id) => orderView(before.order(id), renamed) !== orderView(after.order(id), same),
+  );
+  const creditsView = (ledger: Ledger, as: (id: string) => string) =>
+    JSON.stringify(
+      [...ledger.credits]
+        .filter(([, use]) => mine(use))
+        .map(([id, use]) => [as(id), use.takenCny, use.toShortfallsCny, use.orders] as const)
+        .sort((x, y) => byText(x[0], y[0])),
+    );
+  const accountView = (ledger: Ledger) => {
+    const account = ledger.account(supplierId, currency);
+    return JSON.stringify([account?.outstandingCny, account?.openOrders, ledger.shortfall(supplierId, currency)]);
+  };
+  const changed = orderIds.length > 0 || creditsView(before, renamed) !== creditsView(after, same) || accountView(before) !== accountView(after);
+  return { changed, orderIds };
+}
 
 export type DepositStatus = "none" | "unmet" | "partly" | "met";
 

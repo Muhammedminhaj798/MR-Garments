@@ -412,6 +412,7 @@ describe("PAY-1 GET /payments", () => {
       voidedBy: null,
       voidReason: "",
       held: false,
+      settlement: null, // due: no credit
     });
     expect(res.body.payments).toContainEqual(expect.objectContaining({ orderId: null, po: null, kind: "Payment", status: "paid", amountCny: 1234.56, rateInr: 11.8765, paidOn: "2026-10-21", mode: "Bank transfer" }));
     expect(res.body.accounts).toEqual([expect.objectContaining({ supplierId: ids.supplier, currency: "CNY", supplier: "Guangzhou Textile Co.", balanceCny: -28715.44, openOrders: 2 })]);

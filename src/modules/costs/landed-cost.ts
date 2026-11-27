@@ -313,10 +313,12 @@ export async function recordFinalCostsOfContainer(db: Pick<Database, "select" | 
  * rate correction that changes a final order's settlement (it may then no longer be final) never removes its
  * protection: every later change to its settlement needs an approval again.
  * ponytail: two projections of the supplier's ledger per such write (a few hundred rows); fine at ORD-3/5 and LED-3 rates.
+ * A caller that already projected the supplier's ledger (locked, before the write; after it) passes it: PAY-4's legacy
+ * correction compares the same two projections itself.
  */
-export async function guardFinalSettlements(db: Pick<Database, "select" | "insert">, supplierId: string, currency: string) {
+export async function guardFinalSettlements(db: Pick<Database, "select" | "insert">, supplierId: string, currency: string, given?: Ledger) {
   const slicesOf = (ledger: Ledger, id: string) => JSON.stringify(ledger.order(id)?.slices.map((slice) => [slice.entryId, slice.amount]) ?? null);
-  const before = await loadLedger(db, { supplierIds: [supplierId] });
+  const before = given ?? (await loadLedger(db, { supplierIds: [supplierId] }));
   const ids = [...before.orders.values()].filter((row) => row.currency === currency && row.posted).map((row) => row.orderId);
   const finalNow = await recordFinalCosts(db, supplierId, currency, before);
   const recorded = await db
@@ -324,8 +326,8 @@ export async function guardFinalSettlements(db: Pick<Database, "select" | "inser
     .from(finalCostProtections)
     .where(and(eq(finalCostProtections.supplierId, supplierId), eq(finalCostProtections.currency, currency)));
   const final = [...new Set([...finalNow, ...recorded.map((row) => row.orderId)])].filter((id) => ids.includes(id));
-  return async () => {
-    const after = await loadLedger(db, { supplierIds: [supplierId] });
+  return async (givenAfter?: Ledger) => {
+    const after = givenAfter ?? (await loadLedger(db, { supplierIds: [supplierId] }));
     // The write may itself complete an order (a payment settling its last part): protected from that moment.
     await recordFinalCosts(db, supplierId, currency, after);
     if (final.length === 0) return [];

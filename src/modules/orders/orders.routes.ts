@@ -490,7 +490,8 @@ export function ordersRoutes({ db }: RouteContext) {
         ...orderSettlement(ledger.order(row.id), row),
         nextDue: row.nextDue,
       })),
-      payments: paymentList.map(paymentRow),
+      // Each payment's credit use (unsettled, partly, settled; what it paid): PAY-4's legacy correction rules.
+      payments: paymentList.map((row) => ({ ...paymentRow(row), settlement: ledger.paymentSettlement(row.id) })),
       accounts,
       totals,
     });

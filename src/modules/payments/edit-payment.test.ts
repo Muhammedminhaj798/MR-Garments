@@ -13,7 +13,7 @@ import { MESSAGES } from "./payments.routes";
 
 // PAY-4 PATCH /payments/:id (payments Full): mode, reference and notes change in place and post nothing; a new amount,
 // date or rate voids the payment as PAY-3 does and records a corrected copy as PAY-2 does, in one transaction, under the
-// same M8 guard. Legacy order-linked supplier rows, voided rows and held accounts are refused.
+// same M8 guard. Voided rows and held accounts are refused; legacy order-linked rows: legacy-edit.test.ts.
 
 const ctx = createTestContext();
 const http = api(ctx);
@@ -133,8 +133,9 @@ describe("PAY-4 PATCH /payments/:id", () => {
     expect((await http.get(`/orders/${order.po}`).set("Cookie", management)).body).toMatchObject({ agentPaidCny: 450, agentPaidInr: 5400, settledCny: 0 });
   });
 
-  it("refuses legacy order-linked supplier rows, due and voided rows, a held account, and broken fields, writing nothing", async () => {
+  it("refuses a legacy row outside the ledger, due and voided rows, a held account, and broken fields, writing nothing", async () => {
     const order = await placeOrder();
+    // A legacy order-linked row the backfill never posted (no credit): nothing to correct.
     const [legacy] = await ctx.db
       .insert(payments)
       .values({ orderId: order.id, kind: "Deposit", payee: "Guangzhou Textile Co.", payeeRole: "supplier", amountCny: 300, status: "paid", paidOn: indiaDay(-9), rateInr: 12, mode: "Bank" })
@@ -143,7 +144,7 @@ describe("PAY-4 PATCH /payments/:id", () => {
     const voided = await pay({ amount: 10 });
     expect((await http.delete(`/payments/${voided}`, { reason: "Twice" }).set("Cookie", management)).status).toBe(200);
     const before = await snapshot();
-    expect((await edit(legacy!.id, fields({ mode: "Cash" }))).body.error).toEqual({ code: "legacy_payment", message: MESSAGES.editLegacy });
+    expect((await edit(legacy!.id, fields({ mode: "Cash", reason: "x" }))).body.error).toEqual({ code: "not_editable", message: MESSAGES.editUnposted });
     expect((await edit(voided, fields({ mode: "Cash" }))).body.error.code).toBe("already_voided");
     expect((await edit("00000000-0000-4000-8000-000000000000", fields())).status).toBe(404);
     for (const [overrides, field, message] of [

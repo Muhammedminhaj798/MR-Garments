@@ -1,3 +1,5 @@
+import { randomUUID } from "node:crypto";
+
 import { and, eq, sql } from "drizzle-orm";
 import { Router } from "express";
 import { z } from "zod";
@@ -5,13 +7,27 @@ import { z } from "zod";
 import { requirePermission } from "../../auth/current-user";
 import { currencyCode } from "../../currencies";
 import type { Database } from "../../db/client";
-import { orders, payments, shippingAgents, supplierLedgerEntries, suppliers } from "../../db/schema";
+import { type Currency, orders, payments, shippingAgents, supplierLedgerEntries, suppliers } from "../../db/schema";
 import { conflict, HttpError, notFound, validationFailed } from "../../http/errors";
 import { parse } from "../../http/validate";
 import type { RouteContext } from "../context";
 import { atLeast, effectiveAccess } from "../../permissions/matrix";
 import { guardFinalSettlements } from "../costs/landed-cost";
-import { assertLedgerLive, cents, fromCents, isHeld, loadLedger, lockAccount, MESSAGES as LEDGER, paymentQuery, paymentRow, postPaymentCredit, postPaymentVoid } from "../ledger/ledger";
+import {
+  assertLedgerLive,
+  cents,
+  fromCents,
+  isHeld,
+  loadLedger,
+  lockAccount,
+  MESSAGES as LEDGER,
+  type PaymentSettlement,
+  paymentQuery,
+  paymentRow,
+  postPaymentCredit,
+  postPaymentVoid,
+  settlementDifferences,
+} from "../ledger/ledger";
 import { currencyOptions } from "../ledger/ledger.routes";
 import { money, notify } from "../notifications/notify";
 import { rateProblem } from "../orders/orders.routes";
@@ -47,7 +63,17 @@ export const MESSAGES = {
   alreadyVoided: "This payment was already voided.",
   editReason: "Enter the reason for changing the amount, date or rate.",
   editDue: "Only a paid payment can be edited.",
-  editLegacy: "This payment was recorded against an order before the supplier ledger, so it can't be edited. Void it and record a new payment instead.",
+  /** PAY-4 on a legacy order-linked Deposit/Balance (owner decisions of 2026-11-27): every change is a correction. */
+  correctionReason: "Enter the reason for this correction.",
+  editUnposted: "This payment isn't in the supplier ledger, so it can't be edited.",
+  settled: (paid: string) => `This payment was fully used to pay ${paid}, so it can't be edited.`,
+  belowUsed: (least: string, paid: string) => `Enter at least ${least}: that much of this payment already paid ${paid}.`,
+  usedDate: (paid: string) => `The payment date can't change: part of this payment already paid ${paid}.`,
+  usedRate: (paid: string) => `The rate can't change: part of this payment already paid ${paid}.`,
+  settlementChange: (pos: string[]) =>
+    pos.length > 0
+      ? `This change would alter how ${joinedPos(pos)} ${pos.length > 1 ? "are" : "is"} settled, so nothing was saved.`
+      : "This change would alter how this supplier's account is settled, so nothing was saved.",
 };
 const M = MESSAGES;
 
@@ -112,6 +138,28 @@ const editPayment = z.strictObject({
 type Tx = Parameters<Parameters<Database["transaction"]>[0]>[0];
 
 type Stored = typeof payments.$inferSelect;
+type Fields = { amountCny: number; paidOn: string; rateInr: number; mode: string; reference: string; notes: string };
+/** A rate to the column's 4 decimals, so a float's last digit is no change. */
+const rateKey = (rate: number | null) => Math.round((rate ?? 0) * 10_000);
+
+/**
+ * PAY-4 on a legacy order-linked Deposit/Balance (owner decisions of 2026-11-27), from its credit's use in the
+ * projection taken under the account lock (never the Paid label): settled is 409 `settled_payment`; partly keeps its
+ * date and rate and at least what was used (422); every change needs a reason (422). Throws before anything is written.
+ */
+function legacyRules(use: PaymentSettlement | null, row: Stored, fields: Fields, reason: string, currency: Currency) {
+  if (!use) throw conflict("not_editable", M.editUnposted);
+  const paid = joinedPos(use.usedBy.map((part) => `${part.po ?? "a ledger adjustment"} (${money(part.amountCny, currency)})`));
+  if (use.state === "settled") throw conflict("settled_payment", M.settled(paid));
+  const problems: Record<string, string> = {};
+  if (!reason) problems.reason = M.correctionReason;
+  if (use.state === "partly") {
+    if (cents(fields.amountCny) < cents(use.usedCny)) problems.amount = M.belowUsed(money(use.usedCny, currency), paid);
+    if (fields.paidOn !== row.paidOn) problems.paidOn = M.usedDate(paid);
+    if (rateKey(fields.rateInr) !== rateKey(row.rateInr)) problems.rateInr = M.usedRate(paid);
+  }
+  if (Object.keys(problems).length > 0) throw validationFailed(problems);
+}
 
 /** One submit at a time per client key, so a double click can't record two payments (the second waits, then replays). */
 const lockRequest = (tx: Tx, clientRequestId: string) => tx.execute(sql`select pg_advisory_xact_lock(hashtext('payments.client_request'), hashtext(${clientRequestId}))`);
@@ -145,7 +193,12 @@ async function postedBalances(db: Pick<Database, "select">, paymentId: string, e
 
 export function paymentsRoutes({ db }: RouteContext) {
   const router = Router();
-  const view = async (id: string) => paymentRow((await paymentQuery(db, eq(payments.id, id)))[0]!);
+  /** The PaymentRow with its credit's settlement (null for agent and voided rows). */
+  const view = async (id: string) => {
+    const row = paymentRow((await paymentQuery(db, eq(payments.id, id)))[0]!);
+    const standing = row.payeeRole === "supplier" && !row.voided;
+    return { ...row, settlement: standing ? (await loadLedger(db, { supplierIds: [row.supplierId] })).paymentSettlement(id) : null };
+  };
 
   /** PAY-2, supplier body: an orderless payment credited to the supplier's account in the payment's currency (D10). */
   async function recordSupplierPayment(input: z.infer<typeof supplierPayment>, userId: string, approver: boolean) {
@@ -347,7 +400,11 @@ export function paymentsRoutes({ db }: RouteContext) {
   // shipping agent's. Mode, reference and notes change in place and post nothing. A new amount, date or rate is one
   // correction: the payment is voided as PAY-3 voids it ("Edited: <reason>") and a corrected copy is recorded and posted
   // as PAY-2 posts it, under the same M8 guard. The body's `clientRequestId` keys the copy: a retry replays it. A
-  // submit that changes nothing answers 200 and writes nothing. Legacy order-linked supplier rows stay read-only.
+  // submit that changes nothing answers 200 and writes nothing. A legacy order-linked supplier row (Deposit/Balance) is
+  // always corrected (owner decisions of 2026-11-27): any change, text included, voids it and records a copy on the same
+  // order, the two linked in the void reason and both postings; its credit's use decides what may change
+  // (legacyRules), and the correction is refused (409 settlement_change, rolled back) when the account's settlement
+  // after it differs from before in anything but the edited credit's free part (settlementDifferences).
   router.patch("/payments/:id", requirePermission("payments", "Full"), async (req, res) => {
     const id = String(req.params.id);
     if (!isUuid(id)) throw notFound("Payment");
@@ -359,7 +416,12 @@ export function paymentsRoutes({ db }: RouteContext) {
       await lockRequest(tx, input.clientRequestId);
       const [row] = await tx.select().from(payments).where(eq(payments.id, id)).for("update");
       if (!row) throw notFound("Payment");
-      const [order] = row.orderId ? await tx.select({ po: orders.poNumber, supplierId: orders.supplierId, currency: orders.currency }).from(orders).where(eq(orders.id, row.orderId)) : [];
+      // Key-share locked before the account lock: the copy's insert needs this lock on its order (foreign key), and
+      // REC-3, ORD-5 and ORD-8 lock the order row before the account, so taking it first keeps one lock order (a
+      // receipt on the same order during a legacy correction waits instead of deadlocking).
+      const [order] = row.orderId
+        ? await tx.select({ po: orders.poNumber, supplierId: orders.supplierId, currency: orders.currency }).from(orders).where(eq(orders.id, row.orderId)).for("key share")
+        : [];
       const supplierId = row.supplierId ?? order!.supplierId;
       const currency = row.currency ?? order!.currency;
       const fields = { amountCny: input.amount, paidOn: input.paidOn, rateInr: input.rateInr ?? 1, mode: input.mode, reference: input.reference, notes: input.notes };
@@ -376,46 +438,56 @@ export function paymentsRoutes({ db }: RouteContext) {
       }
       if (row.voidedAt) throw new HttpError(409, "already_voided", M.alreadyVoided);
       if (row.status !== "paid") throw conflict("not_editable", M.editDue);
-      if (supplierMoney && (row.orderId || row.kind !== "Payment")) throw conflict("legacy_payment", M.editLegacy);
       if (await isHeld(tx, supplierId, currency)) throw conflict("account_held", LEDGER.held);
       const rate = rateProblem(currency, input.rateInr, M.rateInr);
       if (rate) throw validationFailed({ rateInr: rate });
+      const legacy = supplierMoney && (row.orderId !== null || row.kind !== "Payment");
       const was = `${row.kind} ${money(row.amountCny, currency)} paid ${row.paidOn} at ${row.rateInr} to ${row.payee}${order ? ` of ${order.po}` : ""}`;
-      const moneyChanged = cents(fields.amountCny) !== cents(row.amountCny) || fields.paidOn !== row.paidOn || Math.round(fields.rateInr * 10_000) !== Math.round((row.rateInr ?? 0) * 10_000);
-      if (!moneyChanged) {
-        const text = (["mode", "reference", "notes"] as const).filter((key) => fields[key] !== row[key]);
-        if (text.length === 0) return { id, replaced: null, ledger: null, log: null };
+      const moneyChanged = cents(fields.amountCny) !== cents(row.amountCny) || fields.paidOn !== row.paidOn || rateKey(fields.rateInr) !== rateKey(row.rateInr);
+      const text = (["mode", "reference", "notes"] as const).filter((key) => fields[key] !== row[key]);
+      if (!moneyChanged && text.length === 0) return { id, replaced: null, ledger: null, log: null };
+      if (!moneyChanged && !legacy) {
         await tx.update(payments).set({ mode: fields.mode, reference: fields.reference, notes: fields.notes, updatedAt: new Date() }).where(eq(payments.id, id));
         return { id, replaced: null, ledger: null, log: `Payment ${id} (${was}) edited by user ${userId}: ${text.map((key) => `${key} ${JSON.stringify(row[key])} -> ${JSON.stringify(fields[key])}`).join(", ")}` };
       }
-      if (!reason) throw validationFailed({ reason: M.editReason });
-      const voidReason = `Edited: ${reason}`;
-      const notes = approval ? `${voidReason}; ${approvalNote(approval)}` : voidReason;
+      if (!legacy && !reason) throw validationFailed({ reason: M.editReason });
       if (supplierMoney) await lockAccount(tx, supplierId, currency);
-      const finalChanged = supplierMoney ? await guardFinalSettlements(tx, supplierId, currency) : null;
+      // A legacy row: its credit's use, projected under the lock (reused by the M8 guard and the settlement guard).
+      const before = legacy ? await loadLedger(tx, { supplierIds: [supplierId] }) : undefined;
+      if (before) legacyRules(before.paymentSettlement(id), row, fields, reason, currency);
+      // The copy's id is known up front, so the void (row and posting) names it and the copy's credit names the original.
+      const newId = randomUUID();
+      const edited = `Edited: ${reason}`;
+      const voidReason = legacy ? `${edited}; replaced by payment ${newId}` : edited;
+      const approved = approval ? `; ${approvalNote(approval)}` : "";
+      const finalChanged = supplierMoney ? await guardFinalSettlements(tx, supplierId, currency, before) : null;
       await tx.update(payments).set({ voidedAt: new Date(), voidedBy: userId, voidReason, updatedAt: new Date() }).where(eq(payments.id, id));
       // Dated at the original's date, so the statement's running balance never counts both credits in between.
-      const voided = await postPaymentVoid(tx, id, userId, notes, row.paidOn!);
-      const [created] = await tx
-        .insert(payments)
-        .values({
-          orderId: row.orderId,
-          supplierId: row.supplierId,
-          currency: row.currency,
-          kind: row.kind,
-          payee: row.payee,
-          payeeRole: row.payeeRole,
-          status: "paid",
-          ...fields,
-          clientRequestId: input.clientRequestId,
-          createdBy: userId,
-        })
-        .returning({ id: payments.id });
-      const newId = created!.id;
+      const voided = await postPaymentVoid(tx, id, userId, `${voidReason}${approved}`, row.paidOn!);
+      await tx.insert(payments).values({
+        id: newId,
+        orderId: row.orderId,
+        supplierId: row.supplierId,
+        currency: row.currency,
+        kind: row.kind,
+        payee: row.payee,
+        payeeRole: row.payeeRole,
+        status: "paid",
+        ...fields,
+        clientRequestId: input.clientRequestId,
+        createdBy: userId,
+      });
+      const creditNotes = `${legacy ? `${edited}; replaces payment ${id}` : edited}${approved}`;
       const credit = supplierMoney
-        ? await postPaymentCredit(tx, { id: newId, supplierId, currency, amount: fields.amountCny, exchangeRate: fields.rateInr, paidOn: fields.paidOn }, userId, notes)
+        ? await postPaymentCredit(tx, { id: newId, supplierId, currency, amount: fields.amountCny, exchangeRate: fields.rateInr, paidOn: fields.paidOn }, userId, creditNotes)
         : null;
-      if (finalChanged) requireFinalApproval(await finalChanged(), approval, true, FINAL.edit);
+      // Legacy: the settlement must be unchanged but for the edited credit's free part (original and copy as one credit).
+      const after = before ? await loadLedger(tx, { supplierIds: [supplierId] }) : undefined;
+      if (before && after) {
+        const moved = settlementDifferences(before, after, supplierId, currency, new Map([[voided!.entry.reversesId!, credit!.entry.id]]));
+        if (moved.changed) throw conflict("settlement_change", M.settlementChange(moved.orderIds.map((orderId) => before.poOf(orderId) ?? orderId)));
+      }
+      if (finalChanged) requireFinalApproval(await finalChanged(after), approval, true, FINAL.edit);
       const ledger = credit ? { supplierId, currency, balanceBefore: voided?.balanceBefore ?? credit.balanceBefore, balanceAfter: credit.balanceAfter } : null;
       const now = `${money(fields.amountCny, currency)} paid ${fields.paidOn} at ${fields.rateInr}`;
       return { id: newId, replaced: id as string | null, ledger, log: `Payment ${id} (${was}) replaced by ${newId} (${now}) by user ${userId}: ${reason}` };

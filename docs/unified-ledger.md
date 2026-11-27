@@ -366,10 +366,29 @@ one, ordered CNY, USD, INR, then the rest.
   (Management), as PAY-3. Guard. Strict body, every field as it should end up, with PAY-2's rules:
   `{ amount, paidOn, rateInr?, mode, reference?, notes?, reason?, clientRequestId, finalSettlementApproval?: { reason } }`.
   - **Editable:** not voided, `status 'paid'`, account not held, and either a current supplier payment
-    (`payee_role 'supplier'`, `kind 'Payment'`, no order) or a shipping-agent (sea freight) payment. Legacy
-    order-linked supplier rows ("Deposit (legacy)" / "Balance (legacy)") stay read-only: 409 `legacy_payment`
-    (Void still works). The archive (`supplier_advance_entries`, `supplier_deposits`) is never touched.
-  - **Mode, reference or notes only:** the row is updated in place (`updated_at`); nothing is posted. Response
+    (`payee_role 'supplier'`, `kind 'Payment'`, no order), a shipping-agent (sea freight) payment, or a legacy
+    order-linked supplier row under the rules below. The archive (`supplier_advance_entries`, `supplier_deposits`)
+    is never touched.
+  - **Legacy rows** ("Deposit (legacy)" / "Balance (legacy)", owner decisions of 2026-11-27, option A, no migration):
+    every edit, text-only included, is a correction and needs `reason` (422 "Enter the reason for this correction.");
+    the row is never updated in place. The original is voided as PAY-3 voids it (`payment_void` dated at its
+    `paidOn`); a copy keeps `order_id`, kind, payee and payee role (supplier and currency stay null) and is credited
+    to the order's account. Links: `void_reason` "Edited: <reason>; replaced by payment <new>" (also the void's
+    notes), the copy's credit notes "Edited: <reason>; replaces payment <old>". Eligibility is the credit's use in
+    the FIFO projection (order and shortfall draws plus negative LED-3 takes), read under the request lock, the
+    payment row lock, a key-share lock on its order (taken before the account lock, the order REC-3, ORD-5 and ORD-8
+    use, so a receipt on the same order waits instead of deadlocking) and the account lock (never the Paid label; PaymentRow `settlement`): **settled** 409 `settled_payment` ("This
+    payment was fully used to pay <POs>, so it can't be edited."), text-only edits included; **partly** the amount
+    may rise or fall to what was used (422 `amount`), `paidOn` and `rateInr` stay (422); **unsettled** amount, date,
+    rate, mode, reference and notes. **Settlement-unchanged guard:** the projection is taken before and after the
+    writes in the same transaction; any difference but the edited credit's free part (orders' settled, outstanding,
+    status, INR and slices with the copy standing in for the original; any credit's takes or draws; the account's
+    outstanding, open orders or shortfall) is 409 `settlement_change` ("This change would alter how <POs> are
+    settled, so nothing was saved."), nothing written. M8 applies on top. Consequences: a credit partly used by an
+    LED-3 take, or followed by a same-date credit recorded later, can't be corrected (the copy is recorded after
+    them). PaymentRow `settlement: { state: "unsettled" | "partly" | "settled", amountCny, usedCny, freeCny, usedBy:
+    [{ po | null, amountCny }] } | null` on PAY-1, ORD-4 and the PAY-2/3/4 responses (absent elsewhere).
+  - **Mode, reference or notes only** (current supplier and sea-freight payments): the row is updated in place (`updated_at`); nothing is posted. Response
     `replaced: null, ledger: null`. A submit that changes nothing answers 200 and writes nothing.
   - **Amount, paid on or rate changed (a correction):** `reason` is required (422 `reason`). One transaction, the
     existing void and record logic only, no new posting type or calculation: account lock, M8 guard, the original is
@@ -380,7 +399,8 @@ one, ordered CNY, USD, INR, then the rest.
     money, credited by `postPaymentCredit`. Both postings carry the notes "Edited: <reason>" (+ the approval note).
     Response 200 `{ payment: <the copy>, replaced: <original id>, ledger: { supplierId, currency, balanceBefore
     (before the void), balanceAfter (after the credit) } | null }` (null for sea freight: never posted).
-  - **Errors:** 404, 409 `already_voided`, 409 `not_editable` (a due row), 409 `legacy_payment`, 409 `account_held`,
+  - **Errors:** 404, 409 `already_voided`, 409 `not_editable` (a due row or a payment outside the ledger), 409 `settled_payment`, 409
+    `settlement_change`, 409 `account_held`,
     409 `final_settlement_approval` ("Changing this payment changes the payments that settle <POs>, whose landed cost
     is already final. Give the reason for approving it.", nothing written), 409 `idempotency_conflict`, 422 fields,
     503 `ledger_maintenance`. A retry of a correction with the same key and details replays it (200).

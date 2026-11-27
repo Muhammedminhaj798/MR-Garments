@@ -188,6 +188,7 @@ describe("ORD-4 GET /orders/:po", () => {
           voidedBy: null,
           voidReason: "",
           held: false,
+          settlement: null, // an agent payment: never posted
         },
       ],
       receipts: [
